@@ -1328,13 +1328,35 @@ fn typed(
             }
             Event::Copy | Event::Cut => {
                 let chars = caret.sorted();
-                if chars.is_empty() {
+                if !chars.is_empty() {
+                    let bytes = byte(text, chars.start)..byte(text, chars.end);
+                    ui.ctx().copy_text(text[bytes].to_owned());
+                    if event == Event::Cut {
+                        caret = pen.write(text, caret, "");
+                    }
                     continue;
                 }
-                let bytes = byte(text, chars.start)..byte(text, chars.end);
-                ui.ctx().copy_text(text[bytes].to_owned());
+                // Nothing selected: the line of the caret is meant, whole, with its end.
+                let at = byte(text, caret.head);
+                let start = text[..at].rfind('\n').map_or(0, |found| found + 1);
+                let end = text[at..]
+                    .find('\n')
+                    .map_or(text.len(), |found| at + found + 1);
+                let mut line = text[start..end].to_owned();
+                if !line.ends_with('\n') {
+                    line.push('\n');
+                }
+                ui.ctx().copy_text(line);
                 if event == Event::Cut {
-                    caret = pen.write(text, caret, "");
+                    // The last line has no end of its own: the one before it goes with it.
+                    let last = end == text.len() && !text[start..end].ends_with('\n');
+                    let start = start - usize::from(last && start > 0);
+                    let first = caret.head - text[start..at].chars().count();
+                    let whole = Caret {
+                        head: first + text[start..end].chars().count(),
+                        anchor: first,
+                    };
+                    caret = pen.write(text, whole, "");
                 }
             }
             Event::Key {

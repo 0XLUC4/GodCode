@@ -2002,6 +2002,30 @@ mod tests {
     }
 
     #[test]
+    fn cut_without_a_selection_takes_the_line_of_the_caret() {
+        let mut harness = Harness::new("one\ntwo\nthree");
+        set_selection(&harness.ctx, editor_id(), &(5..5));
+        harness.frame(Vec::new());
+        let out = harness.frame(vec![Event::Cut]);
+        assert_eq!(harness.text, "one\nthree");
+        // The caret waits where the line was.
+        assert_eq!(out.selection, Some(4..4));
+        // Copying changes nothing, selection or not.
+        harness.frame(vec![Event::Copy]);
+        assert_eq!(harness.text, "one\nthree");
+        // The last line has no end of its own: the one before it goes with it.
+        set_selection(&harness.ctx, editor_id(), &(7..7));
+        harness.frame(Vec::new());
+        harness.frame(vec![Event::Cut]);
+        assert_eq!(harness.text, "one");
+        // With a selection, what is selected alone is cut.
+        set_selection(&harness.ctx, editor_id(), &(0..2));
+        harness.frame(Vec::new());
+        harness.frame(vec![Event::Cut]);
+        assert_eq!(harness.text, "e");
+    }
+
+    #[test]
     fn the_two_tags_of_an_element_are_renamed_as_one() {
         let mut harness = Harness::of("index.html", "<div>\n  <p>a</p>\n</div>", false);
         // The name of the opening tag is erased and typed again: the closing one follows.
