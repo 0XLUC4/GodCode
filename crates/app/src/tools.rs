@@ -137,9 +137,71 @@ pub fn with_places(command: &str, file: Option<&Path>, folder: Option<&Path>) ->
     command
 }
 
-/// What the project in `root` can run, as (what it is called, the command): the scripts
-/// of `package.json`, the usual commands of Cargo and Go, the targets of a `Makefile`.
+/// The files that make a folder a project of its own.
+const PROJECT_FILES: [&str; 4] = ["package.json", "Cargo.toml", "go.mod", "pyproject.toml"];
+/// The folders the projects of a bigger one are usually kept in.
+const PROJECT_FOLDERS: [&str; 6] = ["packages", "apps", "crates", "services", "libs", "modules"];
+
+/// The projects kept inside the one in `root`, as their paths from it, sorted: its
+/// folders, and those of `packages`, `apps`, `crates` and the like, that hold a file such
+/// as `package.json` or `Cargo.toml`.
+pub fn projects(root: &Path) -> Vec<String> {
+    let folders = |inside: &Path| -> Vec<String> {
+        let listed = std::fs::read_dir(inside).into_iter().flatten().flatten();
+        let named = listed.filter(|entry| entry.path().is_dir());
+        let names = named.filter_map(|entry| entry.file_name().into_string().ok());
+        // What is hidden or made by tools is no project.
+        let kept =
+            |name: &String| !name.starts_with('.') && name != "node_modules" && name != "target";
+        names.filter(kept).collect()
+    };
+    let mut found = Vec::new();
+    for name in folders(root) {
+        if PROJECT_FOLDERS.contains(&name.as_str()) {
+            let inside = folders(&root.join(&name)).into_iter();
+            found.extend(inside.map(|project| format!("{name}/{project}")));
+        }
+        found.push(name);
+    }
+    let is_project = |path: &String| {
+        PROJECT_FILES
+            .iter()
+            .any(|file| root.join(path).join(file).is_file())
+    };
+    found.retain(is_project);
+    found.sort();
+    found
+}
+
+/// `command`, run in the folder `inside` of the one the terminal is in, which it comes
+/// back to.
+fn run_inside(inside: &str, command: &str) -> String {
+    if cfg!(windows) {
+        format!("Push-Location \"{inside}\"; {command}; Pop-Location")
+    } else {
+        format!("(cd \"{inside}\" && {command})")
+    }
+}
+
+/// What the project in `root` can run, as (what it is called, the command): its own
+/// tasks, then those of the projects kept inside it, each run in its folder.
 pub fn tasks(root: &Path) -> Vec<(String, String)> {
+    let mut found = own_tasks(root);
+    for project in projects(root) {
+        let inside = own_tasks(&root.join(&project)).into_iter();
+        found.extend(inside.map(|(name, command)| {
+            (
+                format!("{project} › {name}"),
+                run_inside(&project, &command),
+            )
+        }));
+    }
+    found
+}
+
+/// What the project in `root` can run by itself: the scripts of `package.json`, the usual
+/// commands of Cargo and Go, the targets of a `Makefile`.
+fn own_tasks(root: &Path) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
     // The commands the project wrote down for itself come first.
@@ -650,5 +712,36 @@ mod tests {
         assert_eq!(file_icon("notes").glyph, icon::FILE);
         assert!(file_icon("notes").badge.is_none());
         assert_eq!(folder_icon("src", true).0, icon::FOLDER_OPEN);
+    }
+
+    #[test]
+    fn the_tasks_of_the_projects_inside_a_project_are_listed_with_its_own() {
+        let root = std::env::temp_dir().join(format!("godcode-mono-{}", std::process::id()));
+        let web = root.join("packages").join("web");
+        for folder in [
+            &web,
+            &root.join("api"),
+            &root.join("docs"),
+            &root.join("node_modules").join("x"),
+        ] {
+            std::fs::create_dir_all(folder).expect("folder");
+        }
+        std::fs::write(root.join("package.json"), r#"{"scripts":{"all":"x"}}"#).expect("file");
+        std::fs::write(web.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).expect("file");
+        std::fs::write(root.join("api").join("go.mod"), "module api\n").expect("file");
+        let inside = root.join("node_modules").join("x").join("package.json");
+        std::fs::write(inside, "{}").expect("file");
+        // A folder without a project file is none; what tools make is not looked into.
+        assert_eq!(projects(&root), ["api", "packages/web"]);
+        let found = tasks(&root);
+        let names: Vec<&str> = found.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names[0], "npm: all");
+        assert!(names.contains(&"api › go: test ./..."), "{names:?}");
+        let dev = found
+            .iter()
+            .find(|(name, _)| name == "packages/web › npm: dev");
+        let command = &dev.expect("the script of the project inside").1;
+        assert!(command.contains("\"packages/web\"") && command.contains("npm run dev"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -163,7 +163,9 @@ chacun, stash et stash pop. merge et rebase d'une branche, conflits réglés au
 curseur (garder le mien, le leur, les deux). `Git Graph…` dessine toutes les branches et leurs fusions, un clic montre
 le commit. `Conflict: Open Merge View` montre les conflits du fichier
 sur trois colonnes (le mien, le résultat, le leur) : `Mine` / `Both` / `Theirs` par conflit, `All mine`,
-`All theirs`, `Apply` écrit le résultat. Reste : monorepos, variables d'environnement. Fait : `New Project…` crée un projet depuis un
+`All theirs`, `Apply` écrit le résultat. Monorepos : `Run Task…` liste aussi les tâches des projets rangés dans le projet (ses dossiers et ceux de
+`packages`, `apps`, `crates`, `services`, `libs`, `modules` qui ont un `package.json`, `Cargo.toml`,
+`go.mod` ou `pyproject.toml`), chacune lancée dans son dossier. Reste : variables d'environnement. Fait : `New Project…` crée un projet depuis un
 modèle (page web, Node/TypeScript, Python, Rust).
 
 ### Phase 6 — outils (⏳)
