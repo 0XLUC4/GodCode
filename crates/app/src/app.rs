@@ -1668,6 +1668,10 @@ pub struct GodApp {
     vim: modal::Vim,
     /// The tab the marks of Vim were set in: they are no marks of another text.
     vim_tab: u64,
+    /// The marks of Vim that name a place in a file (`A` to `Z`): the file, the char.
+    /// And the one asked for, with whether the start of its line is meant.
+    file_marks: std::collections::HashMap<char, (PathBuf, usize)>,
+    file_mark_wanted: Option<(char, bool)>,
     emacs: modal::Emacs,
     /// The language server writes hints in the lines: types, names of arguments.
     hints: bool,
@@ -1948,6 +1952,8 @@ impl GodApp {
             },
             vim: modal::Vim::default(),
             vim_tab: 0,
+            file_marks: Default::default(),
+            file_mark_wanted: None,
             emacs: modal::Emacs::default(),
             hints: get("hints").is_none_or(|value| value == "1"),
             folds: folds_of(&get("folds").unwrap_or_default()),
@@ -7716,21 +7722,60 @@ impl GodApp {
                 if let Some(copied) = done.copied {
                     ctx.copy_text(copied);
                 }
-                clicked.extend(done.ask.into_iter().flat_map(|ask| match ask {
-                    Ask::Undo => vec![Cmd::Undo],
-                    Ask::Redo => vec![Cmd::Redo],
-                    Ask::Find => vec![Cmd::Find],
-                    Ask::Save => vec![Cmd::Save],
-                    Ask::Open => vec![Cmd::OpenFile],
-                    Ask::Close => vec![Cmd::CloseTab],
-                    Ask::SaveClose => vec![Cmd::Save, Cmd::CloseTab],
-                }));
+                match done.ask {
+                    Some(Ask::Undo) => clicked.push(Cmd::Undo),
+                    Some(Ask::Redo) => clicked.push(Cmd::Redo),
+                    Some(Ask::Find) => clicked.push(Cmd::Find),
+                    Some(Ask::Save) => clicked.push(Cmd::Save),
+                    Some(Ask::Open) => clicked.push(Cmd::OpenFile),
+                    Some(Ask::Close) => clicked.push(Cmd::CloseTab),
+                    Some(Ask::SaveClose) => clicked.extend([Cmd::Save, Cmd::CloseTab]),
+                    // A mark of a file is kept here: the keys of Vim know one text.
+                    Some(Ask::SetFileMark(mark, at)) => {
+                        if let Some(path) = tab.path.clone() {
+                            self.file_marks.insert(mark, (path, at));
+                        }
+                    }
+                    Some(Ask::GoToFileMark { mark, line_start }) => {
+                        self.file_mark_wanted = Some((mark, line_start));
+                    }
+                    None => {}
+                }
             }
             if !taken {
                 kept.push(event);
             }
         }
         ctx.input_mut(|input| input.events = kept);
+        self.go_to_file_mark(ctx);
+    }
+
+    /// Go to the mark of a file that was asked for: its file is opened, the caret put at
+    /// its place, or at the first letter of its line.
+    fn go_to_file_mark(&mut self, ctx: &Context) {
+        let Some((mark, line_start)) = self.file_mark_wanted.take() else {
+            return;
+        };
+        let Some((path, offset)) = self.file_marks.get(&mark).cloned() else {
+            return;
+        };
+        self.record_jump();
+        if !self.open_file(ctx, &path) {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        // The text may have changed since the mark was set: it is brought back into it.
+        let chars: Vec<char> = tab.text.chars().collect();
+        let mut at = offset.min(chars.len());
+        if line_start {
+            let start = chars[..at].iter().rposition(|ch| *ch == '\n');
+            let start = start.map_or(0, |found| found + 1);
+            let blank = |ch: &&char| **ch != '\n' && ch.is_whitespace();
+            at = start + chars[start..].iter().take_while(blank).count();
+        }
+        tab.select(ctx, at..at);
     }
 
     fn shortcuts(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
@@ -8269,14 +8314,21 @@ impl GodApp {
                         (Keys::Vim, modal::Mode::VisualLine) => "-- VISUAL LINE --",
                     };
                     // A command being typed after `:` shows as it is typed.
-                    match self.vim.typing().filter(|_| self.keys == Keys::Vim) {
-                        Some(typed) => {
+                    // What a substitution asks before each change comes first; then the
+                    // command being typed after `:`.
+                    let vim = self.keys == Keys::Vim;
+                    let asked = self.vim.asking().filter(|_| vim);
+                    match (asked, self.vim.typing().filter(|_| vim)) {
+                        (Some(asked), _) => {
+                            ui.label(dim(asked));
+                        }
+                        (None, Some(typed)) => {
                             ui.label(dim(format!(":{typed}")));
                         }
-                        None if !keys.is_empty() => {
+                        (None, None) if !keys.is_empty() => {
                             ui.label(dim(keys.to_owned()));
                         }
-                        None => {}
+                        (None, None) => {}
                     }
                     // The keys typed are being kept as a macro.
                     if let Some(register) = self.vim.recording().filter(|_| self.keys == Keys::Vim)
