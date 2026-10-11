@@ -146,10 +146,11 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Variables dépliables : un clic ouvre une liste ou un objet, ses parties viennent dessous ; points d'arrêt conditionnels : `Breakpoint Condition…` (`Shift+F9`) sur la ligne du curseur, vide pour toujours | ✅ |
 | Pendant un arrêt, le survol d'un nom dans le code dit ce qu'il vaut ; un point d'arrêt conditionnel est dessiné creux dans la marge | ✅ (survol non vu à l'écran) |
 | Les points d'arrêt suivent leur code quand des lignes sont tapées ou effacées au-dessus (dans l'éditeur ; pas après un reformatage) | ✅ |
-| Débogueur : modifier une valeur | ⏳ |
+| Modifier une valeur pendant un arrêt : clic droit sur une variable ou une de ses parties dans le panneau Debug | ✅ |
 
 Vérifié de bout en bout avec le vrai débogueur Python (debugpy) : arrêt sur un point d'arrêt,
-pile, variables et leurs parties, expressions surveillées, point d'arrêt conditionnel,
+pile, variables et leurs parties, valeur modifiée, expressions surveillées, point d'arrêt
+conditionnel,
 reprise jusqu'à la fin.
 `cargo test -p godcode-lsp --test python -- --ignored` le rejoue ; il lui faut debugpy
 (`pip install debugpy`, ou son dossier dans `GODCODE_DEBUGPY`).

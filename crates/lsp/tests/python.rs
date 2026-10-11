@@ -107,6 +107,26 @@ fn a_real_debugger_stops_and_tells_what_expressions_are_worth() {
     assert_eq!(worth["len(items)"], "3");
     assert!(worth["missing + 1"].contains("missing"), "{worth:?}");
 
+    // A variable given another value has it from then on.
+    session.set(None, "total", "40 + 2");
+    let changed = until(&mut session, |event| match event {
+        Event::Variables(variables) => variables
+            .into_iter()
+            .find(|found| found.name == "total" && found.value != "6"),
+        _ => None,
+    });
+    assert_eq!(changed.value, "42");
+    // And so has a part of one.
+    session.set(Some(reference), "0", "100");
+    session.watch(&["items[0] + total".to_owned()]);
+    let sum = until(&mut session, |event| match event {
+        Event::Watched {
+            expression, value, ..
+        } if expression.starts_with("items[0]") => Some(value),
+        _ => None,
+    });
+    assert_eq!(sum, "142");
+
     // Let go, it runs to its end.
     session.resume();
     until(&mut session, |event| {

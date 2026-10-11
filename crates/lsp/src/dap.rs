@@ -88,6 +88,8 @@ pub struct Session {
     thread: u64,
     /// The call of the stack being looked at: expressions are worked out there.
     frame: u64,
+    /// What the variables of that call are asked with: they are changed through it.
+    scope: u64,
     /// What to launch, sent once the debugger answered `initialize`.
     launch: Value,
     /// The breakpoints to set once the debugger is ready for them.
@@ -116,6 +118,7 @@ impl Session {
             pending: HashMap::new(),
             thread: 0,
             frame: 0,
+            scope: 0,
             launch,
             breakpoints,
             ended: false,
@@ -183,6 +186,20 @@ impl Session {
     pub fn inspect(&mut self, frame: u64) {
         self.frame = frame;
         self.request("scopes", json!({ "frameId": frame }), Asked::Scopes);
+    }
+
+    /// Give the variable `name` the value written as `value`: a variable of the call being
+    /// looked at, or a part of the variable `inside` (its reference). The variables are
+    /// then asked for again, to show what the debugger made of it; a value it refuses
+    /// leaves them as they were.
+    pub fn set(&mut self, inside: Option<u64>, name: &str, value: &str) {
+        let arguments = json!({
+            "variablesReference": inside.unwrap_or(self.scope),
+            "name": name,
+            "value": value,
+        });
+        self.request("setVariable", arguments, Asked::Other);
+        self.inspect(self.frame);
     }
 
     /// Ask for the parts of a variable; answered by [`Event::Children`].
@@ -282,6 +299,7 @@ impl Session {
                     // The first scope is the local one.
                     Some(Asked::Scopes) => {
                         if let Some(scope) = body["scopes"][0]["variablesReference"].as_u64() {
+                            self.scope = scope;
                             let arguments = json!({ "variablesReference": scope });
                             self.request("variables", arguments, Asked::Variables);
                         }

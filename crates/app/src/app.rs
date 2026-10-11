@@ -1129,6 +1129,9 @@ enum PromptKind {
     Word(String),
     /// The condition under which the debugger stops on this line of the active file.
     Condition(usize),
+    /// The value to give the variable of this name of the program being debugged: a part
+    /// of the variable with this reference, or a variable of the call looked at.
+    Value(Option<u64>, String),
 }
 
 /// A question about a file of the tree.
@@ -3397,8 +3400,9 @@ impl GodApp {
         let mut inspect = None;
         // An expression to watch from now on, and one to watch no more.
         let (mut watch, mut unwatch) = (None, None);
-        // A variable to open or to close.
+        // A variable to open or to close; one to give another value.
         let mut toggle = None;
+        let mut change = None;
         ui.columns(3, |columns| {
             let titled = |ui: &mut Ui, title: &str| {
                 ui.horizontal(|ui| {
@@ -3455,13 +3459,13 @@ impl GodApp {
                 .show(&mut columns[1], |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     // Each with its parts under it once opened, a level further in.
-                    let mut rows: Vec<(usize, &godcode_lsp::dap::Variable)> = self
+                    let mut rows: Vec<(usize, Option<u64>, &godcode_lsp::dap::Variable)> = self
                         .variables
                         .iter()
                         .rev()
-                        .map(|found| (0, found))
+                        .map(|found| (0, None, found))
                         .collect();
-                    while let Some((depth, found)) = rows.pop() {
+                    while let Some((depth, inside, found)) = rows.pop() {
                         let opened = self
                             .parts
                             .get(&found.reference)
@@ -3474,11 +3478,18 @@ impl GodApp {
                         let label = format!("{arrow}{} = {}", found.name, found.value);
                         let indent = 10.0 + depth as f32 * 14.0;
                         let row = list_row(ui, &palette, &label, indent, palette.text);
-                        if row.on_hover_text(&found.value).clicked() && found.reference != 0 {
+                        let row = row.on_hover_text(format!(
+                            "{}\nRight click to give it another value",
+                            found.value
+                        ));
+                        if row.clicked() && found.reference != 0 {
                             toggle = Some(found.reference);
                         }
+                        if row.secondary_clicked() {
+                            change = Some((inside, found.name.clone(), found.value.clone()));
+                        }
                         let parts = opened.into_iter().flatten().rev();
-                        rows.extend(parts.map(|part| (depth + 1, part)));
+                        rows.extend(parts.map(|part| (depth + 1, Some(found.reference), part)));
                     }
                 });
             titled(&mut columns[2], "OUTPUT");
@@ -3493,6 +3504,13 @@ impl GodApp {
         });
         if let Some(index) = unwatch {
             self.watches.remove(index);
+        }
+        if let Some((inside, name, value)) = change {
+            self.prompt = Some(Prompt {
+                kind: PromptKind::Value(inside, name),
+                name: value,
+                focus: true,
+            });
         }
         if let Some(reference) = toggle {
             // Closed, its parts are forgotten; opened, they are asked for.
@@ -7285,6 +7303,7 @@ impl GodApp {
             PromptKind::Rename(_) => ("Rename", "Rename"),
             PromptKind::Word(_) => ("Rename all occurrences", "Rename"),
             PromptKind::Condition(_) => ("Stop here when… (empty: always)", "Set"),
+            PromptKind::Value(..) => ("New value", "Set"),
             PromptKind::Delete(_) => ("Delete", "Move to recycle bin"),
         };
         let mut confirmed = false;
@@ -7317,6 +7336,11 @@ impl GodApp {
             self.rename_word(ctx, old, prompt.name.trim());
         } else if confirmed && let PromptKind::Condition(line) = prompt.kind {
             self.set_condition(line, prompt.name.trim());
+        } else if confirmed && let PromptKind::Value(inside, name) = &prompt.kind {
+            // What it had opened is asked for again with it: its parts may have changed.
+            if let Some(session) = &mut self.debug {
+                session.set(*inside, name, prompt.name.trim());
+            }
         } else if confirmed {
             match self.file_operation(ctx, &prompt) {
                 Ok(created) => {
@@ -7347,7 +7371,7 @@ impl GodApp {
                 .all(|part| matches!(part, Component::Normal(_)));
         match &prompt.kind {
             // Nothing on disk: the caller renames in the text, or tells the debugger.
-            PromptKind::Word(_) | PromptKind::Condition(_) => Ok(None),
+            PromptKind::Word(_) | PromptKind::Condition(_) | PromptKind::Value(..) => Ok(None),
             PromptKind::Delete(path) => {
                 trash::delete(path).map_err(|err| format!("Cannot delete {name}: {err}"))?;
                 // Unchanged editors of what is gone close; edited ones keep their text.
