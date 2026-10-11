@@ -8008,12 +8008,37 @@ impl GodApp {
         });
     }
 
+    /// Put the tab at `from` in the gap `gap` between the tabs (0: before the first). The
+    /// pinned ones stay first: a tab does not cross from one side to the other.
+    fn move_tab(&mut self, from: usize, gap: usize) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        let front = self.tabs.get(self.active).map(|tab| tab.id);
+        let tab = self.tabs.remove(from);
+        // Taken out, what followed it came one place nearer.
+        let to = gap - usize::from(gap > from);
+        let pinned = self.tabs.iter().filter(|tab| tab.pinned).count();
+        let to = match tab.pinned {
+            true => to.min(pinned),
+            false => to.clamp(pinned, self.tabs.len()),
+        };
+        self.tabs.insert(to, tab);
+        let front = front.and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
+        self.active = front.unwrap_or(self.active);
+    }
+
     /// The open files, above the editor.
     fn editor_tabs(&mut self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
         let palette = Palette::of(ui);
         let mut select = None;
         let mut close = None;
         let mut asked = None;
+        // Where each tab is drawn; the one being dragged, and whether it was just let
+        // go; the tab to move and the gap between tabs it goes to.
+        let mut places = Vec::with_capacity(self.tabs.len());
+        let mut carried = None;
+        let mut moved = None;
         let row = vec2(ui.available_width(), TAB_HEIGHT);
         ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
@@ -8028,6 +8053,10 @@ impl GodApp {
                 let (select_it, close_it, response) = doc_tab(
                     ui, &palette, &tab.name, tab.dirty, active, text_max, tab.pinned,
                 );
+                places.push(response.rect);
+                if response.dragged() || response.drag_stopped() {
+                    carried = Some((index, response.drag_stopped()));
+                }
                 if select_it {
                     select = Some(index);
                 }
@@ -8062,6 +8091,24 @@ impl GodApp {
                         }
                     }
                 });
+            }
+            // A tab being dragged: a line shows where it would go, between two tabs; let
+            // go, it goes there.
+            let pointer = ui.ctx().pointer_interact_pos();
+            if let (Some((from, let_go)), Some(pointer)) = (carried, pointer) {
+                let before = |place: &&Rect| place.center().x < pointer.x;
+                let gap = places.iter().filter(before).count();
+                let edge = match places.get(gap) {
+                    Some(next) => next.min.x,
+                    None => places.last().map_or(0.0, |last| last.max.x),
+                };
+                let rows = places[from].y_range();
+                let line = Stroke::new(2.0, palette.accent);
+                ui.painter().vline(edge, rows, line);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                if let_go {
+                    moved = Some((from, gap));
+                }
             }
             ui.add_space(4.0);
             if widgets::icon_button(ui, icon::PLUS, "New file (Ctrl+N)").clicked() {
@@ -8101,6 +8148,9 @@ impl GodApp {
             self.record_jump();
             self.active = index;
             self.tabs[index].view.focus = true;
+        }
+        if let Some((from, gap)) = moved {
+            self.move_tab(from, gap);
         }
         if let Some(index) = close {
             self.request_close(&ctx, index);
@@ -10848,7 +10898,8 @@ fn doc_tab(
     let star = if dirty { 14.0 } else { 0.0 };
     let close_size = widgets::SMALL_ICON_BUTTON;
     let width = 12.0 + 16.0 + 8.0 + galley.size().x + star + 8.0 + close_size.x + 8.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(width, TAB_HEIGHT), Sense::click());
+    // Dragged, it is put elsewhere among the tabs.
+    let (rect, response) = ui.allocate_exact_size(vec2(width, TAB_HEIGHT), Sense::click_and_drag());
     let painter = ui.painter();
     // The active tab reaches the bottom edge so it merges with the editor below.
     if active {
