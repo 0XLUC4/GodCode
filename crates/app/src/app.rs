@@ -158,6 +158,9 @@ enum Cmd {
     History,
     RunTests,
     TestResults,
+    RunCoverage,
+    Coverage,
+    Environment,
     Themes,
     Font,
     FontReset,
@@ -534,6 +537,24 @@ const COMMANDS: &[Spec] = &[
         "Run Tests and Show Results",
         "Ctrl+Alt+T",
     ),
+    spec(
+        Cmd::RunCoverage,
+        icon::CHECK_SQUARE,
+        "Run Tests with Coverage",
+        "",
+    ),
+    spec(
+        Cmd::Coverage,
+        icon::CHECK_SQUARE,
+        "Show / Hide Coverage",
+        "",
+    ),
+    spec(
+        Cmd::Environment,
+        icon::ROWS,
+        "HTTP: Choose Environment…",
+        "",
+    ),
     spec(Cmd::Themes, icon::PALETTE, "Color Theme…", ""),
     spec(Cmd::Font, icon::PALETTE, "Editor Font…", ""),
     spec(Cmd::FontReset, icon::PALETTE, "Reset Editor Font", ""),
@@ -787,6 +808,8 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::RunTests),
             Some(Cmd::TestResults),
             Some(Cmd::TestAtCaret),
+            Some(Cmd::RunCoverage),
+            Some(Cmd::Coverage),
             Some(Cmd::Tasks),
             Some(Cmd::RunLast),
             Some(Cmd::RunSettings),
@@ -1547,6 +1570,15 @@ pub struct GodApp {
     /// The tests of the project being run here; what the last run said of each test it
     /// ran; and all it printed.
     test_run: Option<Receiver<String>>,
+    /// That run also writes down which lines ran: its report is read when it ends.
+    covering: bool,
+    /// The lines the tests ran, file by file, as the last report read says; empty when
+    /// they are not shown.
+    coverage: Vec<godcode_core::coverage::FileCoverage>,
+    /// The environment whose values fill the requests of `.http` files, by its name; and
+    /// the ones to pick from, with the one chosen.
+    environment: Option<String>,
+    environments: Option<(Vec<String>, usize)>,
     test_results: Vec<(String, bool)>,
     test_output: String,
     /// The tests of the whole project, file by file, once looked for; and the search for
@@ -1711,6 +1743,10 @@ impl GodApp {
             split_down: false,
             tests: (0, Vec::new()),
             test_run: None,
+            covering: false,
+            coverage: Vec::new(),
+            environment: get("environment").filter(|name| !name.is_empty()),
+            environments: None,
             test_results: Vec::new(),
             test_output: String::new(),
             project_tests: Vec::new(),
@@ -3602,17 +3638,23 @@ impl GodApp {
     }
 
     /// Run the tests of the project here, out of sight, to read what passed.
-    fn start_tests(&mut self, ctx: &Context) {
+    fn start_tests(&mut self, ctx: &Context, covering: bool) {
         if self.test_run.is_some() {
             return;
         }
-        let command = self
-            .run_root()
-            .and_then(|root| Some((tools::with_results(tools::test_command(&root)?), root)));
+        let known = |root: &Path| match covering {
+            true => tools::coverage_command(root).map(str::to_owned),
+            false => tools::test_command(root).map(tools::with_results),
+        };
+        let command = self.run_root().and_then(|root| Some((known(&root)?, root)));
         let Some((command, root)) = command else {
-            self.toasts.error("No tests are known for this project");
+            self.toasts.error(match covering {
+                true => "No way is known to tell which lines the tests of this project run",
+                false => "No tests are known for this project",
+            });
             return;
         };
+        self.covering = covering;
         self.test_output = format!("$ {command}\n");
         self.test_results.clear();
         let (sender, receiver) = channel();
@@ -3624,6 +3666,50 @@ impl GodApp {
         });
         self.test_run = Some(receiver);
         self.bottom = Some(Bottom::Tests);
+    }
+
+    /// Read the report the tests left of the lines they ran: they show in the margin.
+    fn load_coverage(&mut self) {
+        let read = self.run_root().and_then(|root| {
+            let mut reports = tools::COVERAGE_REPORTS.iter();
+            reports.find_map(|name| std::fs::read_to_string(root.join(name)).ok())
+        });
+        self.coverage = read.map_or_else(Vec::new, |report| godcode_core::coverage::read(&report));
+        if self.coverage.is_empty() {
+            self.toasts.error(
+                "No coverage report found (lcov.info, coverage/lcov.info, coverage.out): \
+                 Run Tests with Coverage writes one",
+            );
+        } else {
+            let percent = godcode_core::coverage::total_percent(&self.coverage);
+            self.toasts
+                .success(format!("{percent:.0}% of the lines ran in the tests"));
+        }
+    }
+
+    /// The environments written for the requests of the file in front: in
+    /// `http-client.env.json` beside it, or else at the root of the folder.
+    fn http_environments(&self) -> Vec<godcode_core::http::Environment> {
+        let front = self.tabs.get(self.active);
+        let beside = front.and_then(|tab| Some(tab.path.as_deref()?.parent()?.to_path_buf()));
+        let folders = beside.into_iter().chain(self.folder());
+        let mut written = folders
+            .filter_map(|folder| std::fs::read_to_string(folder.join("http-client.env.json")).ok());
+        let read = |json: String| godcode_core::http::environments(&json);
+        written.next().map_or_else(Vec::new, read)
+    }
+
+    /// The environments to fill the requests with: pick one, or none.
+    fn environments_dialog(&mut self, ctx: &Context) {
+        let Some((rows, mut selected)) = self.environments.take() else {
+            return;
+        };
+        match list_dialog(ctx, "HTTP environment", &rows, &mut selected, None) {
+            None => self.environments = Some((rows, selected)),
+            // The first row is for none of them.
+            Some(Some(row)) => self.environment = rows.get(row).filter(|_| row > 0).cloned(),
+            Some(None) => {}
+        }
     }
 
     /// Look for the tests of every file of the project, out of the way.
@@ -3662,6 +3748,9 @@ impl GodApp {
                 self.test_results = outline::results(&printed);
                 self.test_output.push_str(&printed);
                 self.test_run = None;
+                if std::mem::take(&mut self.covering) {
+                    self.load_coverage();
+                }
                 let failed = self
                     .test_results
                     .iter()
@@ -3806,7 +3895,7 @@ impl GodApp {
         });
         let ctx = ui.ctx().clone();
         if run_all {
-            self.start_tests(&ctx);
+            self.start_tests(&ctx, false);
         }
         if scan {
             self.scan_tests(&ctx);
@@ -4177,7 +4266,13 @@ impl GodApp {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        let Some(request) = godcode_core::http::request_at(&tab.text, self.caret_line) else {
+        let chosen = self.environment.as_ref();
+        let mut environments = self.http_environments().into_iter();
+        let values = environments
+            .find(|(name, _)| Some(name) == chosen)
+            .map_or_else(Vec::new, |(_, values)| values);
+        let request = godcode_core::http::request_in(&tab.text, self.caret_line, &values);
+        let Some(request) = request else {
             self.toasts
                 .error("No request here: write a line such as GET https://example.com");
             return;
@@ -4866,6 +4961,7 @@ impl GodApp {
             stopped: None,
             hints: &[],
             folds: None,
+            coverage: &[],
             block_caret: false,
             revision: 0,
         };
@@ -5430,7 +5526,29 @@ impl GodApp {
                     self.versions = Some((versions, 0));
                 }
             }
-            Cmd::TestResults => self.start_tests(ctx),
+            Cmd::TestResults => self.start_tests(ctx, false),
+            Cmd::RunCoverage => self.start_tests(ctx, true),
+            Cmd::Coverage => match self.coverage.is_empty() {
+                true => self.load_coverage(),
+                false => self.coverage.clear(),
+            },
+            Cmd::Environment => {
+                let found = self.http_environments();
+                if found.is_empty() {
+                    self.toasts.error(
+                        "No environment: write some in http-client.env.json beside the file, \
+                         such as {\"dev\": {\"host\": \"localhost:3000\"}}",
+                    );
+                } else {
+                    let names = found.into_iter().map(|(name, _)| name);
+                    let rows: Vec<String> = std::iter::once("No environment".to_owned())
+                        .chain(names)
+                        .collect();
+                    let chosen = self.environment.as_ref();
+                    let selected = rows.iter().position(|row| Some(row) == chosen);
+                    self.environments = Some((rows, selected.unwrap_or(0)));
+                }
+            }
             Cmd::RunTests => {
                 let beside = self
                     .tabs
@@ -6654,6 +6772,12 @@ impl GodApp {
         let at = self.debug_at.as_ref();
         let stopped = at.filter(|(path, _)| self.tabs[index].path.as_deref() == Some(path));
         let stopped = stopped.map(|(_, line)| *line);
+        let root = self.run_root().filter(|_| !self.coverage.is_empty());
+        let coverage = match (&self.tabs[index].path, &root) {
+            (Some(path), Some(root)) => godcode_core::coverage::of_file(&self.coverage, path, root)
+                .map_or(&[][..], |file| &file.lines),
+            _ => &[],
+        };
         let tab = &mut self.tabs[index];
         // The view of this editor is the one put aside: it is brought in to be shown.
         let borrowed = twin && second != tab.in_second;
@@ -6688,6 +6812,7 @@ impl GodApp {
             breakpoints: &tab.breakpoints,
             conditional: &conditional,
             stopped,
+            coverage,
             hints: &tab.hints,
             folds: tab.folds.as_ref().map(|(stamp, list)| (*stamp, &**list)),
             revision: tab.revision,
@@ -7726,6 +7851,7 @@ impl eframe::App for GodApp {
         self.versions_dialog(&ctx);
         self.themes_dialog(&ctx);
         self.tasks_dialog(&ctx);
+        self.environments_dialog(&ctx);
         self.log_dialog(&ctx);
         self.templates_dialog(&ctx);
         self.toasts.show(&ctx);
@@ -7740,6 +7866,7 @@ impl eframe::App for GodApp {
         storage.set_string("minimap", flag(self.minimap));
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
+        storage.set_string("environment", self.environment.clone().unwrap_or_default());
         let watched: Vec<&str> = self
             .watches
             .iter()

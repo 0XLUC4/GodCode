@@ -142,7 +142,8 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Autres langages que Python : `Edit Debug Configurations` (adaptateur + réglages de lancement, `${file}` et `${folder}`) ; mécanisme fait, aucun autre adaptateur vérifié ici | ✅ |
 | `Run Tests and Show Results` (`Ctrl+Alt+T`, ou `Run all` dans le panneau Tests) : la commande de test du projet tourne hors du terminal, et ce qu'elle imprime est lu (cargo, `pytest -v`, `go test -v`, Jest / Vitest verbeux) : tests échoués du projet en tête, coche ou croix sur ceux du fichier ouvert, compte, et toute la sortie à côté. Format vérifié sur une vraie sortie de `cargo test` ; les autres par leurs formats connus | ✅ |
 | Tests de tout le projet dans le panneau Tests (`Find all`) : fichier par fichier, un clic va au test, coche ou croix d'après le dernier lancement | ✅ |
-| Relance d'un seul test avec résultat, couverture dans la marge | ⏳ |
+| Couverture dans la marge : `Run Tests with Coverage` lance les tests avec leur rapport (cargo llvm-cov, go, pytest-cov, jest), `Show / Hide Coverage` relit un rapport LCOV ou Go déjà là ; ligne atteinte en vert, jamais atteinte en rouge, pourcentage annoncé. Les marques ne suivent pas la frappe | ✅ |
+| Relance d'un seul test avec résultat | ⏳ |
 | Variables dépliables : un clic ouvre une liste ou un objet, ses parties viennent dessous ; points d'arrêt conditionnels : `Breakpoint Condition…` (`Shift+F9`) sur la ligne du curseur, vide pour toujours | ✅ |
 | Pendant un arrêt, le survol d'un nom dans le code dit ce qu'il vaut ; un point d'arrêt conditionnel est dessiné creux dans la marge | ✅ (survol non vu à l'écran) |
 | Les points d'arrêt suivent leur code quand des lignes sont tapées ou effacées au-dessus (dans l'éditeur ; pas après un reformatage) | ✅ |
@@ -170,7 +171,9 @@ Fait : client HTTP — fichiers `.http`, `F5` envoie la requête sous le curseur
 (JSON mis en forme) dans le panneau Response ; passe par `curl`. `@nom = valeur` nomme une
 valeur du fichier, `{{nom}}` la reprend dans l'adresse, les en-têtes et le corps ; la méthode
 `GRAPHQL` poste son corps comme requête, avec ses variables en JSON après une ligne vide.
-Reste : WebSocket, environnements (plusieurs jeux de valeurs), historique des réponses.
+Environnements : `http-client.env.json` à côté du fichier ou à la racine, `HTTP: Choose
+Environment…` choisit le jeu de valeurs, qui l'emporte sur les `@nom` du fichier.
+Reste : WebSocket, historique des réponses.
 
 Fait : **aperçu web en direct** — le dossier est servi sur 127.0.0.1 uniquement, la page se
 recharge seule à chaque sauvegarde. `Live Preview` l'affiche dans la fenêtre, à droite de

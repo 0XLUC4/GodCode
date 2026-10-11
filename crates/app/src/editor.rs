@@ -90,6 +90,8 @@ pub struct Config<'a> {
     pub conditional: &'a [usize],
     /// The line the debugged program is stopped at.
     pub stopped: Option<usize>,
+    /// The lines (from 0, sorted) the tests are known to reach, and how often they ran.
+    pub coverage: &'a [(usize, u64)],
     /// A number that changes whenever the text may have changed since the editor last
     /// showed it.
     pub revision: u64,
@@ -1485,6 +1487,21 @@ pub fn show(
                 painter.circle_filled(centre, 2.0, palette.bg);
             }
         }
+        // A line the tests ran is green at the edge, one they never reached is red.
+        if let Ok(known) = config
+            .coverage
+            .binary_search_by_key(&index, |(line, _)| *line)
+        {
+            let bar = Rect::from_min_max(
+                pos2(gutter.min.x, top),
+                pos2(gutter.min.x + 2.0, top + row_height),
+            );
+            let color = match config.coverage[known].1 {
+                0 => ERROR_COLOR,
+                _ => ADDED_COLOR,
+            };
+            painter.rect_filled(bar, 0.0, color);
+        }
         painter.text(
             pos2(gutter.max.x - GUTTER_PAD, middle),
             Align2::RIGHT_CENTER,
@@ -1786,6 +1803,7 @@ mod tests {
                 stopped: None,
                 hints: &self.hints,
                 folds: None,
+                coverage: &[],
                 block_caret: false,
                 revision: self.revision,
             };

@@ -339,6 +339,27 @@ pub fn test_command(root: &Path) -> Option<&'static str> {
     found.map(|(_, command)| command)
 }
 
+/// The command that runs the tests of the project in `root` and writes down which lines
+/// ran, in one of [`COVERAGE_REPORTS`]; each test is named with whether it passed.
+pub fn coverage_command(root: &Path) -> Option<&'static str> {
+    Some(match test_command(root)? {
+        "cargo test" => "cargo llvm-cov --lcov --output-path lcov.info",
+        "npm test" => "npm test -- --coverage",
+        "go test ./..." => "go test -v ./... -coverprofile=coverage.out",
+        "pytest" => "pytest -v --cov --cov-report=lcov:lcov.info",
+        _ => return None,
+    })
+}
+
+/// Where the report of the lines that ran is looked for, from the root of the project.
+pub const COVERAGE_REPORTS: [&str; 5] = [
+    "lcov.info",
+    "coverage/lcov.info",
+    "coverage.out",
+    "cover.out",
+    "target/llvm-cov/lcov.info",
+];
+
 /// `command`, a command that runs tests, asked to name each test it runs and say whether
 /// it passed, where it does not by itself.
 pub fn with_results(command: &str) -> String {
