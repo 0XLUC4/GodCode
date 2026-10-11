@@ -51,6 +51,7 @@ thèmes sombre/clair, zoom.
 | ~75 langages colorés, langages imbriqués (JS/CSS dans HTML, blocs de code Markdown) | ✅ |
 | Recherche par expression régulière et mot entier | ✅ |
 | Restauration de session, sauvegarde automatique | ✅ |
+| `Toggle Format on Save` : un fichier enregistré à la main est d'abord mis en forme (formateur du langage s'il est installé, sinon l'intégré) ; pas à la sauvegarde automatique, ni par le serveur de langage | ✅ |
 | Mini-map, sticky scroll | ✅ |
 | Diff côte à côte avec le dernier commit, Git blame en fin de ligne, branches (changer, créer) | ✅ |
 | Rechargement des fichiers modifiés hors de l'éditeur | ✅ |

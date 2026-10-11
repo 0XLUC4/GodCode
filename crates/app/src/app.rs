@@ -146,6 +146,7 @@ enum Cmd {
     UnfoldAll,
     StickyScroll,
     AutoSave,
+    FormatOnSave,
     Documentation,
     LanguageServer,
     QuickFix,
@@ -481,6 +482,12 @@ const COMMANDS: &[Spec] = &[
     ),
     spec(Cmd::AutoSave, icon::CLOCK_CLOCKWISE, "Toggle Auto Save", ""),
     spec(
+        Cmd::FormatOnSave,
+        icon::CLOCK_CLOCKWISE,
+        "Toggle Format on Save",
+        "",
+    ),
+    spec(
         Cmd::Documentation,
         icon::INFO,
         "Quick Documentation",
@@ -642,6 +649,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::SaveAs),
             Some(Cmd::SaveAll),
             Some(Cmd::AutoSave),
+            Some(Cmd::FormatOnSave),
             None,
             Some(Cmd::CloseTab),
             Some(Cmd::CloseOthers),
@@ -1383,6 +1391,8 @@ pub struct GodApp {
     sticky: bool,
     /// Files are written a moment after each change.
     autosave: bool,
+    /// A file is formatted when it is saved by hand.
+    format_on_save: bool,
     /// The language servers of the open files.
     servers: Servers,
     /// The requests they have not answered yet.
@@ -1582,6 +1592,7 @@ impl GodApp {
             folds: folds_of(&get("folds").unwrap_or_default()),
             sticky: get("sticky").is_none_or(|value| value == "1"),
             autosave: get("autosave").is_some_and(|value| value == "1"),
+            format_on_save: get("format_on_save").is_some_and(|value| value == "1"),
             servers: Servers::default(),
             asked: std::collections::HashMap::new(),
             diagnostics: std::collections::HashMap::new(),
@@ -4472,21 +4483,27 @@ impl GodApp {
             self.asked.insert(id, Asked::Format);
             return;
         }
+        match self.format_now(ctx) {
+            Ok(Some((before, after))) => self
+                .toasts
+                .success(format!("Reformatted: {before} lines, now {after}")),
+            Ok(None) => self.toasts.success("Already formatted"),
+            Err(complaint) => self.toasts.error(format!("Cannot reformat: {complaint}")),
+        }
+    }
+
+    /// Format the file in front with the formatter of its language when it is installed,
+    /// else the built-in one. Returns its lines before and after when it changed.
+    fn format_now(&mut self, ctx: &Context) -> Result<Option<(usize, usize)>, String> {
         let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
+            return Ok(None);
         };
-        // The formatter of the language when it is installed, else the built-in one.
         let formatted = match tools::format_external(tab.language.name, &tab.text) {
-            Some(Ok(formatted)) => formatted,
-            Some(Err(complaint)) => {
-                self.toasts.error(format!("Cannot reformat: {complaint}"));
-                return;
-            }
+            Some(formatted) => formatted?,
             None => format::format(&tab.text, tab.language, &tab.indent.unit()),
         };
         if formatted == tab.text {
-            self.toasts.success("Already formatted");
-            return;
+            return Ok(None);
         }
         let line = godcode_core::line_col(&tab.text, tab.selection.start).0;
         let before = tab.text.lines().count();
@@ -4495,9 +4512,7 @@ impl GodApp {
         tab.touched();
         let caret = godcode_core::line_start(&tab.text, line);
         tab.select(ctx, caret..caret);
-        let after = tab.text.lines().count();
-        self.toasts
-            .success(format!("Reformatted: {before} lines, now {after}"));
+        Ok(Some((before, tab.text.lines().count())))
     }
 
     /// Grow the selection to the next thing around it, or return to what it grew from.
@@ -4698,6 +4713,15 @@ impl GodApp {
             }
             Cmd::CloseFolder => self.close_folder(),
             Cmd::Save => {
+                // A file that would not format is saved as it is: the complaint is told.
+                let small = |tab: &Tab| tab.text.len() <= editor::LARGE_BYTES;
+                if self.format_on_save
+                    && self.tabs.get(self.active).is_some_and(small)
+                    && let Err(complaint) = self.format_now(ctx)
+                {
+                    self.toasts
+                        .error(format!("Saved without formatting: {complaint}"));
+                }
                 self.save_tab(ctx, self.active, false);
             }
             Cmd::SaveAs => {
@@ -5230,6 +5254,11 @@ impl GodApp {
                 }
             }
             Cmd::StickyScroll => self.sticky = !self.sticky,
+            Cmd::FormatOnSave => {
+                self.format_on_save = !self.format_on_save;
+                let state = if self.format_on_save { "on" } else { "off" };
+                self.toasts.success(format!("Format on save is {state}"));
+            }
             Cmd::AutoSave => {
                 self.autosave = !self.autosave;
                 let state = if self.autosave { "on" } else { "off" };
@@ -7494,6 +7523,7 @@ impl eframe::App for GodApp {
         storage.set_string("folds", folds_text(&self.folds));
         storage.set_string("sticky", flag(self.sticky));
         storage.set_string("autosave", flag(self.autosave));
+        storage.set_string("format_on_save", flag(self.format_on_save));
         storage.set_string("blame", flag(self.blame));
         storage.set_string("scheme", self.scheme.to_string());
         // What is open, to come back to it at the next start.
