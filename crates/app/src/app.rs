@@ -4655,6 +4655,7 @@ impl GodApp {
             note: None,
             snippets: &[],
             breakpoints: &[],
+            conditional: &[],
             stopped: None,
             hints: &[],
             block_caret: false,
@@ -6393,6 +6394,7 @@ impl GodApp {
             tab.view.focus = false;
         }
         let unit = tab.indent.unit();
+        let conditional: Vec<usize> = tab.conditions.keys().copied().collect();
         let config = editor::Config {
             language: tab.language,
             font_size,
@@ -6413,6 +6415,7 @@ impl GodApp {
             note: note.as_deref(),
             snippets,
             breakpoints: &tab.breakpoints,
+            conditional: &conditional,
             stopped,
             hints: &tab.hints,
             revision: tab.revision,

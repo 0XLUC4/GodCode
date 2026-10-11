@@ -141,7 +141,8 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | `Run Tests and Show Results` (`Ctrl+Alt+T`, ou `Run all` dans le panneau Tests) : la commande de test du projet tourne hors du terminal, et ce qu'elle imprime est lu (cargo, `pytest -v`, `go test -v`, Jest / Vitest verbeux) : tests échoués du projet en tête, coche ou croix sur ceux du fichier ouvert, compte, et toute la sortie à côté. Format vérifié sur une vraie sortie de `cargo test` ; les autres par leurs formats connus | ✅ |
 | Explorateur de tests du projet par fichier, relance d'un seul test avec résultat, couverture | ⏳ |
 | Variables dépliables : un clic ouvre une liste ou un objet, ses parties viennent dessous ; points d'arrêt conditionnels : `Breakpoint Condition…` (`Shift+F9`) sur la ligne du curseur, vide pour toujours | ✅ |
-| Débogueur : survol d'une variable dans le code, point d'arrêt conditionnel dessiné autrement dans la marge, modifier une valeur | ⏳ |
+| Pendant un arrêt, le survol d'un nom dans le code dit ce qu'il vaut ; un point d'arrêt conditionnel est dessiné creux dans la marge | ✅ (survol non vu à l'écran) |
+| Débogueur : modifier une valeur, points d'arrêt qui suivent les lignes quand on édite au-dessus | ⏳ |
 
 Vérifié de bout en bout avec le vrai débogueur Python (debugpy) : arrêt sur un point d'arrêt,
 pile, variables et leurs parties, expressions surveillées, point d'arrêt conditionnel,
