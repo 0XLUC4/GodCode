@@ -187,7 +187,9 @@ Reste : bases de données (SQLite et PostgreSQL d'abord), Docker.
 ### Phase 7 — personnalisation et extensions (⏳)
 
 Fait : 6 thèmes (GodCode Dark/Light, Darcula, Monokai, Solarized Light, High Contrast),
-mode Zen (`Ctrl+Alt+Z`). Reste : créateur de thèmes, polices, dispositions enregistrables,
+mode Zen (`Ctrl+Alt+Z`). `Editor Font…` choisit le fichier de police (.ttf, .otf) qui dessine le code,
+`Reset Editor Font` revient à celle d'origine ; une police à chasse fixe est attendue.
+Reste : créateur de thèmes, dispositions enregistrables,
 langues d'interface ;
 API de plugins (WASM isolé) une fois le cœur stable.
 

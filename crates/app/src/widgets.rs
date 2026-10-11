@@ -18,10 +18,26 @@ pub const ICON_BUTTON: Vec2 = vec2(28.0, 28.0);
 /// Side of a compact icon-only button (tab close, steppers).
 pub const SMALL_ICON_BUTTON: Vec2 = vec2(22.0, 22.0);
 
-/// Install the icon fonts: outlines as a fallback of the text font, solid shapes as a
-/// family of their own.
-pub fn install_icons(ctx: &Context) {
+/// Whether `bytes` are those of a font file: TrueType, OpenType or a collection of them.
+pub fn is_font(bytes: &[u8]) -> bool {
+    let starts: [&[u8]; 4] = [&[0, 1, 0, 0], b"OTTO", b"true", b"ttcf"];
+    starts.iter().any(|start| bytes.starts_with(start))
+}
+
+/// Install the fonts. `code`: the bytes of a font file the code is drawn with, instead of
+/// the built-in one. The icon fonts: outlines as a fallback of the text font, solid
+/// shapes as a family of their own.
+pub fn install_fonts(ctx: &Context, code: Option<Vec<u8>>) {
     let mut fonts = egui::FontDefinitions::default();
+    if let Some(bytes) = code {
+        let name = "code";
+        fonts
+            .font_data
+            .insert(name.into(), egui::FontData::from_owned(bytes).into());
+        // First of its family: the built-in font still draws what it lacks.
+        let family = fonts.families.entry(FontFamily::Monospace).or_default();
+        family.insert(0, name.into());
+    }
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     fonts.font_data.insert(
         FILLED.into(),

@@ -159,6 +159,8 @@ enum Cmd {
     RunTests,
     TestResults,
     Themes,
+    Font,
+    FontReset,
     Zen,
     CaretAbove,
     CaretBelow,
@@ -533,6 +535,8 @@ const COMMANDS: &[Spec] = &[
         "Ctrl+Alt+T",
     ),
     spec(Cmd::Themes, icon::PALETTE, "Color Theme…", ""),
+    spec(Cmd::Font, icon::PALETTE, "Editor Font…", ""),
+    spec(Cmd::FontReset, icon::PALETTE, "Reset Editor Font", ""),
     spec(Cmd::Zen, icon::EYE, "Toggle Zen Mode", "Ctrl+Alt+Z"),
     spec(
         Cmd::CaretAbove,
@@ -724,6 +728,8 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::SplitSame),
             Some(Cmd::Zen),
             Some(Cmd::Themes),
+            Some(Cmd::Font),
+            Some(Cmd::FontReset),
             Some(Cmd::Preview),
             Some(Cmd::Minimap),
             Some(Cmd::Keys),
@@ -1448,6 +1454,8 @@ pub struct GodApp {
     was_focused: bool,
     /// The colour scheme, by its place in the list.
     scheme: usize,
+    /// The file of the font the code is drawn with, when it is not the built-in one.
+    font: Option<PathBuf>,
     /// The schemes to pick from are shown, and the one chosen.
     themes: Option<usize>,
     /// Only the code shows: no bars, no panels.
@@ -1525,7 +1533,12 @@ impl GodApp {
             .unwrap_or(usize::from(!dark));
         let dark = theme::SCHEMES[scheme].dark;
         theme::install(&cc.egui_ctx, scheme);
-        widgets::install_icons(&cc.egui_ctx);
+        // The font the user chose for the code, when its file is still there and is one.
+        let font = get("font")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let code = font.as_deref().and_then(|path| std::fs::read(path).ok());
+        widgets::install_fonts(&cc.egui_ctx, code.filter(|bytes| widgets::is_font(bytes)));
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -1622,6 +1635,7 @@ impl GodApp {
             versions: None,
             was_focused: false,
             scheme,
+            font,
             themes: None,
             zen: false,
             tasks: None,
@@ -5123,6 +5137,25 @@ impl GodApp {
             Cmd::Diff => self.compare_with_commit(ctx),
             Cmd::Blame => self.blame = !self.blame,
             Cmd::Themes => self.themes = Some(self.scheme),
+            Cmd::Font => {
+                if let Some(path) = platform::pick_font() {
+                    match std::fs::read(&path) {
+                        Ok(bytes) if widgets::is_font(&bytes) => {
+                            widgets::install_fonts(ctx, Some(bytes));
+                            self.toasts
+                                .success(format!("Code is drawn with {}", file_name(&path)));
+                            self.font = Some(path);
+                        }
+                        Ok(_) => self.toasts.error("This file is not a font"),
+                        Err(err) => self.toasts.error(format!("Cannot read the font: {err}")),
+                    }
+                }
+            }
+            Cmd::FontReset => {
+                widgets::install_fonts(ctx, None);
+                self.font = None;
+                self.toasts.success("Code is drawn with the built-in font");
+            }
             Cmd::Zen => self.zen = !self.zen,
             Cmd::CaretAbove => self.add_caret(false),
             Cmd::CaretBelow => self.add_caret(true),
@@ -7526,6 +7559,8 @@ impl eframe::App for GodApp {
         storage.set_string("format_on_save", flag(self.format_on_save));
         storage.set_string("blame", flag(self.blame));
         storage.set_string("scheme", self.scheme.to_string());
+        let font = self.font.as_ref().map(|path| path.display().to_string());
+        storage.set_string("font", font.unwrap_or_default());
         // What is open, to come back to it at the next start.
         let shown = |path: &Path| path.display().to_string();
         let folder = self.folder().map(|folder| shown(&folder));
@@ -7943,6 +7978,23 @@ fn text_on_disk(path: &Path) -> Option<Decoded> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_font_file_is_told_from_another() {
+        assert!(widgets::is_font(&[0, 1, 0, 0, 9, 9]));
+        assert!(widgets::is_font(b"OTTO...") && widgets::is_font(b"ttcf..."));
+        assert!(!widgets::is_font(b"%PDF-1.7") && !widgets::is_font(&[]));
+        // A font of this system, when there is one, is one.
+        if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/consola.ttf") {
+            assert!(widgets::is_font(&bytes));
+            // And code is drawn with it without a hitch.
+            let ctx = Context::default();
+            widgets::install_fonts(&ctx, Some(bytes));
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.label(RichText::new("let code = 1;").monospace());
+            });
+        }
+    }
 
     #[test]
     fn a_typed_address_is_made_whole() {

@@ -12,6 +12,17 @@ pub fn pick_folder(start: Option<&Path>) -> Option<PathBuf> {
     dialog(start).pick_folder()
 }
 
+/// Ask for a font file, starting where the system keeps its own.
+pub fn pick_font() -> Option<PathBuf> {
+    let dialog = rfd::FileDialog::new().add_filter("Font", &["ttf", "otf", "ttc"]);
+    let system = Path::new("C:/Windows/Fonts");
+    match system.is_dir() {
+        true => dialog.set_directory(system),
+        false => dialog,
+    }
+    .pick_file()
+}
+
 /// Ask where to save a file called `name`.
 pub fn pick_save(name: &str, start: Option<&Path>) -> Option<PathBuf> {
     dialog(start).set_file_name(name).save_file()
