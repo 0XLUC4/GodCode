@@ -399,6 +399,15 @@ impl Servers {
         Some((server.hints(path, start..end), start..end, end == total))
     }
 
+    /// Ask what folds in `path`; `None` as long as its server has not been told the text
+    /// of this `revision`.
+    pub fn folds(&mut self, path: &Path, revision: u64) -> Option<u64> {
+        let mut running = self.running.iter_mut();
+        let serving = running.find(|running| running.sent.get(path) == Some(&revision))?;
+        let able = |server: &&mut godcode_lsp::Server| server.can("foldingRangeProvider");
+        Some(Some(&mut serving.server).filter(able)?.folds(path))
+    }
+
     /// Ask the server of `path` for the definitions of its project named like `query`.
     pub fn symbols(&mut self, path: &Path, query: &str) -> Option<u64> {
         Some(self.able(path, "workspaceSymbolProvider")?.symbols(query))

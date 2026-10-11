@@ -35,7 +35,13 @@ pub struct Index {
     pub indents: Vec<Option<usize>>,
     /// For a line that leaves a bracket open, the line that closes it.
     closes: Vec<Option<usize>>,
+    /// What a language server said folds, and the number its answer came with: it is
+    /// believed instead of the brackets and the indentation.
+    given: Option<(u64, Vec<Fold>)>,
 }
+
+/// A block as a language server tells it: the line that opens it, the last line it hides.
+pub type Fold = (usize, usize);
 
 /// For each line that leaves a bracket open, the line that closes it. Brackets in strings
 /// and in comments do not count; prose has none that open a block.
@@ -88,6 +94,7 @@ impl Index {
         Self {
             key,
             closes: closers(text, starts.len() - 1, &spans, language),
+            given: None,
             starts,
             chars,
             spans,
@@ -172,6 +179,13 @@ impl Index {
     /// closes the bracket it leaves open, or else those under it that are indented deeper,
     /// the blank ones between them too.
     pub fn block(&self, header: usize) -> Option<Range<usize>> {
+        if let Some((_, given)) = &self.given {
+            // Of several that start on a line, the longest comes last.
+            let after = given.partition_point(|(first, _)| *first <= header);
+            let (first, last) = *given[..after].last()?;
+            let end = (last + 1).min(self.lines());
+            return (first == header && end > header + 1).then(|| header + 1..end);
+        }
         if let Some(close) = self.closes.get(header).copied().flatten() {
             return (close > header + 1).then(|| header + 1..close);
         }
@@ -863,6 +877,9 @@ pub struct Look<'a> {
     pub min_size: Vec2,
     /// What a language server writes in the lines, sorted by line then by column.
     pub hints: &'a [Hint],
+    /// What a language server says folds, sorted, and a number that changes with its
+    /// answers; `None` when none says: the brackets and the indentation tell.
+    pub folds: Option<(u64, &'a [Fold])>,
     /// The caret covers its char instead of standing before it: keys are commands.
     pub block_caret: bool,
     /// Lines too long for the view go on below instead of running off it.
@@ -1295,13 +1312,10 @@ pub fn show(
     if let (true, true, Some(index)) = (followed, changed, &mut cache.index) {
         Arc::make_mut(index).key = key;
     }
-    let index = match cache.index.as_ref().filter(|index| index.key == key) {
+    let mut given = cache.index.as_ref().and_then(|index| index.given.clone());
+    let mut index = match cache.index.as_ref().filter(|index| index.key == key) {
         Some(index) => Arc::clone(index),
-        None => {
-            let index = Arc::new(Index::new(key, text, look.language));
-            cache.index = Some(Arc::clone(&index));
-            index
-        }
+        None => Arc::new(Index::new(key, text, look.language)),
     };
 
     // The folds follow the text: lines typed above them push them down; a text changed
@@ -1312,11 +1326,36 @@ pub fn show(
             Some(edited) if changed => {
                 let below = folded.iter_mut().filter(|header| **header > edited);
                 below.for_each(|header| *header = header.saturating_add_signed(grown));
+                // What the server said follows too, until it says again.
+                for (first, last) in given.iter_mut().flat_map(|(_, list)| list) {
+                    if *first > edited {
+                        *first = first.saturating_add_signed(grown);
+                    }
+                    if *last >= edited {
+                        *last = last.saturating_add_signed(grown);
+                    }
+                }
             }
-            _ if grown != 0 => folded.clear(),
+            _ if grown != 0 => {
+                folded.clear();
+                given = None;
+            }
             _ => {}
         }
     }
+    match look.folds {
+        Some((stamp, list)) if given.as_ref().is_none_or(|(had, _)| *had != stamp) => {
+            given = Some((stamp, list.to_vec()));
+        }
+        None => given = None,
+        _ => {}
+    }
+    if index.given != given {
+        // Let go of here first, it is not copied to be changed.
+        cache.index = None;
+        Arc::make_mut(&mut index).given = given;
+    }
+    cache.index = Some(Arc::clone(&index));
     folded.retain(|header| index.block(*header).is_some());
     // A caret is never left where it cannot be seen: its block opens.
     if let Some(caret) = caret {
@@ -1332,7 +1371,7 @@ pub fn show(
     // The rows of the lines, counted again when the text, the folds or the width change.
     let rows_key = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (index.key, &*folded, wrap).hash(&mut hasher);
+        (index.key, &index.given, &*folded, wrap).hash(&mut hasher);
         hasher.finish()
     };
     let rows = match &cache.rows {
@@ -1713,6 +1752,29 @@ mod tests {
         // Prose is folded by its indentation alone.
         let prose = Index::new(0, "a (\n  b\nc)\n", Language::plain());
         assert_eq!(prose.block(0), Some(1..2));
+    }
+
+    #[test]
+    fn what_a_server_says_folds_is_believed_over_the_brackets() {
+        let text = "// one
+// two
+fn a() {
+    b(
+        1,
+    );
+}
+";
+        let language = Language::of(std::path::Path::new("a.rs"));
+        let mut index = Index::new(0, text, language);
+        assert_eq!((index.block(0), index.block(2)), (None, Some(3..6)));
+        // The comment folds, the call does not; of two on a line the longest is kept.
+        index.given = Some((1, vec![(0, 1), (2, 3), (2, 5), (6, 40)]));
+        assert_eq!(index.block(0), Some(1..2));
+        assert_eq!(index.block(2), Some(3..6));
+        assert_eq!((index.block(1), index.block(3)), (None, None));
+        assert_eq!((index.header_of(1), index.header_of(4)), (Some(0), Some(2)));
+        // Lines the text does not have are not hidden.
+        assert_eq!(index.block(6), Some(7..8));
     }
 
     #[test]

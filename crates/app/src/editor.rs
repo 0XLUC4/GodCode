@@ -95,6 +95,8 @@ pub struct Config<'a> {
     pub revision: u64,
     /// What the language server writes in the lines.
     pub hints: &'a [field::Hint],
+    /// What the language server says folds (see [`field::Look::folds`]).
+    pub folds: Option<(u64, &'a [field::Fold])>,
     /// The caret covers its char: keys are commands (Vim).
     pub block_caret: bool,
 }
@@ -1090,6 +1092,7 @@ pub fn show(
                 margin: MARGIN,
                 min_size: body.size(),
                 hints: config.hints,
+                folds: config.folds,
                 block_caret: config.block_caret,
                 wrap: config.wrap,
                 // What the keys just did to the text is not in the revision yet.
@@ -1782,6 +1785,7 @@ mod tests {
                 conditional: &[],
                 stopped: None,
                 hints: &self.hints,
+                folds: None,
                 block_caret: false,
                 revision: self.revision,
             };

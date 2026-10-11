@@ -932,6 +932,10 @@ struct Tab {
     /// stay as they are until it has answered about the text typed since.
     hints: Vec<Hint>,
     hints_at: Option<(u64, Range<usize>, bool)>,
+    /// What the language server says folds, with the revision of the text it said it of;
+    /// and the revision it was last asked about.
+    folds: Option<(u64, Vec<crate::field::Fold>)>,
+    folds_at: Option<u64>,
     /// The view of the other editor, when this file shows in both.
     other: Option<Twin>,
     /// `view` and `selection` are those of the second editor; `other` holds the first's.
@@ -980,6 +984,8 @@ impl Tab {
             lines: 0,
             hints: Vec::new(),
             hints_at: None,
+            folds: None,
+            folds_at: None,
             other: None,
             in_second: false,
         }
@@ -1189,6 +1195,11 @@ enum Asked {
     Fixes,
     /// What is written in the lines of a tab, as its text then was.
     Hints {
+        tab: u64,
+        revision: u64,
+    },
+    /// What folds in a tab, as its text then was.
+    Folds {
         tab: u64,
         revision: u64,
     },
@@ -2682,6 +2693,24 @@ impl GodApp {
         }
     }
 
+    /// Ask the language server what folds in the file in front, again when its text changes.
+    fn ask_folds(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(path) = tab.path.as_deref() else {
+            return;
+        };
+        if tab.folds_at == Some(tab.revision) {
+            return;
+        }
+        if let Some(asked) = self.servers.folds(path, tab.revision) {
+            tab.folds_at = Some(tab.revision);
+            let (tab, revision) = (tab.id, tab.revision);
+            self.asked.insert(asked, Asked::Folds { tab, revision });
+        }
+    }
+
     /// Take in what the language servers answered.
     fn poll_servers(&mut self, ctx: &Context) {
         for event in self.servers.poll() {
@@ -2862,6 +2891,17 @@ impl GodApp {
                     if let Some(tab) = tabs.find(|open| open.id == tab && open.revision == revision)
                     {
                         tab.hints = servers::placed(&tab.text, list);
+                    }
+                }
+                ServerEvent::Folds { id, list } => {
+                    let Some(Asked::Folds { tab, revision }) = self.asked.remove(&id) else {
+                        continue;
+                    };
+                    let mut tabs = self.tabs.iter_mut();
+                    if let Some(tab) = tabs.find(|open| open.id == tab && open.revision == revision)
+                    {
+                        let lines = list.into_iter().map(|fold| (fold.first, fold.last));
+                        tab.folds = Some((revision, lines.collect()));
                     }
                 }
                 ServerEvent::Exited { .. } => {}
@@ -4825,6 +4865,7 @@ impl GodApp {
             conditional: &[],
             stopped: None,
             hints: &[],
+            folds: None,
             block_caret: false,
             revision: 0,
         };
@@ -6648,6 +6689,7 @@ impl GodApp {
             conditional: &conditional,
             stopped,
             hints: &tab.hints,
+            folds: tab.folds.as_ref().map(|(stamp, list)| (*stamp, &**list)),
             revision: tab.revision,
             block_caret: front && self.keys == Keys::Vim && self.vim.mode != modal::Mode::Insert,
         };
@@ -7553,6 +7595,7 @@ impl eframe::App for GodApp {
         self.poll_servers(&ctx);
         // After the servers were heard: one that just said what it can do is asked at once.
         self.ask_hints();
+        self.ask_folds();
         self.poll_debug(&ctx);
         self.poll_tests();
         // The tab in front is the most recent of the recent files.

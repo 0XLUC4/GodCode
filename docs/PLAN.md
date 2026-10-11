@@ -117,7 +117,7 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Saisie par IME : texte en cours de composition, fenêtre de l'IME placée au curseur | ✅ testé par événements simulés, pas avec un vrai IME |
 | Défilement automatique pendant une sélection à la souris | ✅ |
 | Repli de code : flèche près du numéro de ligne, `Fold / Unfold Block`, `Unfold All` ; un bloc est ce que tient un crochet laissé ouvert (hors chaînes et commentaires), sinon ce qui est indenté plus loin ; il s'ouvre quand le curseur y entre ; les replis sont gardés d'une session à l'autre | ✅ |
-| Repli donné par le serveur de langage (`textDocument/foldingRange`) | ⏳ |
+| Repli donné par le serveur de langage (`textDocument/foldingRange`) : quand il en donne, ce sont ses blocs qui se replient (commentaires, imports, régions compris) ; ils suivent la frappe jusqu'à sa réponse suivante | ✅ |
 | Indices en ligne (inlay hints) : écrits dans la ligne sans faire partie du texte ; demandés pour les lignes autour de la vue (100 au-dessus, 300 en dessous), à chaque changement et quand la vue en sort ; `Toggle Inlay Hints` les coupe. Le serveur TypeScript est réglé pour en donner, rust-analyzer et clangd en donnent d'eux-mêmes (non lancés ici) | ✅ |
 | Indices suivis pendant la frappe (aujourd'hui : les anciens restent un instant, parfois décalés, jusqu'à la réponse du serveur) | ⏳ |
 | Sélection en colonnes : `Alt+Maj+glisser` ou `Ctrl+Alt+Maj+flèches` ; ce qui est tapé remplace chaque ligne du rectangle, puis chaque ligne garde un curseur | ✅ |
