@@ -2,3 +2,6 @@ target/
 
 
 dist/
+
+# Working copies of agents.
+.claude/
