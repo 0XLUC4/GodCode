@@ -5393,6 +5393,8 @@ impl GodApp {
             let mut taken = false;
             for stroke in strokes {
                 let done = if vim {
+                    // One level of indent is what it is in this file.
+                    self.vim.unit = tab.indent.unit();
                     self.vim.key(&mut tab.text, &tab.selection, stroke)
                 } else {
                     self.emacs.key(&mut tab.text, &tab.selection, stroke)
@@ -5410,12 +5412,14 @@ impl GodApp {
                 if let Some(copied) = done.copied {
                     ctx.copy_text(copied);
                 }
-                clicked.extend(done.ask.map(|ask| match ask {
-                    Ask::Undo => Cmd::Undo,
-                    Ask::Redo => Cmd::Redo,
-                    Ask::Find => Cmd::Find,
-                    Ask::Save => Cmd::Save,
-                    Ask::Open => Cmd::OpenFile,
+                clicked.extend(done.ask.into_iter().flat_map(|ask| match ask {
+                    Ask::Undo => vec![Cmd::Undo],
+                    Ask::Redo => vec![Cmd::Redo],
+                    Ask::Find => vec![Cmd::Find],
+                    Ask::Save => vec![Cmd::Save],
+                    Ask::Open => vec![Cmd::OpenFile],
+                    Ask::Close => vec![Cmd::CloseTab],
+                    Ask::SaveClose => vec![Cmd::Save, Cmd::CloseTab],
                 }));
             }
             if !taken {
@@ -5851,8 +5855,15 @@ impl GodApp {
                         (Keys::Vim, modal::Mode::Visual) => "-- VISUAL --",
                         (Keys::Vim, modal::Mode::VisualLine) => "-- VISUAL LINE --",
                     };
-                    if !keys.is_empty() {
-                        ui.label(dim(keys.to_owned()));
+                    // A command being typed after `:` shows as it is typed.
+                    match self.vim.typing().filter(|_| self.keys == Keys::Vim) {
+                        Some(typed) => {
+                            ui.label(dim(format!(":{typed}")));
+                        }
+                        None if !keys.is_empty() => {
+                            ui.label(dim(keys.to_owned()));
+                        }
+                        None => {}
                     }
                     ui.label(dim(tab.ending.name().to_owned()));
                     ui.label(dim("UTF-8".to_owned()));

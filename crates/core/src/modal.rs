@@ -27,6 +27,10 @@ pub enum Ask {
     Find,
     Save,
     Open,
+    /// Close the file.
+    Close,
+    /// Save the file, then close it.
+    SaveClose,
 }
 
 /// What a key did.
@@ -207,6 +211,10 @@ pub struct Vim {
     insert_from: Option<(usize, usize)>,
     /// `.` is doing the last command again: nothing is recorded meanwhile.
     replaying: bool,
+    /// The command being typed after a `:`.
+    line: Option<String>,
+    /// What one level of indent is, for `>>` and `<<`: four spaces unless told.
+    pub unit: String,
 }
 
 impl Vim {
@@ -238,6 +246,31 @@ impl Vim {
             // Out of insert mode the caret is on a char: the one just typed.
             let at = at.max(line_start(&chars, at) + 1) - 1;
             self.mode = Mode::Normal;
+            done.selection = at..at;
+            self.shown = done.selection.clone();
+            return Some(done);
+        }
+        // After a `:`, keys write a command, which Enter carries out.
+        if let Some(mut typed) = self.line.take() {
+            let mut at = selection.start.min(chars.len());
+            match key {
+                Stroke::Char(ch) => {
+                    typed.push(ch);
+                    self.line = Some(typed);
+                }
+                Stroke::Backspace => self.line = typed.pop().map(|_| typed),
+                Stroke::Enter => match typed.trim() {
+                    "w" => done.ask = Some(Ask::Save),
+                    "q" | "q!" => done.ask = Some(Ask::Close),
+                    "wq" | "x" => done.ask = Some(Ask::SaveClose),
+                    number => {
+                        if let Ok(number) = number.parse::<usize>() {
+                            at = line_numbered(&chars, number);
+                        }
+                    }
+                },
+                _ => {}
+            }
             done.selection = at..at;
             self.shown = done.selection.clone();
             return Some(done);
@@ -304,6 +337,12 @@ impl Vim {
                 self.count = self.count * 10 + digit as usize - '0' as usize;
                 self.pending = pending;
                 keep_count = true;
+            }
+            // `>>` and `<<` push lines in and out by one level.
+            (Some(op @ ('>' | '<')), Stroke::Char(again)) if op == again => {
+                let last = (1..times).fold(at, |at, _| vertical(&chars, at, true));
+                at = shift(&mut chars, at, last, op == '>', self.indent());
+                done.changed = true;
             }
             // An operator typed twice is done on whole lines.
             (Some(op), Stroke::Char(again)) if op == again && "dcy".contains(op) => {
@@ -411,6 +450,18 @@ impl Vim {
         Some(done)
     }
 
+    /// The command being typed after a `:`, to show while it is.
+    pub fn typing(&self) -> Option<&str> {
+        self.line.as_deref()
+    }
+
+    fn indent(&self) -> &str {
+        match self.unit.as_str() {
+            "" => "    ",
+            unit => unit,
+        }
+    }
+
     /// `.`: the last command that changed the text, done again where the caret is now,
     /// with what was typed after it in insert mode.
     fn repeat(&mut self, text: &mut String, selection: &Range<usize>) -> Done {
@@ -509,6 +560,12 @@ impl Vim {
             let (low, high) = (self.anchor.min(at), self.anchor.max(at));
             let by_lines = self.mode == Mode::VisualLine;
             let op = match named {
+                '>' | '<' => {
+                    let unit = self.indent().to_owned();
+                    self.mode = Mode::Normal;
+                    done.changed = true;
+                    return shift(chars, low, high, named == '>', &unit);
+                }
                 'd' | 'x' => 'd',
                 'c' | 'y' => named,
                 'v' | 'V' => {
@@ -525,7 +582,8 @@ impl Vim {
             return self.operate(chars, (op, at), range, by_lines, done);
         }
         match named {
-            'd' | 'c' | 'y' | 'g' | 'r' => self.pending = Some(named),
+            'd' | 'c' | 'y' | 'g' | 'r' | '>' | '<' => self.pending = Some(named),
+            ':' => self.line = Some(String::new()),
             'x' => {
                 let range = at..(at + times).min(end);
                 return self.operate(chars, ('d', at), range, false, done);
@@ -722,6 +780,33 @@ fn object(chars: &[char], at: usize, named: char, around: bool) -> Option<Range<
     } else {
         opened + 1..closed
     })
+}
+
+/// Push the lines from the one of `first` to the one of `last` one `unit` in (`deeper`) or
+/// out. Returns the first letter of the first of them, where the caret goes.
+fn shift(chars: &mut Vec<char>, first: usize, last: usize, deeper: bool, unit: &str) -> usize {
+    let top = line_start(chars, first.min(last));
+    let mut start = line_start(chars, first.max(last));
+    // From the last line up, so that the lines still to move stay where they are.
+    loop {
+        let end = line_end(chars, start);
+        if deeper && end > start {
+            chars.splice(start..start, unit.chars());
+        } else if !deeper {
+            let blank = chars[start..end].iter().take_while(|ch| **ch == ' ');
+            let spaces = blank.count().min(unit.chars().count());
+            let taken = match chars.get(start) {
+                Some('\t') => 1,
+                _ => spaces,
+            };
+            chars.drain(start..start + taken);
+        }
+        if start <= top {
+            break;
+        }
+        start = line_start(chars, start - 1);
+    }
+    first_text(chars, top)
 }
 
 /// The bracket that goes with the first one at or after `at` on its line.
@@ -940,6 +1025,7 @@ mod tests {
         for key in keys.chars() {
             let stroke = match key {
                 '\u{1b}' => Stroke::Escape,
+                '\r' => Stroke::Enter,
                 key => Stroke::Char(key),
             };
             match vim.key(&mut text, &selection, stroke) {
@@ -1069,6 +1155,43 @@ mod tests {
         assert_eq!(vim("f(a, b) + c", 1, "d%"), ("f + c".to_owned(), 1));
         assert_eq!(vim("aBc é", 0, "~~~"), ("AbC é".to_owned(), 3));
         assert_eq!(vim("ab", 0, "3~"), ("AB".to_owned(), 1));
+    }
+
+    #[test]
+    fn vim_shifts_lines_and_takes_commands() {
+        assert_eq!(vim("a\nb", 0, ">>"), ("    a\nb".to_owned(), 4));
+        assert_eq!(vim("a\n\nb", 0, "3>>"), ("    a\n\n    b".to_owned(), 4));
+        assert_eq!(
+            vim("      a\n  b\n\tc", 0, "3<<"),
+            ("  a\nb\nc".to_owned(), 2)
+        );
+        assert_eq!(vim("a\nb\nc", 0, "Vj>"), ("    a\n    b\nc".to_owned(), 4));
+        assert_eq!(vim("    a", 4, "<<."), ("a".to_owned(), 0));
+        // `:` and a number go to that line; a command is asked of the application.
+        assert_eq!(vim("a\nb\nc", 0, ":3\r").1, 4);
+        let mut vim = Vim::default();
+        let mut text = "one".to_owned();
+        let mut ask = |keys: &str| {
+            let mut asked = None;
+            for key in keys.chars() {
+                let stroke = match key {
+                    '\r' => Stroke::Enter,
+                    '\u{8}' => Stroke::Backspace,
+                    key => Stroke::Char(key),
+                };
+                asked = vim
+                    .key(&mut text, &(1..1), stroke)
+                    .and_then(|done| done.ask);
+            }
+            (asked, vim.typing().map(str::to_owned))
+        };
+        assert_eq!(ask(":w"), (None, Some("w".to_owned())));
+        assert_eq!(ask("\r"), (Some(Ask::Save), None));
+        assert_eq!(ask(":wq\r").0, Some(Ask::SaveClose));
+        assert_eq!(ask(":q!\r").0, Some(Ask::Close));
+        // Erased back past its start, the command is given up.
+        assert_eq!(ask(":x\u{8}\u{8}"), (None, None));
+        assert_eq!(text, "one");
     }
 
     #[test]
