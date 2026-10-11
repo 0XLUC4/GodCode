@@ -32,6 +32,16 @@ pub enum Ask {
     Close,
     /// Save the file, then close it.
     SaveClose,
+    /// `m` and a capital letter: keep this place of the file, counted in chars, under that
+    /// letter. Such a mark names a place in a file, whichever file is shown: the
+    /// application keeps it, with the file it is in.
+    SetFileMark(char, usize),
+    /// A quote or a backtick and a capital letter: show the file that mark is in, the caret
+    /// at its place, or with `line_start` (a quote) on the first letter of its line.
+    GoToFileMark {
+        mark: char,
+        line_start: bool,
+    },
 }
 
 /// What a key did.
@@ -218,6 +228,83 @@ impl Places {
     }
 }
 
+/// A substitution that asks before each change: `:s` with the flag `c`, from Enter to the
+/// last answer.
+struct Asking {
+    wanted: regex::Regex,
+    replacement: String,
+    /// Every match on a line is asked about, not the first only: the flag `g`.
+    all: bool,
+    /// The line being read, as it was before anything was written in it.
+    line: String,
+    /// Which of the matches on that line is asked about: 0 for the first.
+    nth: usize,
+    /// How many bytes of `line` are answered for, and where in the text what follows them
+    /// is now.
+    read: usize,
+    at: usize,
+    /// How many lines are still to read after this one.
+    left: usize,
+    /// The match asked about, in the text.
+    found: Range<usize>,
+}
+
+impl Asking {
+    /// Find the next match to ask about: on the line being read, or on the lines after it.
+    /// False when there is none.
+    fn seek(&mut self, chars: &[char]) -> bool {
+        loop {
+            let matches = self.wanted.find_iter(&self.line);
+            // Without the flag `g`, one match a line.
+            let limit = if self.all { usize::MAX } else { 1 };
+            let next = matches.take(limit).nth(self.nth);
+            if let Some(next) = next {
+                let start = self.at + self.line[self.read..next.start()].chars().count();
+                self.found = start..start + next.as_str().chars().count();
+                return true;
+            }
+            let start = self.at + self.line[self.read..].chars().count() + 1;
+            // No line there when the text was changed by something else meanwhile.
+            if self.left == 0 || chars.get(start - 1) != Some(&'\n') {
+                return false;
+            }
+            self.left -= 1;
+            self.line = chars[start..line_end(chars, start)].iter().collect();
+            (self.nth, self.read, self.at) = (0, 0, start);
+        }
+    }
+
+    /// Answer for the match asked about: write the replacement in its place (`write`), or
+    /// leave it as it is. False when the match is no longer there: the text was changed by
+    /// something else meanwhile.
+    fn answer(&mut self, chars: &mut Vec<char>, places: &mut Places, write: bool) -> bool {
+        let Some(found) = self.wanted.captures_iter(&self.line).nth(self.nth) else {
+            return false;
+        };
+        let Some(whole) = found.get(0) else {
+            return false;
+        };
+        let there = chars.get(self.found.clone());
+        if !there.is_some_and(|there| there.iter().copied().eq(whole.as_str().chars())) {
+            return false;
+        }
+        let mut written = String::new();
+        if write {
+            replaced(&found, &self.replacement, &mut written);
+        }
+        let read = whole.end();
+        let mut after = self.found.end;
+        if write {
+            let added = written.chars().count();
+            edited(places, self.found.start, self.found.len(), added);
+            chars.splice(self.found.clone(), written.chars());
+            after = self.found.start + added;
+        }
+        (self.nth, self.read, self.at) = (self.nth + 1, read, after);
+        true
+    }
+}
+
 /// Vim: its mode and what it remembers between keys.
 #[derive(Default)]
 pub struct Vim {
@@ -276,6 +363,8 @@ pub struct Vim {
     global: bool,
     /// The pattern and the replacement of the last `:s`, for `&` and a bare `:s`.
     last_substitute: Option<(String, String)>,
+    /// The substitution that is asking before each change: keys are answers meanwhile.
+    asking: Option<Asking>,
     /// What one level of indent is, for `>>` and `<<`: four spaces unless told.
     pub unit: String,
 }
@@ -311,6 +400,10 @@ impl Vim {
 
     /// What `key` does, whoever types it.
     fn press(&mut self, text: &mut String, selection: &Range<usize>, key: Stroke) -> Option<Done> {
+        // While a substitution asks before each change, keys are answers.
+        if self.asking.is_some() {
+            return Some(self.reply(text, key));
+        }
         let mut chars: Vec<char> = text.chars().collect();
         let mut done = Done::default();
         if self.mode == Mode::Insert {
@@ -363,7 +456,11 @@ impl Vim {
                 *text = chars.iter().collect();
             }
             let at = at.min(chars.len());
-            done.selection = at..at;
+            // A substitution that asks shows the first match it asks about.
+            done.selection = match &self.asking {
+                Some(asking) => asking.found.clone(),
+                None => at..at,
+            };
             self.shown = done.selection.clone();
             return Some(done);
         }
@@ -429,6 +526,20 @@ impl Vim {
                     self.places.marks.insert(name, at);
                 } else if "'`".contains(name) {
                     self.places.marks.insert('\'', at);
+                } else if name.is_ascii_uppercase() {
+                    // A mark of a file is for the application to keep.
+                    done.ask = Some(Ask::SetFileMark(name, at));
+                }
+            }
+            // To a mark of a file: the application knows where it is. Not after an operator,
+            // which is given up: the mark may be in another file.
+            (_, Stroke::Char(mark)) if is_file_mark(waiting, mark) => {
+                if pending.is_none() {
+                    // A jump, for `''` and `Ctrl-O` to come back from in this file.
+                    self.leave(&chars, at);
+                    self.mode = Mode::Normal;
+                    let line_start = waiting == Some('\'');
+                    done.ask = Some(Ask::GoToFileMark { mark, line_start });
                 }
             }
             // To a mark: the first letter of its line, or with a backtick its very place.
@@ -584,13 +695,7 @@ impl Vim {
             }
             Mode::Insert => at..at,
             Mode::Normal => {
-                // The caret is on a char, never after the last one of a line.
-                let (start, end) = (line_start(&chars, at), line_end(&chars, at));
-                let at = if at >= end && end > start {
-                    end - 1
-                } else {
-                    at
-                };
+                let at = on_char(&chars, at);
                 at..at
             }
         };
@@ -622,11 +727,66 @@ impl Vim {
         self.line.as_deref()
     }
 
+    /// What a substitution that asks before each change is asking, to show while it is.
+    /// The match it asks about is the selection; `y` writes the replacement there, `n` does
+    /// not, `a` writes it there and at every match left, `l` writes it there and ends, `q`
+    /// and Escape end. Vim is in normal mode meanwhile.
+    pub fn asking(&self) -> Option<String> {
+        let asking = self.asking.as_ref()?;
+        Some(format!("replace with {}? (y/n/a/q/l)", asking.replacement))
+    }
+
     /// Forget every mark and the list of the jumps. They are places in one text, kept right
     /// through what Vim itself does to it: for the application to call when the text
-    /// becomes another one.
+    /// becomes another one. A substitution that was asking before each change ends too. The
+    /// marks of files, `A` to `Z`, are the application's: they stay.
     pub fn forget_marks(&mut self) {
         self.places = Places::default();
+        self.asking = None;
+    }
+
+    /// A key typed while a substitution asks before each change: the answer for the match
+    /// it asks about. Any other key than an answer does nothing.
+    fn reply(&mut self, text: &mut String, key: Stroke) -> Done {
+        let mut done = Done::default();
+        let Some(mut asking) = self.asking.take() else {
+            return done;
+        };
+        let (answers, writes, goes_on) = match key {
+            Stroke::Char('y' | 'a') => (true, true, true),
+            Stroke::Char('l') => (true, true, false),
+            Stroke::Char('n') => (true, false, true),
+            Stroke::Char('q') | Stroke::Escape => (false, false, false),
+            _ => {
+                done.selection = asking.found.clone();
+                self.asking = Some(asking);
+                return done;
+            }
+        };
+        let mut chars: Vec<char> = text.chars().collect();
+        let mut at;
+        let more = loop {
+            at = asking.found.start;
+            let answered = answers && asking.answer(&mut chars, &mut self.places, writes);
+            done.changed |= answered && writes;
+            let more = answered && goes_on && asking.seek(&chars);
+            // `a` answers for every match left.
+            if !more || key != Stroke::Char('a') {
+                break more;
+            }
+        };
+        if done.changed {
+            *text = chars.iter().collect();
+        }
+        done.selection = if more {
+            self.asking.insert(asking).found.clone()
+        } else {
+            // Over: the caret stays where the last match asked about started.
+            let at = on_char(&chars, at.min(chars.len()));
+            at..at
+        };
+        self.shown = done.selection.clone();
+        done
     }
 
     /// A jump starts at `at`: the place is kept for `''` and for `Ctrl-O` to come back to.
@@ -946,7 +1106,9 @@ impl Vim {
     /// the flags, with a sign of any kind between them; nothing, for the last substitution
     /// again without its flags. The pattern is a regular expression as the `regex` crate
     /// reads them; `g` is for every time on a line and not the first only, `i` for capitals
-    /// and small letters alike. Returns where the caret goes: the last line that changed.
+    /// and small letters alike, `c` to ask before each change: nothing is changed then, the
+    /// keys that follow are the answers. `:g` cannot wait for answers: with `c` in its
+    /// command nothing is done. Returns where the caret goes: the last line that changed.
     fn substitute(
         &mut self,
         chars: &mut Vec<char>,
@@ -979,7 +1141,8 @@ impl Vim {
             }
         };
         let flags = flags.trim_end();
-        if flags.chars().any(|flag| !"gi".contains(flag)) {
+        let asks = flags.contains('c');
+        if flags.chars().any(|flag| !"gic".contains(flag)) || (asks && self.global) {
             return at;
         }
         let mut reader = regex::RegexBuilder::new(&pattern);
@@ -987,6 +1150,23 @@ impl Vim {
             return at;
         };
         let top = line_numbered(chars, first);
+        if asks {
+            let mut asking = Asking {
+                wanted,
+                replacement: replacement.clone(),
+                all: flags.contains('g'),
+                line: chars[top..line_end(chars, top)].iter().collect(),
+                nth: 0,
+                read: 0,
+                at: top,
+                left: to - first,
+                found: 0..0,
+            };
+            // Without a match there is nothing to ask.
+            self.asking = asking.seek(chars).then_some(asking);
+            self.last_substitute = Some((pattern, replacement));
+            return at;
+        }
         let mut start = line_numbered(chars, to);
         let mut reached = None;
         // From the last line up, so that the lines still to read stay where they are.
@@ -1523,37 +1703,58 @@ fn quoted(written: &str, between: char) -> (String, Option<&str>) {
 }
 
 /// `line` with `replacement` where `wanted` is found: the first time, or every time
-/// (`all`). `None` when it is not found. In the replacement `&` is what was found, `\1` to
-/// `\9` its groups, `\r` and `\n` a line end, `\t` a tab; after a `\` any other sign is
-/// itself.
+/// (`all`). `None` when it is not found.
 fn substituted(line: &str, wanted: &regex::Regex, replacement: &str, all: bool) -> Option<String> {
     let mut written = String::new();
     let mut from = None;
     let times = if all { usize::MAX } else { 1 };
     for found in wanted.captures_iter(line).take(times) {
-        let group = |number: usize| found.get(number).map_or("", |group| group.as_str());
         let whole = found.get(0)?;
         written.push_str(&line[from.unwrap_or(0)..whole.start()]);
         from = Some(whole.end());
-        let mut signs = replacement.chars();
-        while let Some(sign) = signs.next() {
-            match (sign, signs.clone().next()) {
-                ('&', _) => written.push_str(group(0)),
-                ('\\', Some(next)) => {
-                    match next {
-                        '0'..='9' => written.push_str(group(next as usize - '0' as usize)),
-                        'r' | 'n' => written.push('\n'),
-                        't' => written.push('\t'),
-                        _ => written.push(next),
-                    }
-                    signs.next();
-                }
-                _ => written.push(sign),
-            }
-        }
+        replaced(&found, replacement, &mut written);
     }
     written.push_str(&line[from?..]);
     Some(written)
+}
+
+/// Add to `written` what `replacement` writes in place of what was `found`. In the
+/// replacement `&` is what was found, `\1` to `\9` its groups, `\r` and `\n` a line end,
+/// `\t` a tab; after a `\` any other sign is itself.
+fn replaced(found: &regex::Captures, replacement: &str, written: &mut String) {
+    let group = |number: usize| found.get(number).map_or("", |group| group.as_str());
+    let mut signs = replacement.chars();
+    while let Some(sign) = signs.next() {
+        match (sign, signs.clone().next()) {
+            ('&', _) => written.push_str(group(0)),
+            ('\\', Some(next)) => {
+                match next {
+                    '0'..='9' => written.push_str(group(next as usize - '0' as usize)),
+                    'r' | 'n' => written.push('\n'),
+                    't' => written.push('\t'),
+                    _ => written.push(next),
+                }
+                signs.next();
+            }
+            _ => written.push(sign),
+        }
+    }
+}
+
+/// A quote or a backtick (`waiting`) and then `name` go to a mark of a file: `A` to `Z`.
+fn is_file_mark(waiting: Option<char>, name: char) -> bool {
+    matches!(waiting, Some('\'' | '`')) && name.is_ascii_uppercase()
+}
+
+/// Where the caret is in normal mode when it goes to `at`: on a char, never after the last
+/// one of a line.
+fn on_char(chars: &[char], at: usize) -> usize {
+    let (start, end) = (line_start(chars, at), line_end(chars, at));
+    if at >= end && end > start {
+        end - 1
+    } else {
+        at
+    }
 }
 
 /// What was typed up to the caret `at` since it was at `from`, the text being `length`
@@ -3606,6 +3807,404 @@ mod tests {
     fn a_substitution_that_asks_before_each_change_is_still_not_done() {
         assert_eq!(vim("a\na", 0, ":%s/a/b/c\r").0, "a\na");
         assert_eq!(vim("a\na", 0, ":g/a/s/a/b/gc\r").0, "a\na");
+    }
+
+    #[test]
+    fn a_capital_letter_after_m_asks_the_application_to_keep_a_mark_of_the_file() {
+        let (text, done) = last_done("one\n  two", 7, "mA");
+        assert_eq!(done.ask, Some(Ask::SetFileMark('A', 7)));
+        assert_eq!((text.as_str(), done.changed), ("one\n  two", false));
+        assert_eq!(done.selection, 7..7);
+        assert_eq!(
+            last_done("one", 2, "mZ").1.ask,
+            Some(Ask::SetFileMark('Z', 2))
+        );
+    }
+
+    #[test]
+    fn a_quote_and_a_capital_letter_ask_for_the_line_of_a_mark_of_a_file() {
+        let done = last_done("one\n  two", 7, "'A").1;
+        let asked = Ask::GoToFileMark {
+            mark: 'A',
+            line_start: true,
+        };
+        // The caret waits for the application to move it.
+        assert_eq!((done.ask, done.selection), (Some(asked), 7..7));
+    }
+
+    #[test]
+    fn a_backtick_and_a_capital_letter_ask_for_the_very_place_of_a_mark_of_a_file() {
+        let done = last_done("one\n  two", 7, "`B").1;
+        let asked = Ask::GoToFileMark {
+            mark: 'B',
+            line_start: false,
+        };
+        assert_eq!((done.ask, done.selection), (Some(asked), 7..7));
+    }
+
+    #[test]
+    fn a_mark_of_a_file_is_not_the_mark_of_the_same_small_letter() {
+        let (mut vim, mut text) = (Vim::default(), "one\ntwo".to_owned());
+        // Vim keeps nothing of `A`: `'a` has nowhere to go.
+        type_in(&mut vim, &mut text, 4, "mA");
+        let done = type_in(&mut vim, &mut text, 0, "'a");
+        assert_eq!((done.ask, done.selection), (None, 0..0));
+        // A small letter asks nothing, and is gone to as before.
+        assert_eq!(type_in(&mut vim, &mut text, 5, "ma").ask, None);
+        let done = type_in(&mut vim, &mut text, 0, "`a");
+        assert_eq!((done.ask, done.selection), (None, 5..5));
+        // `'A` asks, whatever `a` is.
+        let done = type_in(&mut vim, &mut text, 0, "'A");
+        assert_eq!(done.selection, 0..0);
+        assert!(done.ask.is_some());
+    }
+
+    #[test]
+    fn going_to_a_mark_of_a_file_is_a_jump_to_come_back_from() {
+        let (mut vim, mut text) = (Vim::default(), "one\ntwo".to_owned());
+        type_in(&mut vim, &mut text, 5, "`A");
+        // The application put the caret at the mark, in the same text.
+        assert_eq!(type_in(&mut vim, &mut text, 0, "``").selection, 5..5);
+        let mut vim = Vim::default();
+        type_in(&mut vim, &mut text, 5, "'A");
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[BACK]), 5);
+    }
+
+    #[test]
+    fn an_operator_before_a_mark_of_a_file_is_given_up() {
+        for keys in ["d'A", "d`A", "y'A", "c`A"] {
+            let (mut vim, mut text) = (Vim::default(), "one\ntwo".to_owned());
+            let done = type_in(&mut vim, &mut text, 1, keys);
+            assert_eq!((done.ask, done.changed), (None, false), "{keys}");
+            assert_eq!((text.as_str(), vim.mode), ("one\ntwo", Mode::Normal));
+            // Nothing waits any more: the next key is a command of its own.
+            type_in(&mut vim, &mut text, 1, "x");
+            assert_eq!(text, "oe\ntwo", "{keys}");
+        }
+    }
+
+    #[test]
+    fn going_to_a_mark_of_a_file_ends_a_selection() {
+        let (mut vim, mut text) = (Vim::default(), "one two".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, "ve'A");
+        assert_eq!(vim.mode, Mode::Normal);
+        assert_eq!(done.selection, 2..2);
+        assert!(done.ask.is_some());
+    }
+
+    #[test]
+    fn a_macro_ends_at_a_mark_of_a_file_as_at_anything_asked_of_the_application() {
+        let (mut vim, mut text) = (Vim::default(), "abc".to_owned());
+        type_in(&mut vim, &mut text, 0, "qamAxq");
+        assert_eq!(text, "bc");
+        let done = type_in(&mut vim, &mut text, 0, "@a");
+        assert_eq!(done.ask, Some(Ask::SetFileMark('A', 0)));
+        assert_eq!(text, "bc");
+    }
+
+    /// Type `keys` in a new Vim, from the start of `text`. Returns the text and the
+    /// selection shown then.
+    fn shown(text: &str, keys: &str) -> (String, Range<usize>) {
+        let (text, done) = last_done(text, 0, keys);
+        (text, done.selection)
+    }
+
+    #[test]
+    fn a_substitution_that_asks_selects_the_first_match_and_changes_nothing_yet() {
+        let (mut vim, mut text) = (Vim::default(), "one two one".to_owned());
+        let done = type_in(&mut vim, &mut text, 5, ":s/two/2/c\r");
+        assert_eq!((text.as_str(), done.changed), ("one two one", false));
+        assert_eq!(done.selection, 4..7);
+        // No mode of its own: normal, with something to show.
+        assert_eq!(vim.mode, Mode::Normal);
+        assert_eq!(vim.typing(), None);
+    }
+
+    #[test]
+    fn y_writes_the_replacement_and_asks_about_the_next_match() {
+        let (mut vim, mut text) = (Vim::default(), "aXbXc".to_owned());
+        type_in(&mut vim, &mut text, 0, ":s/X/--/gc\r");
+        let done = type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!((text.as_str(), done.changed), ("a--bXc", true));
+        assert_eq!(done.selection, 4..5);
+        // After the last match the caret is where that match started.
+        let done = type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!((text.as_str(), done.changed), ("a--b--c", true));
+        assert_eq!(done.selection, 4..4);
+    }
+
+    #[test]
+    fn n_leaves_the_match_as_it_is_and_asks_about_the_next() {
+        let (mut vim, mut text) = (Vim::default(), "aXbXc".to_owned());
+        type_in(&mut vim, &mut text, 0, ":s/X/--/gc\r");
+        let done = type_in(&mut vim, &mut text, 0, "n");
+        assert_eq!((text.as_str(), done.changed), ("aXbXc", false));
+        assert_eq!(done.selection, 3..4);
+        type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!(text, "aXb--c");
+    }
+
+    #[test]
+    fn a_writes_the_replacement_at_every_match_left_as_one_change() {
+        let (mut vim, mut text) = (Vim::default(), "aa\naa".to_owned());
+        type_in(&mut vim, &mut text, 0, ":%s/a/bb/gc\rn");
+        let done = type_in(&mut vim, &mut text, 0, "a");
+        assert_eq!((text.as_str(), done.changed), ("abb\nbbbb", true));
+        assert_eq!((done.selection, vim.asking()), (6..6, None));
+    }
+
+    #[test]
+    fn q_ends_the_asking_and_changes_nothing_more() {
+        let (mut vim, mut text) = (Vim::default(), "aXbXc".to_owned());
+        type_in(&mut vim, &mut text, 0, ":s/X/-/gc\ry");
+        let done = type_in(&mut vim, &mut text, 0, "q");
+        assert_eq!((text.as_str(), done.changed), ("a-bXc", false));
+        assert_eq!((done.selection, vim.asking()), (3..3, None));
+    }
+
+    #[test]
+    fn escape_ends_the_asking_as_q_does() {
+        let (mut vim, mut text) = (Vim::default(), "aXbXc".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, ":s/X/-/gc\r\u{1b}");
+        assert_eq!((text.as_str(), done.changed), ("aXbXc", false));
+        assert_eq!((done.selection, vim.asking()), (1..1, None));
+    }
+
+    #[test]
+    fn l_writes_the_replacement_and_ends_the_asking() {
+        let (mut vim, mut text) = (Vim::default(), "aXbXc".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, ":s/X/-/gc\rnl");
+        assert_eq!((text.as_str(), done.changed), ("aXb-c", true));
+        assert_eq!((done.selection, vim.asking()), (3..3, None));
+    }
+
+    #[test]
+    fn without_the_flag_g_the_first_match_of_each_line_is_asked_about() {
+        let (mut vim, mut text) = (Vim::default(), "aa\naa\naa".to_owned());
+        assert_eq!(
+            type_in(&mut vim, &mut text, 0, ":%s/a/b/c\r").selection,
+            0..1
+        );
+        // Written or not, the next one asked about is on the next line.
+        assert_eq!(type_in(&mut vim, &mut text, 0, "y").selection, 3..4);
+        assert_eq!(type_in(&mut vim, &mut text, 0, "n").selection, 6..7);
+        assert_eq!(type_in(&mut vim, &mut text, 0, "y").selection, 6..6);
+        assert_eq!((text.as_str(), vim.asking()), ("ba\naa\nba", None));
+    }
+
+    #[test]
+    fn the_asking_ends_with_the_last_line_of_its_range() {
+        assert_eq!(shown("a\na\na", ":1,2s/a/b/c\ryy").0, "b\nb\na");
+        assert_eq!(shown("a a\na", ":s/a/b/gc\ryy").0, "b b\na");
+        // The lines of a selection are a range as any other.
+        assert_eq!(shown("a\na\na", "Vj:s/a/b/c\ryy").0, "b\nb\na");
+        // A third answer was not one: `x` is the command again.
+        assert_eq!(shown("a\na\na", ":1,2s/a/b/c\ryyx").0, "b\n\na");
+    }
+
+    #[test]
+    fn the_next_match_is_where_a_shorter_replacement_leaves_it() {
+        assert_eq!(
+            shown("abc abc abc", ":s/abc/x/gc\ry"),
+            ("x abc abc".to_owned(), 2..5)
+        );
+        assert_eq!(
+            shown("abc abc abc", ":s/abc/x/gc\ryy"),
+            ("x x abc".to_owned(), 4..7)
+        );
+        assert_eq!(shown("abc abc", ":s/abc//gc\ry"), (" abc".to_owned(), 1..4));
+    }
+
+    #[test]
+    fn the_next_match_is_where_a_longer_replacement_leaves_it() {
+        // What was written is not read again, though the pattern is found in it.
+        assert_eq!(
+            shown("ab ab ab", ":s/ab/abab/gc\ry"),
+            ("abab ab ab".to_owned(), 5..7)
+        );
+        assert_eq!(shown("ab ab ab", ":s/ab/abab/gc\ryny").0, "abab ab abab");
+    }
+
+    #[test]
+    fn the_next_match_is_counted_in_chars_after_letters_of_several_bytes() {
+        assert_eq!(shown("é a é a", ":s/a/ùù/gc\r").1, 2..3);
+        assert_eq!(
+            shown("é a é a", ":s/a/ùù/gc\ry"),
+            ("é ùù é a".to_owned(), 7..8)
+        );
+    }
+
+    #[test]
+    fn each_answer_writes_the_groups_of_the_match_it_is_for() {
+        let keys = ":s/(\\w)=(\\w)/\\2=\\1 &/gc\r";
+        let (text, selection) = shown("k=v; a=b", &format!("{keys}y"));
+        assert_eq!((text.as_str(), selection), ("v=k k=v; a=b", 9..12));
+        assert_eq!(
+            shown("k=v; a=b", &format!("{keys}yy")).0,
+            "v=k k=v; b=a a=b"
+        );
+        assert_eq!(shown("k=v; a=b", &format!("{keys}ny")).0, "k=v; b=a a=b");
+    }
+
+    #[test]
+    fn a_replacement_that_adds_a_line_leaves_the_matches_after_it_in_their_place() {
+        let (mut vim, mut text) = (Vim::default(), "a,b,c\nd,e\nf,g".to_owned());
+        type_in(&mut vim, &mut text, 0, ":1,2s/,/\\r/gc\r");
+        let done = type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!((text.as_str(), done.selection), ("a\nb,c\nd,e\nf,g", 3..4));
+        // The line added is no line of the range: the range still ends at `d,e`.
+        assert_eq!(type_in(&mut vim, &mut text, 0, "n").selection, 7..8);
+        type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!((text.as_str(), vim.asking()), ("a\nb,c\nd\ne\nf,g", None));
+    }
+
+    #[test]
+    fn a_match_of_nothing_is_asked_about_as_a_caret() {
+        assert_eq!(shown("ab", ":s/x*/-/gc\r"), ("ab".to_owned(), 0..0));
+        assert_eq!(shown("ab", ":s/x*/-/gc\ry"), ("-ab".to_owned(), 2..2));
+        // As without asking.
+        assert_eq!(
+            shown("ab", ":s/x*/-/gc\ryyy").0,
+            shown("ab", ":s/x*/-/g\r").0
+        );
+    }
+
+    #[test]
+    fn a_pattern_tied_to_the_start_of_the_line_is_not_found_again_in_what_is_left() {
+        assert_eq!(
+            shown("aaa", ":s/^a//gc\ryyy").0,
+            shown("aaa", ":s/^a//g\r").0
+        );
+    }
+
+    #[test]
+    fn the_flag_i_goes_with_the_flag_c() {
+        assert_eq!(shown("A a", ":s/a/b/gic\ryy").0, "b b");
+    }
+
+    #[test]
+    fn a_substitution_that_asks_and_finds_nothing_asks_nothing() {
+        let (mut vim, mut text) = (Vim::default(), "abc".to_owned());
+        let done = type_in(&mut vim, &mut text, 1, ":s/z/y/c\r");
+        assert_eq!((done.selection, done.changed), (1..1, false));
+        assert_eq!(vim.asking(), None);
+        // `y` is no answer then: `yl` copies a char.
+        assert_eq!(
+            type_in(&mut vim, &mut text, 1, "yl").copied.as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn what_is_asked_shows_from_enter_to_the_last_answer() {
+        let (mut vim, mut text) = (Vim::default(), "a a a".to_owned());
+        assert_eq!(vim.asking(), None);
+        type_in(&mut vim, &mut text, 0, ":s/a/\\0b/gc");
+        assert_eq!(vim.asking(), None);
+        let asked = Some("replace with \\0b? (y/n/a/q/l)".to_owned());
+        type_in(&mut vim, &mut text, 0, "\r");
+        assert_eq!(vim.asking(), asked);
+        type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!(vim.asking(), asked);
+        type_in(&mut vim, &mut text, 0, "n");
+        assert_eq!(vim.asking(), asked);
+        type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!((text.as_str(), vim.asking()), ("ab a ab", None));
+    }
+
+    #[test]
+    fn a_key_that_is_no_answer_does_nothing_while_a_substitution_asks() {
+        let (mut vim, mut text) = (Vim::default(), "a\na".to_owned());
+        type_in(&mut vim, &mut text, 0, ":%s/a/b/c\r");
+        let others = [
+            Stroke::Char('x'),
+            Stroke::Char('j'),
+            Stroke::Char('d'),
+            Stroke::Char(':'),
+            Stroke::Char('i'),
+            Stroke::Char('.'),
+            Stroke::Char('Y'),
+            Stroke::Enter,
+            Stroke::Backspace,
+            Stroke::Ctrl('o'),
+            Stroke::Ctrl('r'),
+        ];
+        for key in others {
+            // Taken all the same: nothing else gets it.
+            let done = vim.key(&mut text, &(1..1), key).expect("vim");
+            assert_eq!(
+                (done.selection, done.changed, done.ask),
+                (0..1, false, None)
+            );
+            assert_eq!((text.as_str(), vim.mode), ("a\na", Mode::Normal));
+            assert!(vim.asking().is_some() && vim.typing().is_none());
+        }
+        // None of them started anything: the answers are still answers.
+        assert_eq!(type_in(&mut vim, &mut text, 0, "yy").selection, 2..2);
+        assert_eq!(text, "b\nb");
+    }
+
+    #[test]
+    fn a_command_works_as_ever_right_after_the_last_answer() {
+        assert_eq!(vim("aa\nbb", 0, ":s/a/b/c\ryx"), ("a\nbb".to_owned(), 0));
+        assert_eq!(vim("aa\nbb", 0, ":s/a/b/c\rqjdd"), ("aa".to_owned(), 0));
+        assert_eq!(vim("aa\nbb", 0, ":s/a/b/gc\rl:s/a/c/\r").0, "bc\nbb");
+        assert_eq!(vim("aa\nbb", 0, ":s/a/b/c\r\u{1b}ix\u{1b}").0, "xaa\nbb");
+    }
+
+    #[test]
+    fn a_macro_types_again_the_answers_that_were_recorded() {
+        let keys = "qa:s/a/b/gc\rynjq";
+        assert_eq!(vim("a a\na a", 0, keys), ("b a\na a".to_owned(), 6));
+        assert_eq!(vim("a a\na a", 0, &format!("{keys}@a")).0, "b a\nb a");
+    }
+
+    #[test]
+    fn q_answers_the_substitution_and_does_not_end_the_macro_being_recorded() {
+        let (mut vim, mut text) = (Vim::default(), "a a\na a".to_owned());
+        type_in(&mut vim, &mut text, 0, "qa:s/a/b/gc\ryq");
+        assert_eq!((vim.asking(), vim.recording()), (None, Some('a')));
+        type_in(&mut vim, &mut text, 0, "jq");
+        assert_eq!(vim.recording(), None);
+        type_in(&mut vim, &mut text, 4, "@a");
+        assert_eq!(text, "b a\nb a");
+    }
+
+    #[test]
+    fn the_dot_does_not_do_a_substitution_that_asked_again() {
+        // It is still `x` that it does again, where `q` left the caret: on the second match.
+        assert_eq!(vim("aaaa", 0, "x:s/a/b/gc\ryq.").0, "ba");
+        // And nothing when no command changed the text before.
+        assert_eq!(vim("aa", 0, ":s/a/b/gc\ryq.").0, "ba");
+    }
+
+    #[test]
+    fn a_mark_follows_its_text_when_an_answer_changes_the_lines_above_it() {
+        assert_eq!(
+            vim("a\nb", 2, "ma:1s/a/long/c\ry`ax"),
+            ("long\n".to_owned(), 5)
+        );
+    }
+
+    #[test]
+    fn the_asking_ends_when_the_application_says_the_text_is_another_one() {
+        let (mut vim, mut text) = (Vim::default(), "a a".to_owned());
+        type_in(&mut vim, &mut text, 0, ":s/a/b/gc\r");
+        vim.forget_marks();
+        assert_eq!(vim.asking(), None);
+        assert_eq!(type_in(&mut vim, &mut text, 0, "x").selection, 0..0);
+        assert_eq!(text, " a");
+    }
+
+    #[test]
+    fn the_asking_ends_when_the_match_is_no_longer_in_the_text() {
+        let (mut vim, mut text) = (Vim::default(), "one two".to_owned());
+        type_in(&mut vim, &mut text, 0, ":s/two/2/c\r");
+        // Something else than Vim changed the text meanwhile.
+        text = "one".to_owned();
+        let done = type_in(&mut vim, &mut text, 0, "y");
+        assert_eq!((text.as_str(), done.changed), ("one", false));
+        assert_eq!((done.selection, vim.asking()), (2..2, None));
     }
 
     #[test]
