@@ -4087,15 +4087,21 @@ impl GodApp {
         let Some(docker) = &mut self.docker else {
             return;
         };
+        // Where the compose file of the project is: its commands are run there.
+        let folder = self
+            .explorer
+            .as_ref()
+            .map(|explorer| explorer.root().to_path_buf());
         let (sender, receiver) = channel();
         let waking = ctx.clone();
         std::thread::spawn(move || {
+            let folder = folder.as_deref();
             let done = first.map(|command| {
                 let args: Vec<&str> = command.split_whitespace().skip(1).collect();
-                tools::docker(&args)
+                tools::docker(folder, &args)
             });
-            let containers = tools::docker(&["ps", "-a", "--format", "{{json .}}"]);
-            let images = tools::docker(&["images", "--format", "{{json .}}"]);
+            let containers = tools::docker(folder, &["ps", "-a", "--format", "{{json .}}"]);
+            let images = tools::docker(folder, &["images", "--format", "{{json .}}"]);
             // The window may have been closed: nobody listens then.
             let _ = sender.send((done.unwrap_or_default(), containers, images));
             waking.request_repaint();
@@ -4125,6 +4131,8 @@ impl GodApp {
         let mut open = true;
         let mut refresh = false;
         let mut wanted = None;
+        // What is asked of the services of the folder, all together.
+        let mut compose = None;
         egui::Window::new("Docker")
             .id(Id::new("docker-window"))
             .open(&mut open)
@@ -4141,6 +4149,22 @@ impl GodApp {
                     ui.colored_label(palette.text_dim, &shown.said);
                 }
                 let idle = shown.asking.is_none();
+                if !shown.services.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.strong("Compose");
+                        ui.label(shown.services.join(", "));
+                        let offered = [
+                            ("Up", "docker compose up -d"),
+                            ("Stop", "docker compose stop"),
+                            ("Logs", "docker compose logs --tail 200 -f"),
+                        ];
+                        for (label, command) in offered {
+                            if ui.add_enabled(idle, Button::new(label)).clicked() {
+                                compose = Some(command);
+                            }
+                        }
+                    });
+                }
                 ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                     ui.add_space(6.0);
                     ui.strong(format!("Containers ({})", shown.containers.len()));
@@ -4191,6 +4215,18 @@ impl GodApp {
             });
         if open {
             self.docker = Some(shown);
+        }
+        match compose {
+            Some(logs) if logs.contains(" logs ") => {
+                self.docker = None;
+                self.run_task(ctx, logs.to_owned());
+                return;
+            }
+            Some(command) => {
+                self.ask_docker(ctx, Some(command.to_owned()));
+                return;
+            }
+            None => {}
         }
         match wanted.map(|(action, id)| (action, docker::command(action, &id))) {
             // The logs go on as long as the container runs: they are for the terminal.
@@ -6176,7 +6212,16 @@ impl GodApp {
                 }
             }
             Cmd::Docker => {
-                self.docker = Some(Docker::default());
+                // The services the folder says it is made of, when it has a compose file.
+                let written = self.folder().and_then(|root| {
+                    let mut files = tools::COMPOSE_FILES.iter();
+                    files.find_map(|name| std::fs::read_to_string(root.join(name)).ok())
+                });
+                let services = written.map(|text| godcode_core::docker::services(&text));
+                self.docker = Some(Docker {
+                    services: services.unwrap_or_default(),
+                    ..Docker::default()
+                });
                 self.ask_docker(ctx, None);
             }
             Cmd::SaveLayout => {
@@ -8870,6 +8915,8 @@ struct Docker {
     images: Vec<godcode_core::docker::Image>,
     said: String,
     asking: Option<Receiver<(String, String, String)>>,
+    /// The services of the compose file of the folder.
+    services: Vec<String>,
 }
 
 /// A file with conflicts laid out in three columns: mine, the result, theirs.

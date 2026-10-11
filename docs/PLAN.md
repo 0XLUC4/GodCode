@@ -202,7 +202,9 @@ seule, lecteur maison sans dépendance ; pas de requêtes SQL, pas de tables `WI
 `-wal` n'est pas lu et c'est dit).
 Docker : `Docker…` liste conteneurs et images (par la commande `docker`), démarre, arrête, relance un
 conteneur, suit ses logs dans le terminal ; rien n'y supprime quoi que ce soit.
-Reste : requêtes SQL, PostgreSQL, shell dans un conteneur, docker compose.
+Docker compose : quand le dossier a un fichier compose, ses services sont nommés avec `Up` (`up -d`),
+`Stop` et `Logs`.
+Reste : requêtes SQL, PostgreSQL, shell dans un conteneur.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 

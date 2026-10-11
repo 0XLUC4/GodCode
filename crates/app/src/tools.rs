@@ -433,11 +433,22 @@ pub fn with_results(command: &str) -> String {
     command.to_owned()
 }
 
-/// Run `docker` with `args`, without a window and without a shell, and return all it
-/// printed; or why it could not run.
-pub fn docker(args: &[&str]) -> String {
+/// The names a compose file goes by, in the order Docker looks for them.
+pub const COMPOSE_FILES: [&str; 4] = [
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
+
+/// Run `docker` with `args` in `folder`, without a window and without a shell, and return
+/// all it printed; or why it could not run.
+pub fn docker(folder: Option<&Path>, args: &[&str]) -> String {
     let mut run = Command::new("docker");
     run.args(args);
+    if let Some(folder) = folder {
+        run.current_dir(folder);
+    }
     hidden(&mut run);
     match run.output() {
         Ok(output) => {
