@@ -193,6 +193,20 @@ pub struct Vim {
     shown: Range<usize>,
     /// What was last deleted or copied, and whether it is whole lines.
     register: (String, bool),
+    /// A key that waits for a char: `f`, `F`, `t`, `T` for the one to go to, `i` or `a` for
+    /// the text object to take.
+    waiting: Option<char>,
+    /// The last `f`, `F`, `t` or `T` and its char, for `;` and `,` to do again.
+    found: Option<(char, char)>,
+    /// The keys of the command being typed; those of the last one that changed the text,
+    /// with what was typed in insert mode after it: what `.` does again.
+    recording: Vec<Stroke>,
+    last: Vec<Stroke>,
+    last_typed: String,
+    /// Where insert mode was entered, and how long the text was then.
+    insert_from: Option<(usize, usize)>,
+    /// `.` is doing the last command again: nothing is recorded meanwhile.
+    replaying: bool,
 }
 
 impl Vim {
@@ -210,8 +224,18 @@ impl Vim {
             if key != Stroke::Escape {
                 return None;
             }
-            // Out of insert mode the caret is on a char: the one just typed.
             let at = selection.start.min(chars.len());
+            // What was typed since insert mode was entered, for `.` to type again.
+            if let (Some((from, length)), false) = (self.insert_from.take(), self.replaying) {
+                let typed = at
+                    .checked_sub(from)
+                    .filter(|typed| length + typed == chars.len());
+                self.last_typed = match typed {
+                    Some(typed) => chars[from..from + typed].iter().collect(),
+                    None => String::new(),
+                };
+            }
+            // Out of insert mode the caret is on a char: the one just typed.
             let at = at.max(line_start(&chars, at) + 1) - 1;
             self.mode = Mode::Normal;
             done.selection = at..at;
@@ -223,6 +247,13 @@ impl Vim {
             self.mode = Mode::Normal;
             visual = false;
         }
+        let idle = self.pending.is_none() && self.waiting.is_none();
+        if key == Stroke::Char('.') && idle && !visual {
+            return Some(self.repeat(text, selection));
+        }
+        if !self.replaying {
+            self.recording.push(key);
+        }
         let mut at = if visual {
             self.head.min(chars.len())
         } else {
@@ -230,6 +261,8 @@ impl Vim {
         };
         let before = chars.len();
         let pending = self.pending.take();
+        let waiting = self.waiting.take();
+        let operator = pending.filter(|op| "dcy".contains(*op));
         let counted = (self.count > 0).then_some(self.count);
         let times = counted.unwrap_or(1);
         // A command is done: the number typed before it is used up, unless it goes on.
@@ -238,6 +271,26 @@ impl Vim {
         let mut target = None;
         match (pending, key) {
             (_, Stroke::Escape) => self.mode = Mode::Normal,
+            // The char a key was waiting for: where to go on the line, or what to take.
+            (_, Stroke::Char(named)) if matches!(waiting, Some('i' | 'a')) => {
+                let range = object(&chars, at, named, waiting == Some('a'));
+                match (range, operator) {
+                    (Some(range), _) if visual && !range.is_empty() => {
+                        self.anchor = range.start;
+                        at = range.end - 1;
+                    }
+                    (Some(range), Some(op)) if !visual => {
+                        at = self.operate(&mut chars, (op, at), range, false, &mut done);
+                    }
+                    _ => {}
+                }
+            }
+            (_, Stroke::Char(wanted)) if waiting.is_some() => {
+                let kind = waiting.unwrap_or('f');
+                target = find(&chars, at, kind, wanted, times);
+                self.found = Some((kind, wanted));
+            }
+            (_, _) if waiting.is_some() => {}
             (Some('r'), Stroke::Char(with)) => {
                 if chars.get(at).is_some_and(|ch| *ch != '\n') {
                     chars[at] = with;
@@ -258,9 +311,29 @@ impl Vim {
                 let range = lines(&chars, at, last, op == 'c');
                 at = self.operate(&mut chars, (op, at), range, true, &mut done);
             }
+            (_, Stroke::Char(prefix @ ('f' | 'F' | 't' | 'T'))) => {
+                self.waiting = Some(prefix);
+                self.pending = pending;
+                keep_count = true;
+            }
+            (_, Stroke::Char(prefix @ ('i' | 'a'))) if visual || operator.is_some() => {
+                self.waiting = Some(prefix);
+                self.pending = pending;
+                keep_count = true;
+            }
+            // The last search on the line again, the same way or the other.
+            (_, Stroke::Char(again @ (';' | ','))) => {
+                if let Some((kind, wanted)) = self.found {
+                    let kind = match (again, kind.is_lowercase()) {
+                        (';', _) => kind,
+                        (_, true) => kind.to_ascii_uppercase(),
+                        (_, false) => kind.to_ascii_lowercase(),
+                    };
+                    target = find(&chars, at, kind, wanted, times);
+                }
+            }
             _ => target = motion(&chars, at, key, counted),
         }
-        let operator = pending.filter(|op| "dcy".contains(*op));
         if let Some((mut to, mut span)) = target {
             match operator {
                 Some(op) if !visual => {
@@ -279,7 +352,12 @@ impl Vim {
                 }
                 _ => at = to,
             }
-        } else if target.is_none() && !keep_count && key != Stroke::Escape && pending.is_none() {
+        } else if !keep_count
+            && key != Stroke::Escape
+            && pending.is_none()
+            && waiting.is_none()
+            && !matches!(key, Stroke::Char(';' | ','))
+        {
             at = self.command(&mut chars, at, key, times, visual, &mut done);
             keep_count = self.pending.is_some();
         }
@@ -317,8 +395,52 @@ impl Vim {
                 at..at
             }
         };
+        if !self.replaying {
+            // A command that changed the text, or went to insert mode, is what `.` repeats.
+            let complete = self.pending.is_none() && self.waiting.is_none() && !keep_count;
+            let changes = (done.changed || self.mode == Mode::Insert) && !visual;
+            if complete && changes {
+                self.last = std::mem::take(&mut self.recording);
+                self.last_typed.clear();
+                self.insert_from = (self.mode == Mode::Insert).then_some((at, chars.len()));
+            } else if complete {
+                self.recording.clear();
+            }
+        }
         self.shown = done.selection.clone();
         Some(done)
+    }
+
+    /// `.`: the last command that changed the text, done again where the caret is now,
+    /// with what was typed after it in insert mode.
+    fn repeat(&mut self, text: &mut String, selection: &Range<usize>) -> Done {
+        let (keys, typed) = (self.last.clone(), self.last_typed.clone());
+        let mut done = Done {
+            selection: selection.clone(),
+            ..Done::default()
+        };
+        let step = |vim: &mut Self, text: &mut String, done: &mut Done, key: Stroke| {
+            if let Some(did) = vim.key(text, &done.selection.clone(), key) {
+                done.selection = did.selection;
+                done.changed |= did.changed;
+                done.copied = did.copied.or(done.copied.take());
+            }
+        };
+        self.replaying = true;
+        for key in keys {
+            step(self, text, &mut done, key);
+        }
+        if self.mode == Mode::Insert {
+            let at = done.selection.start;
+            text.insert_str(crate::byte_index(text, at), &typed);
+            let after = at + typed.chars().count();
+            done.selection = after..after;
+            done.changed = true;
+            step(self, text, &mut done, Stroke::Escape);
+        }
+        self.replaying = false;
+        self.shown = done.selection.clone();
+        done
     }
 
     /// Do the operator `op` on `range`, the caret being at `at`. Returns where it goes.
@@ -485,6 +607,104 @@ fn lines(chars: &[char], low: usize, high: usize, text_only: bool) -> Range<usiz
     } else {
         start.saturating_sub(1)..end
     }
+}
+
+/// Where `f`, `F`, `t` or `T` (`kind`) takes the caret on its line: to the `times`-th
+/// `wanted` after or before it, or next to it.
+fn find(
+    chars: &[char],
+    at: usize,
+    kind: char,
+    wanted: char,
+    times: usize,
+) -> Option<(usize, Span)> {
+    let (start, end) = (line_start(chars, at), line_end(chars, at));
+    let mut found = at;
+    for _ in 0..times {
+        found = if kind.is_lowercase() {
+            (found + 1..end).find(|index| chars[*index] == wanted)?
+        } else {
+            (start..found).rev().find(|index| chars[*index] == wanted)?
+        };
+    }
+    Some(match kind {
+        'f' => (found, Span::With),
+        't' => (found - 1, Span::With),
+        'F' => (found, Span::Upto),
+        _ => (found + 1, Span::Upto),
+    })
+}
+
+/// The chars the text object `named` covers at `at`: a word (`w`), or what a pair of
+/// brackets or of quotes holds. `around`: with the white space after the word, or with
+/// the pair itself.
+fn object(chars: &[char], at: usize, named: char, around: bool) -> Option<Range<usize>> {
+    let (open, close) = match named {
+        'w' => {
+            let here = kind(*chars.get(at).filter(|ch| **ch != '\n')?);
+            let same = |ch: &char| *ch != '\n' && kind(*ch) == here;
+            let start = at - chars[..at].iter().rev().take_while(|ch| same(ch)).count();
+            let mut end = at + chars[at..].iter().take_while(|ch| same(ch)).count();
+            if around && here != 1 {
+                end += chars[end..].iter().take_while(|ch| **ch == ' ').count();
+            }
+            return Some(start..end);
+        }
+        '(' | ')' | 'b' => ('(', ')'),
+        '{' | '}' | 'B' => ('{', '}'),
+        '[' | ']' => ('[', ']'),
+        '<' | '>' => ('<', '>'),
+        '"' | '\'' | '`' => {
+            // Quotes pair up along the line: the pair the caret is in, or on.
+            let (start, end) = (line_start(chars, at), line_end(chars, at));
+            let quotes: Vec<usize> = (start..end)
+                .filter(|index| chars[*index] == named)
+                .collect();
+            let pair = quotes
+                .chunks_exact(2)
+                .find(|pair| pair[0] <= at && at <= pair[1])?;
+            return Some(if around {
+                pair[0]..pair[1] + 1
+            } else {
+                pair[0] + 1..pair[1]
+            });
+        }
+        _ => return None,
+    };
+    // Back to the bracket that is still open here, then on to the one that closes it.
+    let mut depth = 0;
+    let mut opened = None;
+    for index in (0..=at.min(chars.len().checked_sub(1)?)).rev() {
+        let ch = chars[index];
+        if ch == close && index != at {
+            depth += 1;
+        } else if ch == open {
+            if depth == 0 {
+                opened = Some(index);
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    let opened = opened?;
+    let mut depth = 0;
+    let closed = (opened + 1..chars.len()).find(|index| {
+        let ch = chars[*index];
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            if depth == 0 {
+                return true;
+            }
+            depth -= 1;
+        }
+        false
+    })?;
+    Some(if around {
+        opened..closed + 1
+    } else {
+        opened + 1..closed
+    })
 }
 
 /// Where a key that moves the caret takes it, `count` times, and what the move covers.
@@ -722,6 +942,56 @@ mod tests {
         // In insert mode only Escape is Vim's.
         vim.key(&mut text, &(6..6), Stroke::Char('i'));
         assert_eq!(vim.key(&mut text, &(6..6), Stroke::Char('x')), None);
+    }
+
+    #[test]
+    fn vim_finds_on_the_line_and_takes_text_objects() {
+        let text = "one two three";
+        assert_eq!((vim(text, 0, "fw").1, vim(text, 0, "tw").1), (5, 4));
+        assert_eq!((vim(text, 0, "fe;").1, vim(text, 0, "fe;;,").1), (11, 11));
+        assert_eq!((vim(text, 12, "Fo").1, vim(text, 12, "To").1), (6, 7));
+        assert_eq!(vim(text, 0, "2fe").1, 11);
+        // Nothing to find: the caret stays, and nothing is taken out.
+        assert_eq!(vim(text, 0, "dfz"), (text.to_owned(), 0));
+        assert_eq!(vim(text, 0, "dfw"), ("o three".to_owned(), 0));
+        assert_eq!(vim(text, 0, "dtw"), ("wo three".to_owned(), 0));
+        assert_eq!(vim(text, 12, "dFo"), ("one twe".to_owned(), 6));
+        assert_eq!(vim(text, 5, "diw"), ("one  three".to_owned(), 4));
+        assert_eq!(vim(text, 5, "daw"), ("one three".to_owned(), 4));
+        assert_eq!(vim(text, 5, "viwd"), ("one  three".to_owned(), 4));
+        assert_eq!(vim("f(a, (b)) + c", 3, "di("), ("f() + c".to_owned(), 2));
+        assert_eq!(vim("f(a, (b)) + c", 3, "da("), ("f + c".to_owned(), 1));
+        assert_eq!(
+            vim("f(a, (b)) + c", 6, "dib"),
+            ("f(a, ()) + c".to_owned(), 6)
+        );
+        assert_eq!(vim("a {\n  b\n}", 5, "di{"), ("a {}".to_owned(), 3));
+        assert_eq!(
+            vim("say \"hi\" now", 6, "ci\"X\u{1b}"),
+            ("say \"X\" now".to_owned(), 5)
+        );
+        assert_eq!(vim("a [1] b", 0, "di["), ("a [1] b".to_owned(), 0));
+    }
+
+    #[test]
+    fn vim_does_the_last_change_again() {
+        assert_eq!(
+            vim("one two three four", 0, "dw."),
+            ("three four".to_owned(), 0)
+        );
+        assert_eq!(vim("a b c", 0, "x.."), (" c".to_owned(), 0));
+        assert_eq!(vim("one\ntwo\nthree", 0, "dd."), ("three".to_owned(), 0));
+        // What was typed in insert mode is typed again.
+        assert_eq!(vim("ab", 0, "iX\u{1b}."), ("XXab".to_owned(), 0));
+        assert_eq!(
+            vim("one two one", 0, "cwX\u{1b}ww."),
+            ("X two X".to_owned(), 6)
+        );
+        assert_eq!(vim("a\nb", 0, "A;\u{1b}j."), ("a;\nb;".to_owned(), 4));
+        // A move is not a change: `.` still does the change before it.
+        assert_eq!(vim("abcd", 0, "xl."), ("bd".to_owned(), 1));
+        // Nothing done yet: nothing to do again.
+        assert_eq!(vim("abc", 1, "."), ("abc".to_owned(), 1));
     }
 
     #[test]

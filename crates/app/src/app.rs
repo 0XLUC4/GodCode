@@ -141,6 +141,7 @@ enum Cmd {
     Preview,
     Minimap,
     Keys,
+    Hints,
     Fold,
     UnfoldAll,
     StickyScroll,
@@ -463,6 +464,7 @@ const COMMANDS: &[Spec] = &[
         "Switch Keys: Default / Vim / Emacs",
         "",
     ),
+    spec(Cmd::Hints, icon::ROWS, "Toggle Inlay Hints", ""),
     spec(Cmd::Fold, icon::ROWS, "Fold / Unfold Block", ""),
     spec(Cmd::UnfoldAll, icon::ROWS, "Unfold All", ""),
     spec(
@@ -695,6 +697,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Preview),
             Some(Cmd::Minimap),
             Some(Cmd::Keys),
+            Some(Cmd::Hints),
             Some(Cmd::Fold),
             Some(Cmd::UnfoldAll),
             Some(Cmd::StickyScroll),
@@ -878,10 +881,11 @@ struct Tab {
     pinned: bool,
     /// The lines (from 0) the debugger stops on.
     breakpoints: Vec<usize>,
-    /// What the language server writes in the lines, and the revision it was last asked
-    /// for: they stay as they are until it has answered about the text typed since.
+    /// What the language server writes in the lines; and what it was last asked: the
+    /// revision of the text, the lines, whether they go to the end of the text. The hints
+    /// stay as they are until it has answered about the text typed since.
     hints: Vec<Hint>,
-    hints_at: Option<u64>,
+    hints_at: Option<(u64, Range<usize>, bool)>,
     /// The view of the other editor, when this file shows in both.
     other: Option<Twin>,
     /// `view` and `selection` are those of the second editor; `other` holds the first's.
@@ -1143,6 +1147,44 @@ enum Asked {
     },
 }
 
+/// The lines under the top of the view that are to have their hints: more than a view shows.
+const HINTS_IN_VIEW: usize = 120;
+
+/// Files whose folded blocks are remembered: the ones last closed.
+const MAX_FOLDED_FILES: usize = 200;
+
+/// Remember the blocks folded in `tab`, or that it has none.
+fn keep_folds(folds: &mut std::collections::HashMap<PathBuf, Vec<usize>>, tab: &Tab) {
+    let Some(path) = &tab.path else {
+        return;
+    };
+    if tab.view.folded.is_empty() {
+        folds.remove(path);
+    } else {
+        folds.insert(path.clone(), tab.view.folded.clone());
+    }
+}
+
+/// The folded blocks of each file as kept in the settings: a line per file, its path, a
+/// tab, then the lines that open the blocks.
+fn folds_text(folds: &std::collections::HashMap<PathBuf, Vec<usize>>) -> String {
+    let lines = folds.iter().take(MAX_FOLDED_FILES).map(|(path, folded)| {
+        let folded: Vec<String> = folded.iter().map(usize::to_string).collect();
+        format!("{}\t{}", path.display(), folded.join(","))
+    });
+    lines.collect::<Vec<_>>().join("\n")
+}
+
+/// The reverse of [`folds_text`]. What cannot be read is left out.
+fn folds_of(text: &str) -> std::collections::HashMap<PathBuf, Vec<usize>> {
+    let files = text.lines().filter_map(|line| {
+        let (path, folded) = line.split_once('\t')?;
+        let folded = folded.split(',').filter_map(|line| line.parse().ok());
+        Some((PathBuf::from(path), folded.collect()))
+    });
+    files.collect()
+}
+
 /// Whose keys the editor obeys.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keys {
@@ -1285,6 +1327,10 @@ pub struct GodApp {
     keys: Keys,
     vim: modal::Vim,
     emacs: modal::Emacs,
+    /// The language server writes hints in the lines: types, names of arguments.
+    hints: bool,
+    /// The blocks folded in each file, kept from one session to the next.
+    folds: std::collections::HashMap<PathBuf, Vec<usize>>,
     /// The lines that open the blocks stay in view above the code.
     sticky: bool,
     /// Files are written a moment after each change.
@@ -1454,6 +1500,8 @@ impl GodApp {
             },
             vim: modal::Vim::default(),
             emacs: modal::Emacs::default(),
+            hints: get("hints").is_none_or(|value| value == "1"),
+            folds: folds_of(&get("folds").unwrap_or_default()),
             sticky: get("sticky").is_none_or(|value| value == "1"),
             autosave: get("autosave").is_some_and(|value| value == "1"),
             servers: Servers::default(),
@@ -1644,6 +1692,8 @@ impl GodApp {
         }
         // The caret starts at the top, not where the text field would put it.
         let tab = &mut self.tabs[self.active];
+        // The blocks it had folded the last time are folded again.
+        tab.view.folded = self.folds.get(path).cloned().unwrap_or_default();
         editor::set_selection(ctx, tab.editor_id(), &(0..0));
         // A minified file is one endless line running off the view: say what helps.
         if !tab.wrap && format::longest_line(&tab.text) > LONG_LINE {
@@ -1745,6 +1795,7 @@ impl GodApp {
 
     fn close_tab(&mut self, ctx: &Context, index: usize) {
         let tab = self.tabs.remove(index);
+        keep_folds(&mut self.folds, &tab);
         if let Some(path) = &tab.path {
             self.servers.closed(path);
             self.diagnostics.remove(path);
@@ -2446,20 +2497,31 @@ impl GodApp {
             .sync(ctx, root, path, tab.language.name, &tab.text, tab.revision);
     }
 
-    /// Ask the language server what it writes in the lines of the file in front, once for
-    /// each state of its text.
+    /// Ask the language server what it writes in the lines of the file in front that are
+    /// in view or near: again when its text changes, and when the view leaves those lines.
     fn ask_hints(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(tab) = self.tabs.get_mut(self.active).filter(|_| self.hints) else {
             return;
         };
-        if tab.hints_at == Some(tab.revision) {
+        // At the end of the text the top of the view is not told: it is far down.
+        let top = if self.top_line.is_finite() {
+            self.top_line as usize
+        } else {
+            usize::MAX / 2
+        };
+        let covered = |(revision, lines, to_end): &(u64, Range<usize>, bool)| {
+            let below = *to_end || top + HINTS_IN_VIEW <= lines.end;
+            *revision == tab.revision && lines.start <= top && below
+        };
+        if tab.hints_at.as_ref().is_some_and(covered) {
             return;
         }
         let Some(path) = tab.path.as_deref() else {
             return;
         };
-        if let Some(asked) = self.servers.hints(path, &tab.text, tab.revision) {
-            tab.hints_at = Some(tab.revision);
+        let asked = self.servers.hints(path, &tab.text, tab.revision, top);
+        if let Some((asked, lines, to_end)) = asked {
+            tab.hints_at = Some((tab.revision, lines, to_end));
             let (tab, revision) = (tab.id, tab.revision);
             self.asked.insert(asked, Asked::Hints { tab, revision });
         }
@@ -4402,6 +4464,20 @@ impl GodApp {
                         tab.view.folded.clear();
                     }
                 }
+            }
+            Cmd::Hints => {
+                self.hints = !self.hints;
+                if !self.hints {
+                    for tab in &mut self.tabs {
+                        tab.hints.clear();
+                        tab.hints_at = None;
+                    }
+                }
+                self.toasts.success(if self.hints {
+                    "Inlay hints on"
+                } else {
+                    "Inlay hints off"
+                });
             }
             Cmd::Keys => {
                 self.keys = match self.keys {
@@ -6816,6 +6892,11 @@ impl eframe::App for GodApp {
         storage.set_string("preview", flag(self.preview));
         storage.set_string("minimap", flag(self.minimap));
         storage.set_string("keys", (self.keys as u8).to_string());
+        storage.set_string("hints", flag(self.hints));
+        for tab in &self.tabs {
+            keep_folds(&mut self.folds, tab);
+        }
+        storage.set_string("folds", folds_text(&self.folds));
         storage.set_string("sticky", flag(self.sticky));
         storage.set_string("autosave", flag(self.autosave));
         storage.set_string("blame", flag(self.blame));
@@ -7211,6 +7292,19 @@ fn text_on_disk(path: &Path) -> Option<Decoded> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folded_blocks_are_written_and_read_back() {
+        let mut folds = std::collections::HashMap::new();
+        folds.insert(PathBuf::from("C:/code/a b.rs"), vec![3, 12]);
+        let text = folds_text(&folds);
+        assert_eq!(text, "C:/code/a b.rs\t3,12");
+        assert_eq!(folds_of(&text), folds);
+        // What is not a file and its lines is left out.
+        let read = folds_of("no tab here\nb.rs\t4,x,9\n");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[&PathBuf::from("b.rs")], [4, 9]);
+    }
 
     #[test]
     fn a_file_a_server_changes_may_not_exist_yet() {

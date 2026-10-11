@@ -32,6 +32,41 @@ pub struct Index {
     widest: usize,
     /// Columns of white space leading each line; `None` for a blank line.
     pub indents: Vec<Option<usize>>,
+    /// For a line that leaves a bracket open, the line that closes it.
+    closes: Vec<Option<usize>>,
+}
+
+/// For each line that leaves a bracket open, the line that closes it. Brackets in strings
+/// and in comments do not count; prose has none that open a block.
+fn closers(text: &str, lines: usize, spans: &[Span], language: &Language) -> Vec<Option<usize>> {
+    let mut closes = vec![None; lines];
+    if matches!(language.name, "Plain Text" | "Markdown") {
+        return closes;
+    }
+    // The lines of the brackets still open.
+    let mut open: Vec<usize> = Vec::new();
+    let (mut line, mut span) = (0, 0);
+    for (at, byte) in text.bytes().enumerate() {
+        let opens = matches!(byte, b'(' | b'[' | b'{');
+        if byte == b'\n' {
+            line += 1;
+        } else if opens || matches!(byte, b')' | b']' | b'}') {
+            while spans.get(span).is_some_and(|span| span.end <= at) {
+                span += 1;
+            }
+            let token = spans.get(span).map(|span| span.token);
+            if matches!(token, Some(syntax::Token::String | syntax::Token::Comment)) {
+                continue;
+            }
+            if opens {
+                open.push(line);
+            } else if let Some(opened) = open.pop().filter(|opened| *opened < line) {
+                // Of several left open on a line, the first one closes last: it is kept.
+                closes[opened] = Some(line);
+            }
+        }
+    }
+    closes
 }
 
 impl Index {
@@ -48,11 +83,13 @@ impl Index {
             count += length + 1;
         }
         chars.push(count);
+        let spans = syntax::highlight(text, language);
         Self {
             key,
+            closes: closers(text, starts.len() - 1, &spans, language),
             starts,
             chars,
-            spans: syntax::highlight(text, language),
+            spans,
             widest,
             indents: crate::editor::indents_of(text),
         }
@@ -63,9 +100,13 @@ impl Index {
         self.chars[line.min(self.lines() - 1)]
     }
 
-    /// The lines hidden when the block that `header` opens is folded: those under it that
-    /// are indented deeper, the blank ones between them too.
+    /// The lines hidden when the block that `header` opens is folded: up to the line that
+    /// closes the bracket it leaves open, or else those under it that are indented deeper,
+    /// the blank ones between them too.
     pub fn block(&self, header: usize) -> Option<Range<usize>> {
+        if let Some(close) = self.closes.get(header).copied().flatten() {
+            return (close > header + 1).then(|| header + 1..close);
+        }
         let depth = (*self.indents.get(header)?)?;
         let mut last = header;
         for (line, indent) in self.indents.iter().enumerate().skip(header + 1) {
@@ -1359,6 +1400,22 @@ mod tests {
                 std::hint::black_box(Index::new(0, &text, plain).lines());
             });
         }
+    }
+
+    #[test]
+    fn a_block_is_what_a_bracket_left_open_holds() {
+        // Not indented at all: the brackets alone tell the blocks.
+        let text = "fn a()\n{\nlet s = \"}\";\nif x { // }\ny();\n}\n}\ncall(\n1,\n2);\n";
+        let language = Language::of(std::path::Path::new("a.rs"));
+        let index = Index::new(0, text, language);
+        // The brace in the string and the one in the comment close nothing.
+        assert_eq!(index.block(1), Some(2..6));
+        assert_eq!(index.block(3), Some(4..5));
+        assert_eq!(index.block(7), Some(8..9));
+        assert_eq!((index.block(0), index.block(2)), (None, None));
+        // Prose is folded by its indentation alone.
+        let prose = Index::new(0, "a (\n  b\nc)\n", Language::plain());
+        assert_eq!(prose.block(0), Some(1..2));
     }
 
     #[test]

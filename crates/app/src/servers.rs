@@ -2,6 +2,7 @@
 //! first time a file of that language shows.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use egui::Context;
@@ -194,6 +195,10 @@ pub fn placed(text: &str, hints: Vec<godcode_lsp::Hint>) -> Vec<Hint> {
     placed.collect()
 }
 
+/// Hints are asked for this many lines above the top of the view, and below it.
+const HINTS_ABOVE: usize = 100;
+const HINTS_BELOW: usize = 300;
+
 struct Running {
     program: &'static str,
     root: PathBuf,
@@ -373,13 +378,25 @@ impl Servers {
         Some(server.signature(path, line, column))
     }
 
-    /// Ask what is to be written in the lines of `path`, whose text is `text`; `None` as
-    /// long as its server has not been told the text of this `revision`.
-    pub fn hints(&mut self, path: &Path, text: &str, revision: u64) -> Option<u64> {
+    /// Ask what is to be written in the lines of `path` around the line `around`; `None`
+    /// as long as its server has not been told the text of this `revision`. Returns the
+    /// request, the lines asked about, and whether they go to the end of the text.
+    pub fn hints(
+        &mut self,
+        path: &Path,
+        text: &str,
+        revision: u64,
+        around: usize,
+    ) -> Option<(u64, Range<usize>, bool)> {
         let mut running = self.running.iter_mut();
         let serving = running.find(|running| running.sent.get(path) == Some(&revision))?;
         let server = Some(&mut serving.server).filter(|server| server.can("inlayHintProvider"))?;
-        Some(server.hints(path, 0..text.matches('\n').count() + 1))
+        let total = text.matches('\n').count() + 1;
+        let end = around.saturating_add(HINTS_BELOW).min(total);
+        let start = around
+            .saturating_sub(HINTS_ABOVE)
+            .min(end.saturating_sub(HINTS_ABOVE + HINTS_BELOW));
+        Some((server.hints(path, start..end), start..end, end == total))
     }
 
     /// Ask the server of `path` for the definitions of its project named like `query`.
