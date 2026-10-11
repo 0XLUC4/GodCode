@@ -1682,7 +1682,6 @@ impl Spans {
     }
 }
 
-/// Colour `text`: spans in order, covering it entirely.
 /// The colours written in a line of a style sheet or of a page: where each is, in chars,
 /// and what it is, as red, green, blue and opacity. `#rgb`, `#rrggbb`, with or without
 /// opacity, and `rgb(…)` / `rgba(…)` with numbers.
@@ -1754,16 +1753,227 @@ fn in_numbers(text: &str) -> Option<(usize, [u8; 4])> {
     (parts.len() == 3 || parts.len() == 4).then_some((length, colour))
 }
 
+/// What a line of code leaves open for the next one to go on with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Open {
+    Nothing,
+    /// A block comment.
+    Comment,
+    /// A Rust raw string, closed by a quote and this many hashes.
+    Raw(usize),
+    /// A string between three of this quote.
+    Triple(u8),
+    /// A string between two of this quote: one that runs over lines, or whose line end
+    /// was escaped.
+    Quoted(u8),
+}
+
+/// How the lexer of code stands at a line start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Code {
+    open: Open,
+    /// The last byte of code seen: after an operator a `/` opens a regular expression,
+    /// after a value it divides.
+    last: u8,
+}
+
+impl Default for Code {
+    fn default() -> Self {
+        Self {
+            open: Open::Nothing,
+            last: b'(',
+        }
+    }
+}
+
+/// What a page holds in another language.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Inside {
+    Script,
+    Style,
+}
+
+impl Inside {
+    fn language(self) -> Option<&'static Language> {
+        Language::named(match self {
+            Self::Script => "JavaScript",
+            Self::Style => "CSS",
+        })
+    }
+
+    /// What ends it, in lower case.
+    fn closing(self) -> &'static str {
+        match self {
+            Self::Script => "</script",
+            Self::Style => "</style",
+        }
+    }
+}
+
+/// How the lexer of a page stands at a line start.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Page {
+    #[default]
+    Text,
+    Comment,
+    /// In a tag: whether its name is read, the quote of the value being read, and what
+    /// the tag opens once closed.
+    Tag {
+        named: bool,
+        quote: Option<u8>,
+        opens: Option<Inside>,
+    },
+    /// In a script or a style, read as code.
+    Inside(Inside),
+}
+
+/// The language a Markdown fence names: the same when it is the same one of the table.
+#[derive(Clone, Copy, Debug)]
+struct Fence(&'static Language);
+
+impl PartialEq for Fence {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+/// How the lexer stands at a line start: all that the lines before leave to the ones
+/// after. Each family reads its own part; a fence and a page hand the rest to the
+/// language they hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct State {
+    /// The Markdown fence being read.
+    fence: Option<Fence>,
+    page: Page,
+    code: Code,
+}
+
+/// Colour `text`: spans in order, covering it entirely.
 pub fn highlight(text: &str, language: &Language) -> Vec<Span> {
     let mut spans = Spans(Vec::new());
-    match language.family {
-        Family::Text => {}
-        Family::Code => code(text, language, &mut spans),
-        Family::Markup => markup(text, &mut spans),
-        Family::Markdown => markdown(text, &mut spans),
+    let (mut start, mut state) = (0, State::default());
+    while start < text.len() {
+        let end = line_end(text, start);
+        state = lex_line(text, start, end, language, state, &mut spans);
+        start = end;
     }
     spans.push(text.len(), Token::Plain);
     spans.0
+}
+
+/// What is known of a text once coloured, kept to colour it again after a change without
+/// reading it all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Coloured {
+    spans: Vec<Span>,
+    /// Where each line starts, and how the lexer stood there.
+    lines: Vec<(usize, State)>,
+    /// The bytes read to colour the text last.
+    read: usize,
+}
+
+impl Coloured {
+    /// Colour a whole text.
+    pub fn new(text: &str, language: &Language) -> Coloured {
+        let mut coloured = Coloured {
+            spans: Vec::new(),
+            lines: Vec::new(),
+            read: 0,
+        };
+        // Nothing, into which the whole text was written.
+        coloured.edit(text, language, 0..0, 0..text.len());
+        coloured
+    }
+
+    /// The spans, as `highlight` gives them.
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+
+    /// Colour again after a change: the bytes `old` of the text this was made for were
+    /// replaced, and now stand as the bytes `new` of `text` (the text after the change).
+    /// Only the lines from the change down to where the colouring falls back in step with
+    /// what was known are read. Ranges that do not tell such a change have the whole text
+    /// coloured again.
+    pub fn edit(
+        &mut self,
+        text: &str,
+        language: &Language,
+        old: std::ops::Range<usize>,
+        new: std::ops::Range<usize>,
+    ) {
+        let before = self.spans.last().map_or(0, |span| span.end);
+        // The line of the byte before the change: the line changed, or the one above when
+        // the change starts a line, as what ends a line can be told by what follows it.
+        let above = self.lines.partition_point(|line| line.0 < new.start);
+        let first = above.saturating_sub(1);
+        let (restart, mut state) = self.lines.get(first).copied().unwrap_or_default();
+        let fits = old.start == new.start
+            && old.start <= old.end
+            && old.end <= before
+            && new.start <= new.end
+            && new.end <= text.len()
+            && before - old.end == text.len() - new.end
+            && (restart == 0 || text.as_bytes().get(restart - 1) == Some(&b'\n'));
+        if !fits {
+            *self = Coloured::new(text, language);
+            return;
+        }
+        // The span that holds the byte before `restart` is the first one made again.
+        let from = self.spans.partition_point(|span| span.end < restart);
+        let mut spans = Spans(Vec::new());
+        if let Some(span) = self.spans.get(from).filter(|_| restart > 0) {
+            spans.push(restart, span.token);
+        }
+        let mut lines = Vec::new();
+        // `known` is the line known before the change that the one at `start` is now.
+        let (mut start, mut known, mut met) = (restart, first, false);
+        while !met && start < text.len() {
+            lines.push((start, state));
+            let end = line_end(text, start);
+            state = lex_line(text, start, end, language, state, &mut spans);
+            start = end;
+            if start >= new.end {
+                // Past the change, a line at whose start the lexer stands as it stood:
+                // what follows keeps its colours.
+                let was = start - new.end + old.end;
+                while self.lines.get(known).is_some_and(|line| line.0 < was) {
+                    known += 1;
+                }
+                met = self.lines.get(known) == Some(&(was, state));
+            }
+        }
+        spans.push(start, Token::Plain);
+        let was = if met {
+            start - new.end + old.end
+        } else {
+            known = self.lines.len();
+            before
+        };
+        // The span cut at the line met keeps its end.
+        let mut to = self.spans.partition_point(|span| span.end <= was);
+        if let Some(span) = self.spans.get(to) {
+            spans.push(span.end - old.end + new.end, span.token);
+            to += 1;
+        }
+        let (spanned, lined) = (spans.0.len(), lines.len());
+        self.spans.splice(from..to, spans.0);
+        self.lines.splice(first..known, lines);
+        // What follows moves along.
+        for span in &mut self.spans[from + spanned..] {
+            span.end = span.end - old.end + new.end;
+        }
+        for line in &mut self.lines[first + lined..] {
+            line.0 = line.0 - old.end + new.end;
+        }
+        self.read = start - restart;
+    }
+
+    /// How many bytes of the text were read to colour it last: all of them by `new`, the
+    /// lines gone through by `edit`.
+    pub fn last_read(&self) -> usize {
+        self.read
+    }
 }
 
 fn is_word_byte(byte: u8) -> bool {
@@ -1775,26 +1985,64 @@ fn find_from(text: &str, from: usize, needle: &str) -> Option<usize> {
     text.get(from..)?.find(needle).map(|index| from + index)
 }
 
-/// End of the string opened by `quote` at byte `start`.
-fn string_end(text: &str, start: usize, quote: u8, language: &Language) -> usize {
-    let bytes = text.as_bytes();
-    let triple = [quote; 3];
-    if language.triple_quotes && bytes[start..].starts_with(&triple) {
-        let closing = std::str::from_utf8(&triple).unwrap_or("\"\"\"");
-        return find_from(text, start + 3, closing).map_or(text.len(), |index| index + 3);
+/// Where the line that starts at byte `start` ends: past its line end, or with the text.
+fn line_end(text: &str, start: usize) -> usize {
+    let rest = text.get(start..).unwrap_or("");
+    rest.find('\n').map_or(text.len(), |at| start + at + 1)
+}
+
+/// Colour the line `from..to` of `text`, its line end included, the lexer standing as
+/// `state` at its start: how it stands at its end.
+fn lex_line(
+    text: &str,
+    from: usize,
+    to: usize,
+    language: &Language,
+    state: State,
+    spans: &mut Spans,
+) -> State {
+    match language.family {
+        Family::Text => state,
+        Family::Code => State {
+            code: code(text, from, to, language, state.code, spans),
+            ..state
+        },
+        Family::Markup => markup(text, from, to, state, spans),
+        Family::Markdown => markdown(text, from, to, state, spans),
     }
-    let multiline = language.multiline.contains(&quote);
-    let mut index = start + 1;
+}
+
+/// Where the string opened by `quote` closes in `line`, read from byte `from` inside it;
+/// `None` when it runs past the line.
+fn quoted_end(line: &str, from: usize, quote: u8, multiline: bool) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut index = from;
     while index < bytes.len() {
         match bytes[index] {
             b'\\' => index += 1,
-            byte if byte == quote => return index + 1,
-            b'\n' if !multiline => return index,
+            byte if byte == quote => return Some(index + 1),
+            b'\n' if !multiline => return Some(index),
             _ => {}
         }
         index += 1;
     }
-    text.len()
+    None
+}
+
+/// Where what is `open` closes in `line`, looked for from byte `from` inside it; `None`
+/// when it runs past the line.
+fn closing(line: &str, from: usize, open: Open, language: &Language) -> Option<usize> {
+    let past = |close: &str| find_from(line, from, close).map(|found| found + close.len());
+    match open {
+        Open::Nothing => Some(from),
+        Open::Comment => past(language.block_comment?.1),
+        Open::Raw(hashes) => past(&format!("\"{}", "#".repeat(hashes))),
+        Open::Triple(quote) => {
+            let triple = [quote; 3];
+            past(std::str::from_utf8(&triple).unwrap_or("\"\"\""))
+        }
+        Open::Quoted(quote) => quoted_end(line, from, quote, language.multiline.contains(&quote)),
+    }
 }
 
 /// In Rust `'a'` and `'\n'` are chars, `'a` is a lifetime.
@@ -1807,15 +2055,13 @@ fn is_char_literal(rest: &str) -> bool {
     }
 }
 
-/// End of the Rust raw string (`r"…"`, `r#"…"#`, `br"…"`) starting at byte `index`.
-fn raw_string_end(text: &str, index: usize) -> Option<usize> {
-    let rest = &text[index..];
-    let rest = rest.strip_prefix('b').unwrap_or(rest).strip_prefix('r')?;
-    let hashes = rest.len() - rest.trim_start_matches('#').len();
-    let body = rest[hashes..].strip_prefix('"')?;
-    let closing = format!("\"{}", "#".repeat(hashes));
-    let start = text.len() - body.len();
-    Some(find_from(text, start, &closing).map_or(text.len(), |found| found + closing.len()))
+/// The Rust raw string (`r"…"`, `r#"…"#`, `br"…"`) that `rest` starts with: its hashes,
+/// and the bytes its opening takes.
+fn raw_string(rest: &str) -> Option<(usize, usize)> {
+    let marked = rest.strip_prefix('b').unwrap_or(rest).strip_prefix('r')?;
+    let hashes = marked.len() - marked.trim_start_matches('#').len();
+    let body = marked[hashes..].strip_prefix('"')?;
+    Some((hashes, rest.len() - body.len()))
 }
 
 /// End of the regular expression literal opened by the `/` at `start`, when it closes on
@@ -1843,42 +2089,68 @@ fn regex_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-fn code(text: &str, language: &Language, spans: &mut Spans) {
+/// Colour the bytes `from..to` of `text` as code, `to` ending a line or the text, the
+/// lexer standing as `state` at `from`: how it stands at `to`.
+fn code(
+    text: &str,
+    from: usize,
+    to: usize,
+    language: &Language,
+    state: Code,
+    spans: &mut Spans,
+) -> Code {
     let bytes = text.as_bytes();
-    let mut index = 0;
-    // The last byte of code seen: after an operator a `/` opens a regular expression,
-    // after a value it divides.
-    let mut last = b'(';
-    while index < bytes.len() {
+    // No token is looked for past the line; only a `'` looks one char into the next.
+    let line = &text[..to];
+    let mut index = from;
+    let mut last = state.last;
+    let mut left = state.open;
+    // Only where a `/` can open a regular expression does the last byte matter.
+    let stands = |open: Open, last: u8| Code {
+        open,
+        last: if language.regex_literals { last } else { b'(' },
+    };
+    while index < to {
         let byte = bytes[index];
         let rest = &text[index..];
         let lifetime = language.rust && byte == b'\'' && !is_char_literal(rest);
-        let (end, token) = if language
+        // What starts here: its kind, and either its end, or what it opens and where the
+        // search for its close starts.
+        let (token, open, at) = if left != Open::Nothing {
+            // What the line before left open goes on.
+            let token = if left == Open::Comment {
+                Token::Comment
+            } else {
+                Token::String
+            };
+            (token, std::mem::replace(&mut left, Open::Nothing), index)
+        } else if language
             .line_comments
             .iter()
             .any(|prefix| rest.starts_with(prefix))
         {
-            let end = find_from(text, index, "\n").unwrap_or(text.len());
-            (end, Token::Comment)
-        } else if let Some((open, close)) = language.block_comment
-            && rest.starts_with(open)
+            let end = find_from(line, index, "\n").unwrap_or(to);
+            (Token::Comment, Open::Nothing, end)
+        } else if let Some((opening, _)) = language.block_comment
+            && rest.starts_with(opening)
         {
-            let end = find_from(text, index + open.len(), close)
-                .map_or(text.len(), |found| found + close.len());
-            (end, Token::Comment)
+            (Token::Comment, Open::Comment, index + opening.len())
         } else if language.rust
-            && let Some(end) = raw_string_end(text, index)
+            && let Some((hashes, length)) = raw_string(rest)
         {
-            (end, Token::String)
+            (Token::String, Open::Raw(hashes), index + length)
         } else if language.regex_literals
             && byte == b'/'
             && b"(,=:[!&|?{};".contains(&last)
-            && let Some(end) = regex_end(bytes, index)
+            && let Some(end) = regex_end(line.as_bytes(), index)
         {
-            (end, Token::String)
+            (Token::String, Open::Nothing, end)
         } else if language.quotes.contains(&byte) && !lifetime {
-            let end = string_end(text, index, byte, language).min(text.len());
-            (end, Token::String)
+            if language.triple_quotes && bytes[index..].starts_with(&[byte; 3]) {
+                (Token::String, Open::Triple(byte), index + 3)
+            } else {
+                (Token::String, Open::Quoted(byte), index + 1)
+            }
         } else if byte.is_ascii_digit() {
             let mut end = index + 1;
             while end < bytes.len()
@@ -1888,7 +2160,7 @@ fn code(text: &str, language: &Language, spans: &mut Spans) {
             {
                 end += 1;
             }
-            (end, Token::Number)
+            (Token::Number, Open::Nothing, end)
         } else if is_word_byte(byte) {
             let mut end = index + 1;
             while end < bytes.len() && is_word_byte(bytes[end]) {
@@ -1905,7 +2177,7 @@ fn code(text: &str, language: &Language, spans: &mut Spans) {
             } else {
                 Token::Plain
             };
-            (end, token)
+            (token, Open::Nothing, end)
         } else {
             if !byte.is_ascii_whitespace() {
                 last = byte;
@@ -1913,129 +2185,205 @@ fn code(text: &str, language: &Language, spans: &mut Spans) {
             index += 1;
             continue;
         };
+        let Some(end) = closing(line, at, open, language) else {
+            spans.mark(index, to, token);
+            return stands(open, last);
+        };
         if token != Token::Comment {
             // A keyword (`return`) is followed by a value, as an operator is.
             last = if token == Token::Keyword {
                 b'('
             } else {
-                bytes[end - 1]
+                bytes[end.max(1) - 1]
             };
         }
         spans.mark(index, end, token);
         index = end;
     }
-}
-
-/// Colour the bytes `from..to` of `text` as `language`: a script in a page, a fenced block.
-fn embed(text: &str, from: usize, to: usize, language: &Language, spans: &mut Spans) {
-    if from >= to {
-        return;
-    }
-    if language.family == Family::Text {
-        spans.mark(from, to, Token::String);
-        return;
-    }
-    spans.push(from, Token::Plain);
-    for span in highlight(&text[from..to], language) {
-        spans.push(from + span.end, span.token);
-    }
+    stands(Open::Nothing, last)
 }
 
 /// HTML / XML: comments, tag names, attribute names and values; scripts and styles in
-/// their own language.
-fn markup(text: &str, spans: &mut Spans) {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while let Some(open) = find_from(text, index, "<") {
-        if text[open..].starts_with("<!--") {
-            let end = find_from(text, open + 4, "-->").map_or(text.len(), |found| found + 3);
-            spans.mark(open, end, Token::Comment);
-            index = end;
-            continue;
-        }
-        let close = find_from(text, open, ">").unwrap_or(text.len());
-        let mut at = open + 1;
-        let mut named = false;
-        while at < close {
-            let byte = bytes[at];
-            if byte == b'"' || byte == b'\'' {
-                let end = text[at + 1..close]
-                    .find(byte as char)
-                    .map_or(close, |found| at + 1 + found + 1);
-                spans.mark(at, end, Token::String);
-                at = end;
-            } else if is_word_byte(byte) {
-                let mut end = at + 1;
-                while end < close && (is_word_byte(bytes[end]) || b"-:.".contains(&bytes[end])) {
-                    end += 1;
-                }
-                let token = if named { Token::Type } else { Token::Keyword };
-                spans.mark(at, end, token);
-                named = true;
-                at = end;
-            } else {
-                at += 1;
-            }
-        }
-        index = (close + 1).min(text.len());
-        let name: String = text[open + 1..close]
-            .chars()
-            .take_while(char::is_ascii_alphanumeric)
-            .collect::<String>()
-            .to_ascii_lowercase();
-        let language = match name.as_str() {
-            "script" => Language::named("JavaScript"),
-            "style" => Language::named("CSS"),
-            _ => None,
-        };
-        if let Some(language) = language.filter(|_| !text[open..close].ends_with('/')) {
-            let closing = format!("</{name}");
-            let end = text[index..]
-                .to_ascii_lowercase()
-                .find(&closing)
-                .map_or(text.len(), |at| index + at);
-            embed(text, index, end, language, spans);
-            index = end;
-        }
-    }
-}
-
-/// Markdown: headings, quotes, fenced and inline code.
-fn markdown(text: &str, spans: &mut Spans) {
-    let mut start = 0;
-    // The fence being read: where its code starts, and the language it names.
-    let mut fence: Option<(usize, &Language)> = None;
-    for line in text.split('\n') {
-        let end = start + line.len();
-        let trimmed = line.trim_start();
-        if let Some(named) = trimmed.strip_prefix("```") {
-            match fence.take() {
-                Some((body, language)) => embed(text, body, start, language, spans),
-                None => fence = Some(((end + 1).min(text.len()), Language::fenced(named))),
-            }
-            spans.mark(start, end, Token::String);
-        } else if fence.is_some() {
-            // Coloured as a whole when the fence closes.
-        } else if trimmed.starts_with('#') {
-            spans.mark(start, end, Token::Keyword);
-        } else if trimmed.starts_with('>') {
-            spans.mark(start, end, Token::Comment);
-        } else {
-            let mut from = start;
-            while let Some(open) = find_from(text, from, "`").filter(|open| *open < end) {
-                let Some(close) = find_from(text, open + 1, "`").filter(|close| *close < end)
-                else {
+/// their own language. Colour the line `from..to` of `text`, the lexer standing as
+/// `state` at its start: how it stands at its end.
+fn markup(text: &str, from: usize, to: usize, mut state: State, spans: &mut Spans) -> State {
+    let line = &text[..to];
+    let bytes = line.as_bytes();
+    let mut at = from;
+    while at < to {
+        match state.page {
+            Page::Text => {
+                let Some(open) = find_from(line, at, "<") else {
                     break;
                 };
-                spans.mark(open, close + 1, Token::String);
-                from = close + 1;
+                spans.push(open, Token::Plain);
+                if line[open..].starts_with("<!--") {
+                    state.page = Page::Comment;
+                    at = open + 4;
+                } else {
+                    let name = &bytes[open + 1..];
+                    let length = name.iter().take_while(|byte| byte.is_ascii_alphanumeric());
+                    let name = &name[..length.count()];
+                    let opens = if name.eq_ignore_ascii_case(b"script") {
+                        Some(Inside::Script)
+                    } else if name.eq_ignore_ascii_case(b"style") {
+                        Some(Inside::Style)
+                    } else {
+                        None
+                    };
+                    state.page = Page::Tag {
+                        named: false,
+                        quote: None,
+                        opens,
+                    };
+                    at = open + 1;
+                }
+            }
+            Page::Comment => match find_from(line, at, "-->") {
+                Some(found) => {
+                    spans.push(found + 3, Token::Comment);
+                    state.page = Page::Text;
+                    at = found + 3;
+                }
+                None => at = to,
+            },
+            Page::Tag {
+                named,
+                quote: Some(quote),
+                opens,
+            } => {
+                // A value ends with its quote, or with the tag.
+                let ends = |byte: &u8| *byte == quote || *byte == b'>';
+                let Some(found) = bytes[at..].iter().position(ends) else {
+                    break;
+                };
+                at += found + usize::from(bytes[at + found] == quote);
+                spans.push(at, Token::String);
+                state.page = Page::Tag {
+                    named,
+                    quote: None,
+                    opens,
+                };
+            }
+            Page::Tag {
+                named,
+                quote: None,
+                opens,
+            } => {
+                let byte = bytes[at];
+                if byte == b'>' {
+                    // `<script/>` holds nothing.
+                    let whole = at > 0 && bytes[at - 1] == b'/';
+                    let opens = opens.filter(|inside| !whole && inside.language().is_some());
+                    state.page = opens.map_or(Page::Text, Page::Inside);
+                    state.code = Code::default();
+                    at += 1;
+                } else if byte == b'"' || byte == b'\'' {
+                    spans.push(at, Token::Plain);
+                    state.page = Page::Tag {
+                        named,
+                        quote: Some(byte),
+                        opens,
+                    };
+                    at += 1;
+                } else if is_word_byte(byte) {
+                    let mut end = at + 1;
+                    while end < to && (is_word_byte(bytes[end]) || b"-:.".contains(&bytes[end])) {
+                        end += 1;
+                    }
+                    let token = if named { Token::Type } else { Token::Keyword };
+                    spans.mark(at, end, token);
+                    state.page = Page::Tag {
+                        named: true,
+                        quote: None,
+                        opens,
+                    };
+                    at = end;
+                } else {
+                    at += 1;
+                }
+            }
+            Page::Inside(inside) => {
+                let Some(language) = inside.language() else {
+                    state.page = Page::Text;
+                    continue;
+                };
+                let closing = inside.closing().as_bytes();
+                let closes = |window: &[u8]| window.eq_ignore_ascii_case(closing);
+                match bytes[at..].windows(closing.len()).position(closes) {
+                    // The code ends where its closing tag starts, whatever it left open.
+                    Some(found) => {
+                        let end = at + found;
+                        code(&text[..end], at, end, language, state.code, spans);
+                        state.page = Page::Text;
+                        at = end;
+                    }
+                    None => {
+                        state.code = code(text, at, to, language, state.code, spans);
+                        at = to;
+                    }
+                }
             }
         }
-        start = end + 1;
     }
-    if let Some((body, language)) = fence {
-        embed(text, body, text.len(), language, spans);
+    // What is left open runs to the end of the line.
+    match state.page {
+        Page::Comment => spans.push(to, Token::Comment),
+        Page::Tag { quote: Some(_), .. } => spans.push(to, Token::String),
+        _ => {}
     }
+    state
+}
+
+/// Markdown: headings, quotes, fenced and inline code. Colour the line `from..to` of
+/// `text`, the lexer standing as `state` at its start: how it stands at its end.
+fn markdown(text: &str, from: usize, to: usize, state: State, spans: &mut Spans) -> State {
+    let line = &text[from..to];
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let end = from + line.len();
+    let trimmed = line.trim_start();
+    if let Some(named) = trimmed.strip_prefix("```") {
+        spans.mark(from, end, Token::String);
+        // A fence closes the one being read, or opens one in the language it names.
+        return State {
+            fence: match state.fence {
+                Some(_) => None,
+                None => Some(Fence(Language::fenced(named))),
+            },
+            ..State::default()
+        };
+    }
+    if let Some(Fence(language)) = state.fence {
+        if language.family == Family::Text {
+            spans.mark(from, to, Token::String);
+            return state;
+        }
+        // Its language reads the line, knowing of no fence.
+        let within = State {
+            fence: None,
+            ..state
+        };
+        return State {
+            fence: state.fence,
+            ..lex_line(text, from, to, language, within, spans)
+        };
+    }
+    if trimmed.starts_with('#') {
+        spans.mark(from, end, Token::Keyword);
+    } else if trimmed.starts_with('>') {
+        spans.mark(from, end, Token::Comment);
+    } else {
+        let line = &text[..end];
+        let mut at = from;
+        while let Some(open) = find_from(line, at, "`") {
+            let Some(close) = find_from(line, open + 1, "`") else {
+                break;
+            };
+            spans.mark(open, close + 1, Token::String);
+            at = close + 1;
+        }
+    }
+    state
 }
 
 #[cfg(test)]
@@ -2199,5 +2547,680 @@ mod tests {
         assert_eq!(Language::of(Path::new("x.sql")).line_comment(), Some("--"));
         assert_eq!(Language::of(Path::new("x.css")).line_comment(), None);
         assert!(tokens("SELECT 1", "x.sql").contains(&("SELECT", Token::Keyword)));
+    }
+
+    /// Every language of the table, and plain text.
+    fn languages() -> impl Iterator<Item = &'static Language> {
+        LANGUAGES.iter().chain(std::iter::once(&PLAIN))
+    }
+
+    /// Replace the bytes `at` of `text` by `with`, have `coloured` follow, and check that
+    /// it knows what colouring the whole text anew gives.
+    fn change(
+        coloured: &mut Coloured,
+        text: &mut String,
+        language: &Language,
+        at: std::ops::Range<usize>,
+        with: &str,
+    ) {
+        let before = text.clone();
+        text.replace_range(at.clone(), with);
+        coloured.edit(text, language, at.clone(), at.start..at.start + with.len());
+        let whole = Coloured::new(text, language);
+        assert!(
+            coloured.spans() == highlight(text, language) && coloured.lines == whole.lines,
+            "{}: {at:?} replaced by {with:?}\nbefore: {before:?}\nafter: {text:?}\nkept: {:?}\nwhole: {:?}",
+            language.name,
+            coloured.spans(),
+            whole.spans(),
+        );
+    }
+
+    /// `before`, as the file `file`, once its bytes `at` are replaced by `with`: the text,
+    /// and its colours, which followed the change.
+    fn changed(
+        file: &str,
+        before: &str,
+        at: std::ops::Range<usize>,
+        with: &str,
+    ) -> (String, Coloured) {
+        let language = Language::of(Path::new(file));
+        let mut text = before.to_string();
+        let mut coloured = Coloured::new(&text, language);
+        assert_eq!(coloured.spans(), highlight(&text, language));
+        change(&mut coloured, &mut text, language, at, with);
+        (text, coloured)
+    }
+
+    /// The token of the byte `at`.
+    fn token_at(coloured: &Coloured, at: usize) -> Token {
+        let spans = coloured.spans();
+        spans[spans.partition_point(|span| span.end <= at)].token
+    }
+
+    #[test]
+    fn typing_inside_a_line_reads_that_line_alone() {
+        let text = "fn a() {}\nlet x = 1;\nlet y = 2;\n";
+        let at = text.find('x').unwrap();
+        let (_, coloured) = changed("a.rs", text, at..at, "z");
+        assert_eq!(coloured.last_read(), "let zx = 1;\n".len());
+        // Typed first on a line, it has the line above read too: a `'` ending it is told
+        // by what follows.
+        let at = text.find("let y").unwrap();
+        let (_, coloured) = changed("a.rs", text, at..at, "z");
+        assert_eq!(coloured.last_read(), "let x = 1;\nzlet y = 2;\n".len());
+    }
+
+    #[test]
+    fn a_block_comment_opened_takes_what_follows_and_closed_gives_it_back() {
+        let language = Language::of(Path::new("a.c"));
+        let mut text = "int a;\nint b;\nint c; /* old */\nint d;\nint e;\n".to_string();
+        let mut coloured = Coloured::new(&text, language);
+        let b = text.find("int b").unwrap();
+        // Opened above a comment, it ends where that one ended: the lines after are not read.
+        change(&mut coloured, &mut text, language, b..b, "/*");
+        assert_eq!(
+            token_at(&coloured, text.find("int c").unwrap()),
+            Token::Comment
+        );
+        assert_eq!(
+            token_at(&coloured, text.find("int d").unwrap()),
+            Token::Keyword
+        );
+        let unread = "int d;\nint e;\n".len();
+        assert_eq!(coloured.last_read(), text.len() - unread);
+        // Closed at once, it gives back the lines it took, down to the old comment.
+        change(&mut coloured, &mut text, language, b + 2..b + 2, "*/");
+        assert_eq!(
+            token_at(&coloured, text.find("int b").unwrap()),
+            Token::Keyword
+        );
+        assert_eq!(
+            token_at(&coloured, text.find("old").unwrap()),
+            Token::Comment
+        );
+        assert_eq!(coloured.last_read(), "/**/int b;\nint c; /* old */\n".len());
+        // With nothing to close it below, it takes all the rest: read from the line above
+        // the one it starts, down to the end.
+        let e = text.find("int e").unwrap();
+        let d = text.find("int d").unwrap();
+        change(&mut coloured, &mut text, language, d..d, "/*");
+        assert_eq!(token_at(&coloured, e + 2), Token::Comment);
+        assert_eq!(
+            coloured.last_read(),
+            text.len() - text.find("int c").unwrap()
+        );
+        // Deleted, it gives it all back.
+        change(&mut coloured, &mut text, language, d..d + 2, "");
+        assert_eq!(token_at(&coloured, e), Token::Keyword);
+    }
+
+    #[test]
+    fn a_string_left_open_swallows_the_lines_that_follow() {
+        // A template literal runs to the next backtick, which then opens another.
+        let text = "let a = 1;\nlet b = 2;\nlet c = `t`;\nlet d = 4;\n";
+        let (after, coloured) = changed("a.js", text, 8..8, "`");
+        assert_eq!(
+            token_at(&coloured, after.find("let b").unwrap()),
+            Token::String
+        );
+        assert_eq!(token_at(&coloured, after.find("t`").unwrap()), Token::Plain);
+        assert_eq!(
+            token_at(&coloured, after.find("let d").unwrap()),
+            Token::String
+        );
+        // Three quotes take the lines down to the next three.
+        let text = "a = 1\nb = 2\nc = \"\"\"doc\"\"\"\nd = 4\n";
+        let (after, coloured) = changed("a.py", text, 0..0, "\"\"\"");
+        assert_eq!(
+            token_at(&coloured, after.find("b = 2").unwrap()),
+            Token::String
+        );
+        assert_eq!(
+            token_at(&coloured, after.find("doc").unwrap()),
+            Token::Plain
+        );
+        // A raw string of Rust ends with as many hashes as opened it.
+        let text = "let a = \"x\";\nlet b = 2; // \"# y\nlet c = 3;\n";
+        let (after, coloured) = changed("a.rs", text, 8..8, "r#");
+        assert_eq!(
+            token_at(&coloured, after.find("let b").unwrap()),
+            Token::String
+        );
+        assert_eq!(
+            token_at(&coloured, after.find("let c").unwrap()),
+            Token::Keyword
+        );
+        // A line end escaped in a string has it go on with the next line.
+        let text = "s = \"one\nint two;\"\nint three;\n";
+        let (after, coloured) = changed("a.c", text, 8..8, "\\");
+        assert_eq!(
+            token_at(&coloured, after.find("int two").unwrap()),
+            Token::String
+        );
+        assert_eq!(
+            token_at(&coloured, after.find("int three").unwrap()),
+            Token::Keyword
+        );
+        let (after, coloured) = changed("a.c", &after, 8..9, "");
+        assert_eq!(
+            token_at(&coloured, after.find("int two").unwrap()),
+            Token::Keyword
+        );
+    }
+
+    #[test]
+    fn deleting_a_line_end_joins_two_lines() {
+        let text = "a = 1 // note\nb = 2\nc = 3\n";
+        let end = text.find('\n').unwrap();
+        let (after, coloured) = changed("a.c", text, end..end + 1, "");
+        assert_eq!(after, "a = 1 // noteb = 2\nc = 3\n");
+        assert_eq!(
+            token_at(&coloured, after.find('2').unwrap()),
+            Token::Comment
+        );
+        assert_eq!(token_at(&coloured, after.find('3').unwrap()), Token::Number);
+        assert_eq!(coloured.last_read(), "a = 1 // noteb = 2\n".len());
+        // And the last one, which leaves a text without a line end.
+        let (after, _) = changed("a.c", text, text.len() - 1..text.len(), "");
+        assert!(after.ends_with('3'));
+    }
+
+    #[test]
+    fn a_text_is_changed_at_its_ends_and_as_a_whole() {
+        // Written into nothing, and emptied.
+        let (after, coloured) = changed("a.rs", "", 0..0, "fn a() {}");
+        assert_eq!(coloured.last_read(), after.len());
+        let (_, coloured) = changed("a.rs", "fn a() {}\n// b\n", 0..15, "");
+        assert_eq!((coloured.spans(), coloured.last_read()), (&[][..], 0));
+        let text = "let a = 1;\nlet b = 2;\n";
+        // At its start.
+        changed("a.rs", text, 0..0, "/* c */ ");
+        changed("a.rs", text, 0..3, "");
+        changed("a.rs", text, 0..0, "\n");
+        // At its end, after a line end and after none.
+        let (_, coloured) = changed("a.rs", text, text.len()..text.len(), "let c = \"");
+        assert_eq!(coloured.last_read(), "let b = 2;\nlet c = \"".len());
+        let (_, coloured) = changed("a.rs", "let a = 1;\nlet b", 16..16, " = 2;");
+        assert_eq!(coloured.last_read(), "let b = 2;".len());
+        changed("a.rs", text, text.len()..text.len(), "\n\n");
+        // All of it replaced by another text, and by itself.
+        let (_, coloured) = changed("a.rs", text, 0..text.len(), "/* all\nnew */\nfn b() {}");
+        assert_eq!(coloured.last_read(), "/* all\nnew */\nfn b() {}".len());
+        changed("a.rs", text, 0..text.len(), text);
+    }
+
+    #[test]
+    fn chars_of_several_bytes_stand_around_a_change() {
+        let text = "let é = \"日本\"; // ünï\nlet b = 'é'; /* 語\n語 */ let ñ = 2;\n";
+        for (at, _) in text.char_indices() {
+            let next = at + text[at..].chars().next().map_or(0, char::len_utf8);
+            changed("a.rs", text, at..at, "语");
+            changed("a.rs", text, at..next, "");
+            changed("a.rs", text, at..next, "\"é");
+            changed("a.md", text, at..next, "`ü");
+            changed("a.html", text, at..next, "<é a='日");
+        }
+    }
+
+    #[test]
+    fn lines_ending_in_crlf_follow_a_change() {
+        let text = "let a = 'x\\\r\ny';\r\n/* c\r\nd */ let b = `e\r\nf`;\r\n// g\r\nh();\r\n";
+        for (at, _) in text.char_indices() {
+            changed("a.js", text, at..at, "\r\n");
+            changed("a.js", text, at..at + 1, "");
+            changed("a.js", text, at..at, "`");
+            changed("a.rs", text, at..at, "'");
+        }
+        let page = "<a\r\n href=\"u\r\nv\">\r\n<script>\r\nlet x = 1;\r\n</script>\r\n```rust\r\nfn a() {}\r\n```\r\n";
+        for (at, _) in page.char_indices() {
+            changed("a.html", page, at..at + 1, "");
+            changed("a.md", page, at..at + 1, "");
+            changed("a.md", page, at..at, "\r\n```\r\n");
+        }
+    }
+
+    #[test]
+    fn a_change_of_nothing_changes_nothing() {
+        let text = "fn a() {}\n/* b\nc */ let d = 1;\n";
+        for at in 0..=text.len() {
+            let language = Language::of(Path::new("a.rs"));
+            let whole = Coloured::new(text, language);
+            let mut coloured = whole.clone();
+            coloured.edit(text, language, at..at, at..at);
+            assert_eq!(
+                (coloured.spans(), &coloured.lines),
+                (whole.spans(), &whole.lines)
+            );
+            assert!(coloured.last_read() <= "/* b\nc */ let d = 1;\n".len());
+        }
+    }
+
+    #[test]
+    fn a_quote_that_ends_a_line_is_told_by_the_line_below() {
+        // `'` then a line end then `'` is a char in Rust; without the last, a lifetime.
+        let text = "a '\nb\n";
+        let (after, coloured) = changed("a.rs", text, 4..4, "'");
+        assert_eq!(after, "a '\n'b\n");
+        assert_eq!(
+            token_at(&Coloured::new(text, Language::of(Path::new("a.rs"))), 2),
+            Token::Plain
+        );
+        assert_eq!(token_at(&coloured, 2), Token::String);
+        changed("a.rs", &after, 4..5, "");
+        // In a fence too.
+        let fenced = "```rust\na '\nb\n```\n";
+        changed("a.md", fenced, 12..12, "'");
+        changed("a.md", "```rust\na '\n'b\n```\n", 12..13, "");
+    }
+
+    #[test]
+    fn ranges_that_tell_no_change_have_everything_coloured_again() {
+        let language = Language::of(Path::new("a.rs"));
+        let text = "let a = 1;\n/* b */\n";
+        let whole = Coloured::new(text, language);
+        assert_eq!(whole.last_read(), text.len());
+        // Not the same start, a length that does not add up, ranges past the texts or
+        // turned around.
+        #[allow(clippy::reversed_empty_ranges)]
+        let wrong = [
+            (0..1, 2..3),
+            (0..0, 0..1),
+            (4..9, 4..4),
+            (3..90, 3..90),
+            (9..2, 9..2),
+        ];
+        for (old, new) in wrong {
+            let mut coloured = Coloured::new("fn other() {}\nlet z = \"", language);
+            coloured.edit(text, language, old, new);
+            assert_eq!(coloured, whole);
+        }
+    }
+
+    #[test]
+    fn a_page_follows_a_change_in_its_tags_and_in_what_they_hold() {
+        let page =
+            "<p class=\"a\nb\">t</p>\n<script>\nlet x = `a\n`; /* c */\n</script>\n<b>let</b>\n";
+        // Typed in the script: only its line is read.
+        let x = page.find('x').unwrap();
+        let (_, coloured) = changed("a.html", page, x..x, "y");
+        assert_eq!(coloured.last_read(), "let yx = `a\n".len());
+        // The script closed early: what it held is a page again.
+        let (after, coloured) = changed("a.html", page, x..x, "</script>");
+        assert_eq!(
+            token_at(&coloured, after.find("let").unwrap()),
+            Token::Keyword
+        );
+        assert_eq!(
+            token_at(&coloured, after.find("/* c").unwrap()),
+            Token::Plain
+        );
+        // Its closing tag gone: the rest of the page is script.
+        let close = page.find("</script>").unwrap();
+        let (after, coloured) = changed("a.html", page, close..close + 9, "");
+        assert_eq!(
+            token_at(&coloured, after.rfind("let").unwrap()),
+            Token::Keyword
+        );
+        // A tag that holds nothing, a style, a comment, a value left open.
+        let open = page.find("<script>").unwrap();
+        changed("a.html", page, open + 7..open + 7, "/");
+        changed("a.html", page, open + 1..open + 7, "STYLE");
+        changed("a.html", page, 0..0, "<!--");
+        let (after, coloured) = changed("a.html", page, 11..12, "");
+        assert_eq!(
+            token_at(&coloured, after.find("b\">t").unwrap()),
+            Token::String
+        );
+        let quote = page.find("b\"").unwrap() + 1;
+        let (after, coloured) = changed("a.html", page, quote..quote + 1, "");
+        assert_eq!(
+            token_at(&coloured, after.find("t</p").unwrap()),
+            Token::Plain
+        );
+    }
+
+    #[test]
+    fn fences_follow_a_change() {
+        let notes = "# T\n```rust\nlet s = \"a\nb\"; // c\n```\ntext `code`\n```\nraw\n";
+        // Typed in a fence: only its line is read.
+        let s = notes.find("s =").unwrap();
+        let (_, coloured) = changed("a.md", notes, s..s, "x");
+        assert_eq!(coloured.last_read(), "let xs = \"a\n".len());
+        // Another language named: the fence is read again, and no more.
+        let (after, coloured) = changed("a.md", notes, 7..11, "py");
+        assert_eq!(
+            token_at(&coloured, after.find("let").unwrap()),
+            Token::Plain
+        );
+        assert_eq!(
+            coloured.last_read(),
+            "```py\nlet s = \"a\nb\"; // c\n```\n".len()
+        );
+        // A fence opened above: every fence below turns inside out.
+        let (after, coloured) = changed("a.md", notes, 4..4, "```\n");
+        assert_eq!(
+            token_at(&coloured, after.find("let").unwrap()),
+            Token::Plain
+        );
+        assert_eq!(
+            token_at(&coloured, after.find("text").unwrap()),
+            Token::String
+        );
+        assert_eq!(
+            token_at(&coloured, after.find("raw").unwrap()),
+            Token::Plain
+        );
+        assert_eq!(coloured.last_read(), after.len());
+        // A fence closed, a fence removed, a page in a fence.
+        changed("a.md", notes, notes.len()..notes.len(), "```");
+        changed("a.md", notes, 4..12, "");
+        changed(
+            "a.md",
+            notes,
+            7..11,
+            "html\n<script>let a = /b/;</script>\n<i\n",
+        );
+    }
+
+    /// Numbers that look drawn at random, the same on every run.
+    struct Dice(u64);
+
+    impl Dice {
+        /// A number below `limit`.
+        fn below(&mut self, limit: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as usize % limit
+        }
+    }
+
+    /// The char boundary of `text` at or before byte `at`.
+    fn boundary(text: &str, mut at: usize) -> usize {
+        at = at.min(text.len());
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    const CODE: &str = r##"fn main<'a>(x: &'a str) -> Vec<u8> {
+    let r = r#"raw "text"
+over lines"#; let c = 'x'; let n = b'\n';
+    let total = compute(alpha, 42, 1.5e3) / 2; // done
+    const re = /ab+c[/]/gi, d = a / b;
+    println!("{}", total);
+}
+"##;
+
+    const PAGE: &str = r#"<!DOCTYPE html>
+<!-- a note
+over lines -->
+<html lang="en">
+<head>
+<style>
+body { color: #fff; /* white
+ text */ }
+</style>
+<script src="a.js"/>
+<script type="module">
+let x = `a
+${b}` + 'y'; // note
+const re = /a+/g;
+</SCRIPT>
+</head>
+<body class="main
+ wide" id='top'>
+<a href="u">text é</a>
+</body>
+</html>
+"#;
+
+    const NOTES: &str = r#"# Title
+
+Some `code` here and `more`.
+> a quote
+
+```rust
+fn a<'a>() { let s = "x
+y"; /* c
+*/ }
+```
+text
+```html
+<p class="a">
+<script>let x = 1;</script>
+```
+```md
+# inner
+> q
+```
+```
+raw
+```
+  ```js
+let y = `t
+`;
+"#;
+
+    /// A text in `language`, with all that it can leave open over lines.
+    fn sample(language: &Language) -> String {
+        let mut text = match language.family {
+            Family::Markup => return PAGE.to_string(),
+            Family::Markdown => return NOTES.to_string(),
+            Family::Text => return "plain words\nand \"more\" of them\n".to_string(),
+            Family::Code => CODE.to_string(),
+        };
+        for prefix in language.line_comments {
+            text += &format!("call(1) {prefix} a note\n");
+        }
+        if let Some((open, close)) = language.block_comment {
+            text += &format!("a {open} over\ntwo lines {close} b = 2\n");
+        }
+        for quote in language.quotes.iter().map(|quote| *quote as char) {
+            text += &format!("s = {quote}one\\{quote} two{quote} + {quote}left open\n");
+            text += &format!("t = {quote}goes \\\non{quote}\n");
+            if language.multiline.contains(&(quote as u8)) {
+                text += &format!("m = {quote}over\nlines{quote};\n");
+            }
+            if language.triple_quotes {
+                text += &format!(
+                    "d = {quote}{quote}{quote}doc {quote} over\nlines{quote}{quote}{quote} + 1\n"
+                );
+            }
+        }
+        for keyword in language.keywords.iter().take(6) {
+            text += &format!("{keyword} name(x) {{ Type }}\n");
+        }
+        text
+    }
+
+    /// What is typed into a text of `language`: its own delimiters among those of all.
+    fn pieces(language: &Language) -> Vec<String> {
+        let all = [
+            "\n",
+            "\n",
+            "\n",
+            "\r\n",
+            " ",
+            "\\",
+            "/",
+            "'",
+            "\"",
+            "`",
+            "#",
+            "x",
+            "fn",
+            "A",
+            "1",
+            "(",
+            "=",
+            ",",
+            "é",
+            "日",
+            "r#\"",
+            "\"#",
+            "br\"",
+            "\"\"\"",
+            "'''",
+            "/*",
+            "*/",
+            "//",
+            "--",
+            "<!--",
+            "-->",
+            "<script>",
+            "</script>",
+            "<style",
+            "</STYLE>",
+            "<a href=\"u\"",
+            ">",
+            "/>",
+            "<",
+            "```",
+            "```rust\n",
+            "```html\n",
+            "```md\n",
+            "\n```\n",
+            " ```",
+            "# ",
+            "> ",
+            "'a",
+            "'\n'",
+            ".5",
+            "<<EOF",
+            "EOF\n",
+            "[",
+            "]",
+        ];
+        let mut pieces: Vec<String> = all.iter().map(|piece| piece.to_string()).collect();
+        pieces.extend(
+            language
+                .line_comments
+                .iter()
+                .map(|prefix| prefix.to_string()),
+        );
+        if let Some((open, close)) = language.block_comment {
+            pieces.extend([open.to_string(), close.to_string()]);
+        }
+        for quote in language.quotes.iter().map(|quote| *quote as char) {
+            pieces.extend([quote.to_string(), quote.to_string().repeat(3)]);
+        }
+        pieces.extend(language.keywords.first().map(|keyword| keyword.to_string()));
+        pieces
+    }
+
+    #[test]
+    fn every_language_follows_thousands_of_changes() {
+        for (number, language) in languages().enumerate() {
+            let mut dice = Dice(number as u64 + 1);
+            let pieces = pieces(language);
+            let mut text = sample(language);
+            let mut coloured = Coloured::new(&text, language);
+            for _ in 0..2500 {
+                let at = boundary(&text, dice.below(text.len() + 1));
+                // Mostly a few bytes go; now and then lines do, and more when the text
+                // has grown long.
+                let gone = match dice.below(12) {
+                    0..4 => 0,
+                    4..11 if text.len() < 1500 => dice.below(6),
+                    4..11 => dice.below(200),
+                    _ => dice.below(80),
+                };
+                let end = boundary(&text, at + gone);
+                let written: String = (0..dice.below(4))
+                    .map(|_| pieces[dice.below(pieces.len())].as_str())
+                    .collect();
+                change(&mut coloured, &mut text, language, at..end, &written);
+            }
+        }
+    }
+
+    /// A source of `lines` lines.
+    fn big(lines: usize) -> String {
+        "    let total = compute(alpha, \"text\", 42); // a note\n".repeat(lines)
+    }
+
+    /// Type `typed` at the byte `at` of `text`, have `coloured` follow: the bytes read.
+    fn typed(coloured: &mut Coloured, text: &mut String, at: usize, typed: &str) -> usize {
+        text.insert_str(at, typed);
+        let language = Language::of(Path::new("a.rs"));
+        coloured.edit(text, language, at..at, at..at + typed.len());
+        coloured.last_read()
+    }
+
+    #[test]
+    fn a_change_in_a_big_file_reads_a_line_or_so() {
+        let language = Language::of(Path::new("a.rs"));
+        let mut text = big(200_000);
+        let line = text.len() / 200_000;
+        let mut coloured = Coloured::new(&text, language);
+        assert_eq!(coloured.last_read(), text.len());
+        // A char typed in a line in the middle of the file: its line is read.
+        let here = 100_000 * line;
+        assert_eq!(typed(&mut coloured, &mut text, here + 8, "x"), line + 1);
+        // A line end: the line cut, and the one it makes.
+        assert_eq!(typed(&mut coloured, &mut text, here + 8, "\n"), line + 2);
+        // A block comment opened there takes the rest of the file, read to its end.
+        let read = typed(&mut coloured, &mut text, here + 12, "/*");
+        assert_eq!(read, text.len() - (here + 9));
+        assert_eq!(
+            coloured.spans().last().map(|span| span.token),
+            Some(Token::Comment)
+        );
+        // Typed in the comment, there and far below: a line each time.
+        assert_eq!(typed(&mut coloured, &mut text, here + 14, "y"), line - 4);
+        assert_eq!(
+            typed(&mut coloured, &mut text, here + 50_000 * line, "z"),
+            line + 1
+        );
+        // Closed, it gives back all it took: every line below changes colour, and is read.
+        let read = typed(&mut coloured, &mut text, here + 15, "*/");
+        assert_eq!(read, text.len() - (here + 9));
+        // After which a char is a line again.
+        assert_eq!(typed(&mut coloured, &mut text, here + 17, "w"), line - 1);
+        assert_eq!(coloured.spans(), highlight(&text, language));
+    }
+
+    #[test]
+    #[ignore = "a measure, not a check"]
+    fn colouring_again_is_measured() {
+        let language = Language::of(Path::new("a.rs"));
+        let mut text = big(200_000);
+        let timed = |name: &str, work: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            work();
+            println!("{name}: {:?}", start.elapsed());
+        };
+        println!("{} lines, {} bytes", 200_000, text.len());
+        timed("highlight", &mut || {
+            std::hint::black_box(highlight(&text, language));
+        });
+        timed("Coloured::new", &mut || {
+            std::hint::black_box(Coloured::new(&text, language));
+        });
+        let mut coloured = Coloured::new(&text, language);
+        println!("{} spans", coloured.spans().len());
+        let middle = text.len() / 2 + 8;
+        for (after, typed) in [(0, "x"), (0, "y"), (0, "\n"), (1, "/*"), (3, "*/")] {
+            let at = middle + after;
+            text.insert_str(at, typed);
+            timed(&format!("edit, {typed:?} typed in the middle"), &mut || {
+                coloured.edit(&text, language, at..at, at..at + typed.len());
+            });
+            println!("  {} bytes read", coloured.last_read());
+        }
+        let last = text.len() - 3;
+        text.insert(last, 'x');
+        timed("edit, a char typed on the last line", &mut || {
+            coloured.edit(&text, language, last..last, last..last + 1);
+        });
+        text.insert(8, 'x');
+        timed("edit, a char typed on the first line", &mut || {
+            coloured.edit(&text, language, 8..8, 8..9);
+        });
+        assert_eq!(coloured.spans(), highlight(&text, language));
     }
 }
