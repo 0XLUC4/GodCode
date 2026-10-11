@@ -175,6 +175,7 @@ enum Cmd {
     StepInto,
     StepOut,
     Breakpoint,
+    BreakpointCondition,
     DebugPanel,
     LivePreview,
     LivePreviewBrowser,
@@ -561,6 +562,12 @@ const COMMANDS: &[Spec] = &[
         "Toggle Breakpoint",
         "F9",
     ),
+    spec(
+        Cmd::BreakpointCondition,
+        icon::DOT_OUTLINE,
+        "Breakpoint Condition…",
+        "Shift+F9",
+    ),
     spec(Cmd::DebugPanel, icon::BUG, "Toggle Debug Panel", ""),
     spec(Cmd::LivePreview, icon::BROWSER, "Live Preview", ""),
     spec(
@@ -753,6 +760,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Run),
             Some(Cmd::Debug),
             Some(Cmd::Breakpoint),
+            Some(Cmd::BreakpointCondition),
             Some(Cmd::StepOver),
             Some(Cmd::StepInto),
             Some(Cmd::StepOut),
@@ -896,8 +904,10 @@ struct Tab {
     seen: (u64, f64),
     /// Kept at the start of the tabs, and out of "close others".
     pinned: bool,
-    /// The lines (from 0) the debugger stops on.
+    /// The lines (from 0) the debugger stops on; and for some of them the condition under
+    /// which it does.
     breakpoints: Vec<usize>,
+    conditions: std::collections::HashMap<usize, String>,
     /// What the language server writes in the lines; and what it was last asked: the
     /// revision of the text, the lines, whether they go to the end of the text. The hints
     /// stay as they are until it has answered about the text typed since.
@@ -947,6 +957,7 @@ impl Tab {
             seen: (0, 0.0),
             pinned: false,
             breakpoints: Vec::new(),
+            conditions: Default::default(),
             hints: Vec::new(),
             hints_at: None,
             other: None,
@@ -1096,6 +1107,8 @@ enum PromptKind {
     Delete(PathBuf),
     /// Rename every occurrence of this word in the active file.
     Word(String),
+    /// The condition under which the debugger stops on this line of the active file.
+    Condition(usize),
 }
 
 /// A question about a file of the tree.
@@ -1439,7 +1452,9 @@ pub struct GodApp {
     debug_stopped: bool,
     /// Where it is stopped: the calls, the variables of one of them, the file and line.
     frames: Vec<godcode_lsp::dap::Frame>,
-    variables: Vec<(String, String)>,
+    variables: Vec<godcode_lsp::dap::Variable>,
+    /// The parts of the variables that were opened, by the reference of each.
+    parts: std::collections::HashMap<u64, Vec<godcode_lsp::dap::Variable>>,
     /// The expressions watched, each with what it was last worth; and the one being typed.
     watches: Vec<(String, String)>,
     watch_typed: String,
@@ -1599,6 +1614,7 @@ impl GodApp {
             debug_stopped: false,
             frames: Vec::new(),
             variables: Vec::new(),
+            parts: Default::default(),
             watches: get("watches")
                 .unwrap_or_default()
                 .lines()
@@ -3110,12 +3126,31 @@ impl GodApp {
         }
     }
 
+    /// Have the debugger stop on `line` of the file in front only when `condition` holds;
+    /// always, when it is empty. The line gets a breakpoint if it had none.
+    fn set_condition(&mut self, line: usize, condition: &str) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !tab.breakpoints.contains(&line) {
+            tab.breakpoints.push(line);
+        }
+        match condition {
+            "" => tab.conditions.remove(&line),
+            condition => tab.conditions.insert(line, condition.to_owned()),
+        };
+        if let (Some(session), Some(path)) = (&mut self.debug, &tab.path) {
+            session.set_breakpoints(path, &stops_of(tab));
+        }
+    }
+
     /// The program runs again: nothing to show of where it was.
     fn debug_running(&mut self) {
         self.debug_stopped = false;
         self.debug_at = None;
         self.frames.clear();
         self.variables.clear();
+        self.parts.clear();
         // Running, nothing can be said of what the expressions are worth.
         self.watches.iter_mut().for_each(|(_, worth)| worth.clear());
     }
@@ -3174,8 +3209,7 @@ impl GodApp {
         };
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let breakpoints = self.tabs.iter().filter_map(|tab| {
-            let lines = tab.breakpoints.clone();
-            Some((tab.path.clone()?, lines)).filter(|(_, lines)| !lines.is_empty())
+            Some((tab.path.clone()?, stops_of(tab))).filter(|(_, stops)| !stops.is_empty())
         });
         let wake = ctx.clone();
         let wake = move || wake.request_repaint();
@@ -3222,8 +3256,13 @@ impl GodApp {
                         self.debug_at = Some((path, line));
                     }
                 }
+                Event::Children { reference, list } => {
+                    self.parts.insert(reference, list);
+                }
                 Event::Variables(variables) => {
                     self.variables = variables;
+                    // Those of another call: what was opened is not theirs.
+                    self.parts.clear();
                     // The call looked at changed: so may what the expressions are worth.
                     let watched: Vec<String> = self
                         .watches
@@ -3282,6 +3321,8 @@ impl GodApp {
         let mut inspect = None;
         // An expression to watch from now on, and one to watch no more.
         let (mut watch, mut unwatch) = (None, None);
+        // A variable to open or to close.
+        let mut toggle = None;
         ui.columns(3, |columns| {
             let titled = |ui: &mut Ui, title: &str| {
                 ui.horizontal(|ui| {
@@ -3337,9 +3378,31 @@ impl GodApp {
                 .auto_shrink(false)
                 .show(&mut columns[1], |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    for (name, value) in &self.variables {
-                        let label = format!("{name} = {value}");
-                        list_row(ui, &palette, &label, 10.0, palette.text).on_hover_text(value);
+                    // Each with its parts under it once opened, a level further in.
+                    let mut rows: Vec<(usize, &godcode_lsp::dap::Variable)> = self
+                        .variables
+                        .iter()
+                        .rev()
+                        .map(|found| (0, found))
+                        .collect();
+                    while let Some((depth, found)) = rows.pop() {
+                        let opened = self
+                            .parts
+                            .get(&found.reference)
+                            .filter(|_| found.reference != 0);
+                        let arrow = match (found.reference, opened) {
+                            (0, _) => "   ",
+                            (_, Some(_)) => "▾ ",
+                            (_, None) => "▸ ",
+                        };
+                        let label = format!("{arrow}{} = {}", found.name, found.value);
+                        let indent = 10.0 + depth as f32 * 14.0;
+                        let row = list_row(ui, &palette, &label, indent, palette.text);
+                        if row.on_hover_text(&found.value).clicked() && found.reference != 0 {
+                            toggle = Some(found.reference);
+                        }
+                        let parts = opened.into_iter().flatten().rev();
+                        rows.extend(parts.map(|part| (depth + 1, part)));
                     }
                 });
             titled(&mut columns[2], "OUTPUT");
@@ -3354,6 +3417,14 @@ impl GodApp {
         });
         if let Some(index) = unwatch {
             self.watches.remove(index);
+        }
+        if let Some(reference) = toggle {
+            // Closed, its parts are forgotten; opened, they are asked for.
+            if self.parts.remove(&reference).is_none()
+                && let Some(session) = &mut self.debug
+            {
+                session.expand(reference);
+            }
         }
         if let Some(expression) = watch {
             // Stopped, it is worked out at once; running, at the next stop.
@@ -4731,6 +4802,16 @@ impl GodApp {
                 let line = self.caret_line;
                 self.toggle_breakpoint(self.active, line);
             }
+            Cmd::BreakpointCondition => {
+                let line = self.caret_line;
+                if let Some(tab) = self.tabs.get(self.active) {
+                    self.prompt = Some(Prompt {
+                        kind: PromptKind::Condition(line),
+                        name: tab.conditions.get(&line).cloned().unwrap_or_default(),
+                        focus: true,
+                    });
+                }
+            }
             Cmd::LivePreview => self.live_preview(ctx, false),
             Cmd::LivePreviewBrowser => self.live_preview(ctx, true),
             Cmd::Keymap => {
@@ -5248,6 +5329,7 @@ impl GodApp {
             (Modifiers::SHIFT, Key::F11, Cmd::StepOut),
             (Modifiers::NONE, Key::F11, Cmd::StepInto),
             (Modifiers::NONE, Key::F10, Cmd::StepOver),
+            (Modifiers::SHIFT, Key::F9, Cmd::BreakpointCondition),
             (Modifiers::NONE, Key::F9, Cmd::Breakpoint),
             (alt_shift, Key::ArrowRight, Cmd::ExpandSelection),
             (alt_shift, Key::ArrowLeft, Cmd::ShrinkSelection),
@@ -6948,6 +7030,7 @@ impl GodApp {
             PromptKind::NewFolder(_) => ("New folder", "Create"),
             PromptKind::Rename(_) => ("Rename", "Rename"),
             PromptKind::Word(_) => ("Rename all occurrences", "Rename"),
+            PromptKind::Condition(_) => ("Stop here when… (empty: always)", "Set"),
             PromptKind::Delete(_) => ("Delete", "Move to recycle bin"),
         };
         let mut confirmed = false;
@@ -6978,6 +7061,8 @@ impl GodApp {
         });
         if confirmed && let PromptKind::Word(old) = &prompt.kind {
             self.rename_word(ctx, old, prompt.name.trim());
+        } else if confirmed && let PromptKind::Condition(line) = prompt.kind {
+            self.set_condition(line, prompt.name.trim());
         } else if confirmed {
             match self.file_operation(ctx, &prompt) {
                 Ok(created) => {
@@ -7007,8 +7092,8 @@ impl GodApp {
                 .clone()
                 .all(|part| matches!(part, Component::Normal(_)));
         match &prompt.kind {
-            // Nothing on disk: the caller renames in the text.
-            PromptKind::Word(_) => Ok(None),
+            // Nothing on disk: the caller renames in the text, or tells the debugger.
+            PromptKind::Word(_) | PromptKind::Condition(_) => Ok(None),
             PromptKind::Delete(path) => {
                 trash::delete(path).map_err(|err| format!("Cannot delete {name}: {err}"))?;
                 // Unchanged editors of what is gone close; edited ones keep their text.
@@ -7386,12 +7471,21 @@ fn toggle_breakpoint_of(
     match tab.breakpoints.iter().position(|set| *set == line) {
         Some(at) => {
             tab.breakpoints.remove(at);
+            tab.conditions.remove(&line);
         }
         None => tab.breakpoints.push(line),
     }
     if let (Some(session), Some(path)) = (session, &tab.path) {
-        session.set_breakpoints(path, &tab.breakpoints);
+        session.set_breakpoints(path, &stops_of(tab));
     }
+}
+
+/// The places the debugger stops at in `tab`, each with its condition when it has one.
+fn stops_of(tab: &Tab) -> Vec<godcode_lsp::dap::Stop> {
+    let stops = tab.breakpoints.iter();
+    stops
+        .map(|line| (*line, tab.conditions.get(line).cloned()))
+        .collect()
 }
 
 /// A settings file of the user, by its name.

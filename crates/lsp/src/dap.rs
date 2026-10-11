@@ -20,6 +20,19 @@ pub struct Frame {
     pub line: usize,
 }
 
+/// A variable of the program, or a part of one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Variable {
+    pub name: String,
+    pub value: String,
+    /// What to ask its parts with, when it has parts (a list, an object); 0 otherwise.
+    pub reference: u64,
+}
+
+/// A place the program stops at: a line, counted from 0, and the condition under which it
+/// does, when there is one.
+pub type Stop = (usize, Option<String>);
+
 /// What the debugger said.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -31,7 +44,12 @@ pub enum Event {
     /// Where the stopped program is, innermost call first.
     Stack(Vec<Frame>),
     /// The variables of a call: their names and values.
-    Variables(Vec<(String, String)>),
+    Variables(Vec<Variable>),
+    /// What a variable holds: the answer to [`Session::expand`] of its `reference`.
+    Children {
+        reference: u64,
+        list: Vec<Variable>,
+    },
     /// What the program printed.
     Output(String),
     /// What an expression is worth where the program is stopped, or why it cannot be told.
@@ -50,6 +68,8 @@ enum Asked {
     Stack,
     Scopes,
     Variables,
+    /// The parts of the variable with this reference.
+    Children(u64),
     /// The worth of this expression.
     Evaluate(String),
     Other,
@@ -69,7 +89,7 @@ pub struct Session {
     /// What to launch, sent once the debugger answered `initialize`.
     launch: Value,
     /// The breakpoints to set once the debugger is ready for them.
-    breakpoints: Vec<(PathBuf, Vec<usize>)>,
+    breakpoints: Vec<(PathBuf, Vec<Stop>)>,
     ended: bool,
 }
 
@@ -80,7 +100,7 @@ impl Session {
         program: &str,
         args: &[&str],
         launch: Value,
-        breakpoints: Vec<(PathBuf, Vec<usize>)>,
+        breakpoints: Vec<(PathBuf, Vec<Stop>)>,
         wake: impl Fn() + Send + 'static,
     ) -> std::io::Result<Self> {
         let mut command = Command::new(program);
@@ -124,10 +144,13 @@ impl Session {
     }
 
     /// Set the breakpoints of one file: all of them, replacing those it had.
-    pub fn set_breakpoints(&mut self, path: &Path, lines: &[usize]) {
-        let places: Vec<Value> = lines
+    pub fn set_breakpoints(&mut self, path: &Path, stops: &[Stop]) {
+        let places: Vec<Value> = stops
             .iter()
-            .map(|line| json!({ "line": line + 1 }))
+            .map(|(line, condition)| match condition {
+                Some(condition) => json!({ "line": line + 1, "condition": condition }),
+                None => json!({ "line": line + 1 }),
+            })
             .collect();
         let arguments = json!({ "source": { "path": path }, "breakpoints": places });
         self.request("setBreakpoints", arguments, Asked::Other);
@@ -158,6 +181,12 @@ impl Session {
     pub fn inspect(&mut self, frame: u64) {
         self.frame = frame;
         self.request("scopes", json!({ "frameId": frame }), Asked::Scopes);
+    }
+
+    /// Ask for the parts of a variable; answered by [`Event::Children`].
+    pub fn expand(&mut self, reference: u64) {
+        let arguments = json!({ "variablesReference": reference });
+        self.request("variables", arguments, Asked::Children(reference));
     }
 
     /// Ask what `expressions` are worth in the call being looked at; each is answered by
@@ -259,12 +288,11 @@ impl Session {
                         expression,
                         value: worth(message),
                     }),
-                    Some(Asked::Variables) => {
-                        let list = body["variables"].as_array().into_iter().flatten();
-                        let text = |value: &Value| value.as_str().unwrap_or("").to_owned();
-                        let list = list.map(|found| (text(&found["name"]), text(&found["value"])));
-                        events.push(Event::Variables(list.collect()));
-                    }
+                    Some(Asked::Variables) => events.push(Event::Variables(variables(body))),
+                    Some(Asked::Children(reference)) => events.push(Event::Children {
+                        reference,
+                        list: variables(body),
+                    }),
                     _ => {}
                 }
             }
@@ -284,6 +312,17 @@ impl Session {
             _ => {}
         }
     }
+}
+
+fn variables(body: &Value) -> Vec<Variable> {
+    let list = body["variables"].as_array().into_iter().flatten();
+    let text = |value: &Value| value.as_str().unwrap_or("").to_owned();
+    list.map(|found| Variable {
+        name: text(&found["name"]),
+        value: text(&found["value"]),
+        reference: found["variablesReference"].as_u64().unwrap_or(0),
+    })
+    .collect()
 }
 
 /// What the answer to `evaluate` says an expression is worth, or why it has no worth.
@@ -327,6 +366,22 @@ mod tests {
             json!({ "success": false, "message": "NameError: name 'x' is not defined\nmore" });
         assert_eq!(worth(&unknown), "NameError: name 'x' is not defined");
         assert_eq!(worth(&json!({ "success": false })), "cannot be worked out");
+    }
+
+    #[test]
+    fn variables_say_whether_they_have_parts() {
+        let body = json!({ "variables": [
+            { "name": "items", "value": "[1, 2]", "variablesReference": 5 },
+            { "name": "total", "value": "3", "variablesReference": 0 },
+            { "name": "odd" },
+        ]});
+        let found = variables(&body);
+        let parts: Vec<_> = found
+            .iter()
+            .map(|it| (it.name.as_str(), it.reference))
+            .collect();
+        assert_eq!(parts, [("items", 5), ("total", 0), ("odd", 0)]);
+        assert_eq!(found[0].value, "[1, 2]");
     }
 
     #[test]

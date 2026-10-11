@@ -140,10 +140,12 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Autres langages que Python : `Edit Debug Configurations` (adaptateur + réglages de lancement, `${file}` et `${folder}`) ; mécanisme fait, aucun autre adaptateur vérifié ici | ✅ |
 | `Run Tests and Show Results` (`Ctrl+Alt+T`, ou `Run all` dans le panneau Tests) : la commande de test du projet tourne hors du terminal, et ce qu'elle imprime est lu (cargo, `pytest -v`, `go test -v`, Jest / Vitest verbeux) : tests échoués du projet en tête, coche ou croix sur ceux du fichier ouvert, compte, et toute la sortie à côté. Format vérifié sur une vraie sortie de `cargo test` ; les autres par leurs formats connus | ✅ |
 | Explorateur de tests du projet par fichier, relance d'un seul test avec résultat, couverture | ⏳ |
-| Débogueur : points d'arrêt conditionnels, variables dépliables (objets, listes), survol d'une variable dans le code | ⏳ |
+| Variables dépliables : un clic ouvre une liste ou un objet, ses parties viennent dessous ; points d'arrêt conditionnels : `Breakpoint Condition…` (`Shift+F9`) sur la ligne du curseur, vide pour toujours | ✅ |
+| Débogueur : survol d'une variable dans le code, point d'arrêt conditionnel dessiné autrement dans la marge, modifier une valeur | ⏳ |
 
 Vérifié de bout en bout avec le vrai débogueur Python (debugpy) : arrêt sur un point d'arrêt,
-pile, variables, expressions surveillées, reprise jusqu'à la fin.
+pile, variables et leurs parties, expressions surveillées, point d'arrêt conditionnel,
+reprise jusqu'à la fin.
 `cargo test -p godcode-lsp --test python -- --ignored` le rejoue ; il lui faut debugpy
 (`pip install debugpy`, ou son dossier dans `GODCODE_DEBUGPY`).
 
