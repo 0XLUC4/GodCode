@@ -261,36 +261,73 @@ pub fn set_selection(ctx: &Context, id: Id, range: &Range<usize>) {
     state.store(ctx, id);
 }
 
+/// Bytes of the lines an edit at the bytes `selected` can read or change: the lines the
+/// selection touches, the one above and the one below.
+fn lines_around(text: &str, selected: &Range<usize>) -> Range<usize> {
+    let line_of = |before: &str| before.rfind('\n').map_or(0, |found| found + 1);
+    let end_of = |from: usize| {
+        text[from..]
+            .find('\n')
+            .map_or(text.len(), |found| from + found)
+    };
+    let start = line_of(&text[..line_of(&text[..selected.start]).saturating_sub(1)]);
+    let end = end_of(selected.end);
+    start..end_of((end + 1).min(text.len()))
+}
+
+/// Apply `op` at `selection`. Returns the selection to show and whether the text changed;
+/// `None` when `op` has nothing to do there.
+fn apply(
+    text: &mut String,
+    selection: Range<usize>,
+    config: &Config<'_>,
+    op: Op,
+) -> Option<(Range<usize>, bool)> {
+    let comment = config.language.line_comment();
+    if matches!(op, Op::Comment) && comment.is_none() {
+        return None;
+    }
+    // The edit is made on a copy of the few lines it can read or change: nothing of a big
+    // text is read but what leads to the caret, and what changed is told without a copy
+    // of the whole.
+    let start = godcode_core::byte_index(text, selection.start);
+    let selected = start..start + godcode_core::byte_index(&text[start..], selection.len());
+    let lines = lines_around(text, &selected);
+    let first = selection.start - text[lines.start..selected.start].chars().count();
+    let selection = selection.start - first..selection.end - first;
+    let mut part = text[lines.clone()].to_owned();
+    let part = &mut part;
+    let shown = match op {
+        Op::Newline => {
+            let caret = edit::newline(part, selection, config.indent, config.language);
+            caret..caret
+        }
+        Op::Indent => edit::indent(part, selection, config.indent),
+        Op::Outdent => edit::outdent(part, selection, config.indent),
+        Op::Comment => edit::toggle_comment(part, selection, comment?),
+        Op::Duplicate => edit::duplicate_lines(part, selection),
+        Op::DeleteLine => edit::delete_lines(part, selection),
+        Op::Join => edit::join_lines(part, selection),
+        Op::ToggleCase => edit::toggle_case(part, selection),
+        Op::MoveUp | Op::MoveDown => edit::move_lines(part, selection, matches!(op, Op::MoveUp))?,
+    };
+    let changed = *part != text[lines.clone()];
+    if changed {
+        text.replace_range(lines, part);
+    }
+    Some((shown.start + first..shown.end + first, changed))
+}
+
 /// Apply `op` at the selection of the editor `id`. Returns whether the text changed.
 pub fn run(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>, op: Op) -> bool {
     let Some(selection) = selection_of(ctx, id) else {
         return false;
     };
-    let before = text.clone();
-    let selection = match op {
-        Op::Newline => {
-            let caret = edit::newline(text, selection, config.indent, config.language);
-            caret..caret
-        }
-        Op::Indent => edit::indent(text, selection, config.indent),
-        Op::Outdent => edit::outdent(text, selection, config.indent),
-        Op::Comment => match config.language.line_comment() {
-            Some(prefix) => edit::toggle_comment(text, selection, prefix),
-            None => return false,
-        },
-        Op::Duplicate => edit::duplicate_lines(text, selection),
-        Op::DeleteLine => edit::delete_lines(text, selection),
-        Op::Join => edit::join_lines(text, selection),
-        Op::ToggleCase => edit::toggle_case(text, selection),
-        Op::MoveUp | Op::MoveDown => {
-            match edit::move_lines(text, selection, matches!(op, Op::MoveUp)) {
-                Some(selection) => selection,
-                None => return false,
-            }
-        }
+    let Some((selection, changed)) = apply(text, selection, config, op) else {
+        return false;
     };
     set_selection(ctx, id, &selection);
-    *text != before
+    changed
 }
 
 /// Step the history of the editor `id`, whose view is `view`; `None` when there is nothing
@@ -341,23 +378,45 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
     let Some(typed) = typed else {
         return false;
     };
-    let take = |ui: &Ui, typed: char| {
-        let taken = typed.to_string();
-        ui.input_mut(|input| {
-            input
-                .events
-                .retain(|event| !matches!(event, Event::Text(text) if *text == taken));
-        });
+    let Some((caret, changed)) = paired(text, caret, typed, config) else {
+        return false;
     };
-    if typed == '>' && config.language.is_markup() {
-        let at = godcode_core::byte_index(text, caret);
-        let Some(closing) = complete::closing_tag(&text[..at], &text[at..]) else {
-            return false;
-        };
-        take(ui, typed);
+    // The char is dealt with: the text field is not to type it too.
+    let taken = typed.to_string();
+    ui.input_mut(|input| {
+        input
+            .events
+            .retain(|event| !matches!(event, Event::Text(text) if *text == taken));
+    });
+    set_selection(ui.ctx(), id, &(caret..caret));
+    changed
+}
+
+/// What typing `typed` at `caret` does when the char is one that code is helped with: a
+/// bracket, a quote, the end of a tag, the last letter of a word that ends a block.
+/// Returns the caret after it and whether the text changed; `None` when the char is to be
+/// typed as any other. Only the lines around the caret are read, but to find the bracket
+/// or the tag that the char closes.
+fn paired(
+    text: &mut String,
+    caret: usize,
+    typed: char,
+    config: &Config<'_>,
+) -> Option<(usize, bool)> {
+    let markup = config.language.is_markup();
+    let closers = config.language.block_closers();
+    // Any other char is typed as it is whatever stands around it: the text is not read.
+    let helped = "()[]{}\"".contains(typed)
+        || (markup && matches!(typed, '>' | '/'))
+        || (typed.is_alphabetic() && !closers.is_empty());
+    if !helped {
+        return None;
+    }
+    let at = godcode_core::byte_index(text, caret);
+    if typed == '>' && markup {
+        let closing = complete::closing_tag(&text[..at], &text[at..])?;
         text.insert_str(at, &format!(">{closing}"));
-        set_selection(ui.ctx(), id, &(caret + 1..caret + 1));
-        return true;
+        return Some((caret + 1, true));
     }
     let blank = |lead: &str| lead.chars().all(|ch| ch == ' ' || ch == '\t');
     let indent_at = |text: &str, byte: usize| {
@@ -369,15 +428,9 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
     };
     // `</` closes the element still open: its name is written, and a closing tag that
     // starts its line goes under the tag it closes.
-    if typed == '/' && config.language.is_markup() {
-        let at = godcode_core::byte_index(text, caret);
-        let Some(before) = text[..at].strip_suffix('<') else {
-            return false;
-        };
-        let Some((name, opened)) = complete::unclosed_tag(before) else {
-            return false;
-        };
-        take(ui, typed);
+    if typed == '/' && markup {
+        let before = text[..at].strip_suffix('<')?;
+        let (name, opened) = complete::unclosed_tag(before)?;
         let line = before.rfind('\n').map_or(0, |found| found + 1);
         let (mut at, mut caret) = (at, caret);
         if blank(&before[line..]) {
@@ -388,13 +441,10 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
             text.replace_range(lead, &indent);
         }
         text.insert_str(at, &format!("/{name}>"));
-        caret += name.chars().count() + 2;
-        set_selection(ui.ctx(), id, &(caret..caret));
-        return true;
+        return Some((caret + name.chars().count() + 2, true));
     }
-    let mut around = text.chars().skip(caret.saturating_sub(1));
-    let before = if caret == 0 { None } else { around.next() };
-    let after = around.next();
+    let before = text[..at].chars().next_back();
+    let after = text[at..].chars().next();
     let closer = match typed {
         '(' => ')',
         '[' => ']',
@@ -407,55 +457,41 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
         && after.is_none_or(|ch| ch.is_whitespace() || ")]},;".contains(ch))
         // A quote after a word or a backslash closes or escapes, it does not open.
         && (typed != '"' || !before.is_some_and(|ch| ch.is_alphanumeric() || "\"\\".contains(ch)));
+    let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
     // A word that ends a block (`end`, `fi`), typed first on its line, goes back one level.
-    let closers = config.language.block_closers();
     if typed.is_alphabetic() && !closers.is_empty() {
-        let at = godcode_core::byte_index(text, caret);
-        let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
         let written = text[line..at].trim_start();
         let lead = at - written.len();
         let word = format!("{written}{typed}");
         let goes_on = after.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
         let unit = config.indent;
         if closers.contains(&word.as_str()) && !goes_on && text[line..lead].ends_with(unit) {
-            take(ui, typed);
             text.insert(at, typed);
             text.replace_range(lead - unit.len()..lead, "");
-            let after = caret + 1 - unit.chars().count();
-            set_selection(ui.ctx(), id, &(after..after));
-            return true;
+            return Some((caret + 1 - unit.chars().count(), true));
         }
     }
     // A closing bracket typed first on its line goes under the line of the one it closes.
-    if matches!(typed, ')' | ']' | '}') && !steps_over {
-        let at = godcode_core::byte_index(text, caret);
-        let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
-        if at > line && blank(&text[line..at]) {
-            text.insert(at, typed);
-            let pair = check::matching_bracket(text, config.language, caret);
-            let Some(opener) = pair.map(|(one, other)| one.min(other)) else {
-                // It closes nothing: typed as it is.
-                text.remove(at);
-                return false;
-            };
-            take(ui, typed);
-            let indent = indent_at(text, godcode_core::byte_index(text, opener));
-            let after = caret - text[line..at].chars().count() + indent.chars().count() + 1;
-            text.replace_range(line..at, &indent);
-            set_selection(ui.ctx(), id, &(after..after));
-            return true;
-        }
+    if matches!(typed, ')' | ']' | '}') && !steps_over && at > line && blank(&text[line..at]) {
+        text.insert(at, typed);
+        let pair = check::matching_bracket(text, config.language, caret);
+        let Some(opener) = pair.map(|(one, other)| one.min(other)) else {
+            // It closes nothing: typed as it is.
+            text.remove(at);
+            return None;
+        };
+        let indent = indent_at(text, godcode_core::byte_index(text, opener));
+        let after = caret - text[line..at].chars().count() + indent.chars().count() + 1;
+        text.replace_range(line..at, &indent);
+        return Some((after, true));
     }
     if !steps_over && !opens {
-        return false;
+        return None;
     }
-    take(ui, typed);
     if !steps_over {
-        let at = godcode_core::byte_index(text, caret);
         text.insert_str(at, &format!("{typed}{closer}"));
     }
-    set_selection(ui.ctx(), id, &(caret + 1..caret + 1));
-    !steps_over
+    Some((caret + 1, !steps_over))
 }
 
 /// A rectangle of text: two corners, each a line and a column. A column may be past the end
@@ -1755,6 +1791,38 @@ mod tests {
         Id::new("editor")
     }
 
+    /// What the tests show a file with.
+    fn config_of<'a>(
+        file: &'static str,
+        wrap: bool,
+        hints: &'a [field::Hint],
+        revision: u64,
+    ) -> Config<'a> {
+        Config {
+            language: Language::of(std::path::Path::new(file)),
+            font_size: 14.0,
+            indent: "    ",
+            marks: &[],
+            current_mark: None,
+            squiggles: &[],
+            changes: &[],
+            occurrences: &[],
+            wrap,
+            minimap: true,
+            sticky: true,
+            note: None,
+            snippets: &[],
+            breakpoints: &[],
+            conditional: &[],
+            stopped: None,
+            hints,
+            folds: None,
+            coverage: &[],
+            block_caret: false,
+            revision,
+        }
+    }
+
     impl Harness {
         fn new(text: &str) -> Self {
             Self::of("main.rs", text, false)
@@ -1790,29 +1858,7 @@ mod tests {
             if std::mem::replace(&mut self.bytes, self.text.len()) != self.text.len() {
                 self.revision += 1;
             }
-            let config = Config {
-                language: Language::of(std::path::Path::new(self.file)),
-                font_size: 14.0,
-                indent: "    ",
-                marks: &[],
-                current_mark: None,
-                squiggles: &[],
-                changes: &[],
-                occurrences: &[],
-                wrap: self.wrap,
-                minimap: true,
-                sticky: true,
-                note: None,
-                snippets: &[],
-                breakpoints: &[],
-                conditional: &[],
-                stopped: None,
-                hints: &self.hints,
-                folds: None,
-                coverage: &[],
-                block_caret: false,
-                revision: self.revision,
-            };
+            let config = config_of(self.file, self.wrap, &self.hints, self.revision);
             let mut output = None;
             let _ = self.ctx.run_ui(input, |ui| {
                 output = Some(show(
@@ -2266,6 +2312,425 @@ mod tests {
             );
             assert!(harness.text.starts_with("xa line") && harness.text.ends_with('y'));
         }
+    }
+
+    /// What each editing key costs in a big file: through the whole editor, a frame per
+    /// key, then the edits alone. `cargo test --release -p godcode the_editing_keys --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measure, not a check"]
+    fn the_editing_keys_are_measured_in_big_files() {
+        use std::time::{Duration, Instant};
+        const ROUNDS: usize = 7;
+        // The best of a few: the machine is seldom still.
+        let best = |times: Vec<Duration>| times.into_iter().min().unwrap_or_default();
+        let code = "fn name(value: usize) -> usize {\n    let total = value + 1;\n    \
+                    if total > 3 {\n        return total;\n    }\n    total\n}\n\n";
+        let prose = "a line of plain text, as long as the lines of a log often are, or so\n";
+        let cases = [
+            ("2 MB code", "big.rs", code, 2),
+            ("40 MB code", "big.rs", code, 40),
+            ("40 MB plain", "big.txt", prose, 40),
+        ];
+        for (name, file, line, megabytes) in cases {
+            let text = line.repeat(megabytes * 1024 * 1024 / line.len());
+            // The texts are ASCII: a byte is a char. The middle is the end of a line.
+            let half = &text[..text.len() / 2];
+            let middle = half
+                .rfind(";\n")
+                .map_or_else(|| half.rfind('\n').unwrap_or(0), |at| at + 1);
+            let mut harness = Harness::of(file, &text, false);
+            for (place, caret) in [("middle", middle), ("end", text.len())] {
+                // A frame with `events`, the last `selected` chars before the caret selected.
+                let mut frame = |selected: usize, events: &dyn Fn() -> Vec<Event>| {
+                    let times = (0..ROUNDS).map(|_| {
+                        harness.text.clone_from(&text);
+                        harness.revision += 1;
+                        harness.frame(Vec::new());
+                        set_selection(&harness.ctx, editor_id(), &(caret - selected..caret));
+                        harness.frame(Vec::new());
+                        let start = Instant::now();
+                        harness.frame(events());
+                        let took = start.elapsed();
+                        harness.frame(Vec::new());
+                        took
+                    });
+                    best(times.collect())
+                };
+                let typed = |typed: &'static str| move || vec![Event::Text(typed.to_owned())];
+                let key = |key: Key, modifiers: Modifiers| {
+                    move || {
+                        vec![Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        }]
+                    }
+                };
+                let (plain, shift) = (Modifiers::NONE, Modifiers::SHIFT);
+                println!("{name}, caret at the {place}: a frame with");
+                println!("  nothing      {:?}", frame(0, &Vec::new));
+                println!("  a letter     {:?}", frame(0, &typed("x")));
+                println!("  a bracket    {:?}", frame(0, &typed("(")));
+                println!("  a quote      {:?}", frame(0, &typed("\"")));
+                println!("  Enter        {:?}", frame(0, &key(Key::Enter, plain)));
+                println!("  Tab          {:?}", frame(0, &key(Key::Tab, plain)));
+                println!("  Shift+Tab    {:?}", frame(0, &key(Key::Tab, shift)));
+                println!("  Backspace    {:?}", frame(0, &key(Key::Backspace, plain)));
+                println!("  over 5 chars {:?}", frame(5, &typed("x")));
+
+                // What the app does for Ctrl+/ and its like: the edit, outside a frame.
+                let config = config_of(file, false, &[], 0);
+                let mut ran = |op: Op| {
+                    let times = (0..ROUNDS).map(|_| {
+                        harness.text.clone_from(&text);
+                        set_selection(&harness.ctx, editor_id(), &(caret..caret));
+                        let start = Instant::now();
+                        run(&harness.ctx, editor_id(), &mut harness.text, &config, op);
+                        start.elapsed()
+                    });
+                    best(times.collect())
+                };
+                println!("{name}, caret at the {place}: `run` alone with");
+                println!("  Enter        {:?}", ran(Op::Newline));
+                println!("  Tab          {:?}", ran(Op::Indent));
+                println!("  Shift+Tab    {:?}", ran(Op::Outdent));
+                println!("  Ctrl+/       {:?}", ran(Op::Comment));
+                println!("  duplicate    {:?}", ran(Op::Duplicate));
+                println!("  delete line  {:?}", ran(Op::DeleteLine));
+                println!("  move up      {:?}", ran(Op::MoveUp));
+                println!("  join         {:?}", ran(Op::Join));
+
+                // The edits themselves, and what they are made of.
+                type Edit<'a> = &'a dyn Fn(&mut String);
+                let mut work = text.clone();
+                let mut alone = |edit: Edit| {
+                    let times = (0..ROUNDS).map(|_| {
+                        work.clone_from(&text);
+                        let start = Instant::now();
+                        edit(&mut work);
+                        start.elapsed()
+                    });
+                    best(times.collect())
+                };
+                let language = config.language;
+                let at = caret..caret;
+                let parts: [(&str, Edit); 15] = [
+                    ("a letter", &|text| {
+                        paired(text, caret, 'x', &config);
+                    }),
+                    ("a bracket", &|text| {
+                        paired(text, caret, '(', &config);
+                    }),
+                    ("a quote", &|text| {
+                        paired(text, caret, '"', &config);
+                    }),
+                    ("byte_index", &|text| {
+                        std::hint::black_box(godcode_core::byte_index(text, caret));
+                    }),
+                    ("a copy", &|text| {
+                        std::hint::black_box(text.clone());
+                    }),
+                    ("chars().nth", &|text| {
+                        std::hint::black_box(text.chars().nth(caret.saturating_sub(1)));
+                    }),
+                    ("an insert", &|text| text.insert(caret, 'x')),
+                    ("newline", &|text| {
+                        edit::newline(text, at.clone(), "    ", language);
+                    }),
+                    ("indent", &|text| {
+                        edit::indent(text, at.clone(), "    ");
+                    }),
+                    ("outdent", &|text| {
+                        edit::outdent(text, at.clone(), "    ");
+                    }),
+                    ("comment", &|text| {
+                        edit::toggle_comment(text, at.clone(), "//");
+                    }),
+                    ("duplicate", &|text| {
+                        edit::duplicate_lines(text, at.clone());
+                    }),
+                    ("delete line", &|text| {
+                        edit::delete_lines(text, at.clone());
+                    }),
+                    ("move up", &|text| {
+                        edit::move_lines(text, at.clone(), true);
+                    }),
+                    ("join", &|text| {
+                        edit::join_lines(text, at.clone());
+                    }),
+                ];
+                println!("{name}, caret at the {place}: alone,");
+                for (part, edit) in parts {
+                    println!("  {part:<12} {:?}", alone(edit));
+                }
+            }
+        }
+    }
+
+    /// `apply` as it was: the edit made in the whole text, a copy of which tells whether
+    /// it changed.
+    fn old_apply(
+        text: &mut String,
+        selection: Range<usize>,
+        config: &Config<'_>,
+        op: Op,
+    ) -> Option<(Range<usize>, bool)> {
+        let before = text.clone();
+        let selection = match op {
+            Op::Newline => {
+                let caret = edit::newline(text, selection, config.indent, config.language);
+                caret..caret
+            }
+            Op::Indent => edit::indent(text, selection, config.indent),
+            Op::Outdent => edit::outdent(text, selection, config.indent),
+            Op::Comment => edit::toggle_comment(text, selection, config.language.line_comment()?),
+            Op::Duplicate => edit::duplicate_lines(text, selection),
+            Op::DeleteLine => edit::delete_lines(text, selection),
+            Op::Join => edit::join_lines(text, selection),
+            Op::ToggleCase => edit::toggle_case(text, selection),
+            Op::MoveUp | Op::MoveDown => {
+                edit::move_lines(text, selection, matches!(op, Op::MoveUp))?
+            }
+        };
+        Some((selection, *text != before))
+    }
+
+    /// `paired` as it was: the text read from its start to find the chars at the caret.
+    fn old_paired(
+        text: &mut String,
+        caret: usize,
+        typed: char,
+        config: &Config<'_>,
+    ) -> Option<(usize, bool)> {
+        if typed == '>' && config.language.is_markup() {
+            let at = godcode_core::byte_index(text, caret);
+            let closing = complete::closing_tag(&text[..at], &text[at..])?;
+            text.insert_str(at, &format!(">{closing}"));
+            return Some((caret + 1, true));
+        }
+        let blank = |lead: &str| lead.chars().all(|ch| ch == ' ' || ch == '\t');
+        let indent_at = |text: &str, byte: usize| {
+            let line = text[..byte].rfind('\n').map_or(0, |found| found + 1);
+            let lead = text[line..]
+                .chars()
+                .take_while(|ch| *ch == ' ' || *ch == '\t');
+            lead.collect::<String>()
+        };
+        if typed == '/' && config.language.is_markup() {
+            let at = godcode_core::byte_index(text, caret);
+            let before = text[..at].strip_suffix('<')?;
+            let (name, opened) = complete::unclosed_tag(before)?;
+            let line = before.rfind('\n').map_or(0, |found| found + 1);
+            let (mut at, mut caret) = (at, caret);
+            if blank(&before[line..]) {
+                let indent = indent_at(text, opened);
+                let lead = line..before.len();
+                caret = caret - text[lead.clone()].chars().count() + indent.chars().count();
+                at = line + indent.len() + 1;
+                text.replace_range(lead, &indent);
+            }
+            text.insert_str(at, &format!("/{name}>"));
+            caret += name.chars().count() + 2;
+            return Some((caret, true));
+        }
+        let mut around = text.chars().skip(caret.saturating_sub(1));
+        let before = if caret == 0 { None } else { around.next() };
+        let after = around.next();
+        let closer = match typed {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '"' => '"',
+            _ => '\0',
+        };
+        let steps_over = matches!(typed, ')' | ']' | '}' | '"') && after == Some(typed);
+        let opens = closer != '\0'
+            && after.is_none_or(|ch| ch.is_whitespace() || ")]},;".contains(ch))
+            && (typed != '"'
+                || !before.is_some_and(|ch| ch.is_alphanumeric() || "\"\\".contains(ch)));
+        let closers = config.language.block_closers();
+        if typed.is_alphabetic() && !closers.is_empty() {
+            let at = godcode_core::byte_index(text, caret);
+            let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+            let written = text[line..at].trim_start();
+            let lead = at - written.len();
+            let word = format!("{written}{typed}");
+            let goes_on = after.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+            let unit = config.indent;
+            if closers.contains(&word.as_str()) && !goes_on && text[line..lead].ends_with(unit) {
+                text.insert(at, typed);
+                text.replace_range(lead - unit.len()..lead, "");
+                return Some((caret + 1 - unit.chars().count(), true));
+            }
+        }
+        if matches!(typed, ')' | ']' | '}') && !steps_over {
+            let at = godcode_core::byte_index(text, caret);
+            let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+            if at > line && blank(&text[line..at]) {
+                text.insert(at, typed);
+                let pair = check::matching_bracket(text, config.language, caret);
+                let Some(opener) = pair.map(|(one, other)| one.min(other)) else {
+                    text.remove(at);
+                    return None;
+                };
+                let indent = indent_at(text, godcode_core::byte_index(text, opener));
+                let after = caret - text[line..at].chars().count() + indent.chars().count() + 1;
+                text.replace_range(line..at, &indent);
+                return Some((after, true));
+            }
+        }
+        if !steps_over && !opens {
+            return None;
+        }
+        if !steps_over {
+            let at = godcode_core::byte_index(text, caret);
+            text.insert_str(at, &format!("{typed}{closer}"));
+        }
+        Some((caret + 1, !steps_over))
+    }
+
+    /// Numbers that look random and are the same at every run.
+    struct Dice(u64);
+
+    impl Dice {
+        fn below(&mut self, limit: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % limit as u64) as usize
+        }
+
+        /// A text made of what the keys look at: brackets, quotes, tags, words that end
+        /// blocks, indents, empty lines, line ends of both kinds, chars of every width.
+        fn text(&mut self) -> String {
+            const PIECES: [&str; 44] = [
+                "\n",
+                "\n",
+                "\n",
+                "\r\n",
+                "\t",
+                "    ",
+                "  ",
+                " ",
+                "a",
+                "B",
+                "é",
+                "😀",
+                "€",
+                "word",
+                "let x = 1;",
+                "{",
+                "}",
+                "(",
+                ")",
+                "[",
+                "]",
+                ":",
+                "// ",
+                " // why",
+                "# ",
+                "<div>",
+                "</div>",
+                "<br>",
+                "<p class=\"a\">",
+                "<",
+                "</",
+                "if x then",
+                "en",
+                "els",
+                "f",
+                "do",
+                "\"",
+                "\\",
+                ";",
+                "_",
+                ",",
+                "\n    ",
+                "\n        ",
+                "<ul><li>",
+            ];
+            let most = if self.below(7) == 0 { 4 } else { 30 };
+            let pieces = self.below(most);
+            (0..pieces)
+                .map(|_| PIECES[self.below(PIECES.len())])
+                .collect()
+        }
+
+        /// A place among `chars` chars: often the start or the end.
+        fn place(&mut self, chars: usize) -> usize {
+            match self.below(6) {
+                0 => 0,
+                1 | 2 => chars,
+                _ => self.below(chars + 1),
+            }
+        }
+    }
+
+    const FILES: [&str; 7] = ["a.rs", "a.html", "a.lua", "a.rb", "a.sh", "a.css", "a.txt"];
+    const UNITS: [&str; 3] = ["    ", "  ", "\t"];
+
+    #[test]
+    fn an_edit_made_on_the_lines_around_the_selection_is_the_one_made_on_the_text() {
+        let ops = [
+            Op::Newline,
+            Op::Indent,
+            Op::Outdent,
+            Op::Comment,
+            Op::Duplicate,
+            Op::DeleteLine,
+            Op::MoveUp,
+            Op::MoveDown,
+            Op::Join,
+            Op::ToggleCase,
+        ];
+        let mut dice = Dice(0x2545_F491_4F6C_DD1D);
+        for round in 0..20_000 {
+            let text = dice.text();
+            let chars = text.chars().count();
+            let start = dice.place(chars);
+            let end = match dice.below(3) {
+                0 => start,
+                1 => (start + dice.below(6)).min(chars),
+                _ => start + dice.below(chars - start + 1),
+            };
+            let config = Config {
+                indent: UNITS[round % 3],
+                ..config_of(FILES[round % 7], false, &[], 0)
+            };
+            let op = ops[dice.below(ops.len())];
+            let (mut now, mut then) = (text.clone(), text.clone());
+            let new = apply(&mut now, start..end, &config, op);
+            let old = old_apply(&mut then, start..end, &config, op);
+            let told = format!("op {} at {start}..{end} in {text:?}", op as usize);
+            assert_eq!(new, old, "{told}");
+            assert_eq!(now, then, "{told}");
+        }
+    }
+
+    #[test]
+    fn a_char_typed_is_helped_as_it_was_when_the_text_was_read_from_its_start() {
+        let typed: Vec<char> = "()[]{}\"'>/dieéx <,;".chars().collect();
+        let mut dice = Dice(0x9E37_79B9_7F4A_7C15);
+        let mut helped = 0;
+        for round in 0..40_000 {
+            let text = dice.text();
+            let caret = dice.place(text.chars().count());
+            let config = Config {
+                indent: UNITS[round % 3],
+                ..config_of(FILES[round % 6], false, &[], 0)
+            };
+            let typed = typed[dice.below(typed.len())];
+            let (mut now, mut then) = (text.clone(), text.clone());
+            let new = paired(&mut now, caret, typed, &config);
+            let old = old_paired(&mut then, caret, typed, &config);
+            assert_eq!(new, old, "{typed:?} at {caret} in {text:?}");
+            assert_eq!(now, then, "{typed:?} at {caret} in {text:?}");
+            helped += usize::from(new.is_some());
+        }
+        assert!(helped > 4000, "only {helped} chars were helped");
     }
 
     #[test]
