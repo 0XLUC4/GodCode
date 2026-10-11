@@ -363,11 +363,12 @@ pub const COVERAGE_REPORTS: [&str; 5] = [
 /// `command`, a command that runs tests, asked to name each test it runs and say whether
 /// it passed, where it does not by itself.
 pub fn with_results(command: &str) -> String {
-    match command {
-        "pytest" => "pytest -v".to_owned(),
-        "go test ./..." => "go test -v ./...".to_owned(),
-        command => command.to_owned(),
+    for quiet in ["pytest", "go test"] {
+        if let Some(rest) = command.strip_prefix(quiet) {
+            return format!("{quiet} -v{rest}");
+        }
     }
+    command.to_owned()
 }
 
 /// Run `command` through the shell in `folder`, without a window, and return all it

@@ -143,7 +143,7 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | `Run Tests and Show Results` (`Ctrl+Alt+T`, ou `Run all` dans le panneau Tests) : la commande de test du projet tourne hors du terminal, et ce qu'elle imprime est lu (cargo, `pytest -v`, `go test -v`, Jest / Vitest verbeux) : tests échoués du projet en tête, coche ou croix sur ceux du fichier ouvert, compte, et toute la sortie à côté. Format vérifié sur une vraie sortie de `cargo test` ; les autres par leurs formats connus | ✅ |
 | Tests de tout le projet dans le panneau Tests (`Find all`) : fichier par fichier, un clic va au test, coche ou croix d'après le dernier lancement | ✅ |
 | Couverture dans la marge : `Run Tests with Coverage` lance les tests avec leur rapport (cargo llvm-cov, go, pytest-cov, jest), `Show / Hide Coverage` relit un rapport LCOV ou Go déjà là ; ligne atteinte en vert, jamais atteinte en rouge, pourcentage annoncé. Les marques ne suivent pas la frappe | ✅ |
-| Relance d'un seul test avec résultat | ⏳ |
+| Relance d'un seul test avec résultat : un clic sur un test du fichier dans le panneau Tests le lance ici, son verdict remplace l'ancien, ceux des autres restent | ✅ |
 | Variables dépliables : un clic ouvre une liste ou un objet, ses parties viennent dessous ; points d'arrêt conditionnels : `Breakpoint Condition…` (`Shift+F9`) sur la ligne du curseur, vide pour toujours | ✅ |
 | Pendant un arrêt, le survol d'un nom dans le code dit ce qu'il vaut ; un point d'arrêt conditionnel est dessiné creux dans la marge | ✅ (survol non vu à l'écran) |
 | Les points d'arrêt suivent leur code quand des lignes sont tapées ou effacées au-dessus (dans l'éditeur ; pas après un reformatage) | ✅ |

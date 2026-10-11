@@ -1587,6 +1587,8 @@ pub struct GodApp {
     test_run: Option<Receiver<String>>,
     /// That run also writes down which lines ran: its report is read when it ends.
     covering: bool,
+    /// That run is of one test: what the others were last said to be is kept.
+    test_single: bool,
     /// The lines the tests ran, file by file, as the last report read says; empty when
     /// they are not shown.
     coverage: Vec<godcode_core::coverage::FileCoverage>,
@@ -1764,6 +1766,7 @@ impl GodApp {
             tests: (0, Vec::new()),
             test_run: None,
             covering: false,
+            test_single: false,
             coverage: Vec::new(),
             environment: get("environment").filter(|name| !name.is_empty()),
             environments: None,
@@ -3707,8 +3710,26 @@ impl GodApp {
             return;
         };
         self.covering = covering;
-        self.test_output = format!("$ {command}\n");
         self.test_results.clear();
+        self.capture_tests(ctx, root, command);
+    }
+
+    /// Run one test of the file in front here, and show whether it passed.
+    fn start_test(&mut self, ctx: &Context, name: &str) {
+        let command = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tools::test_one(tab.language.name, tab.path.as_deref()?, name));
+        let (Some(command), Some(root), None) = (command, self.run_root(), &self.test_run) else {
+            return;
+        };
+        self.test_single = true;
+        self.capture_tests(ctx, root, tools::with_results(&command));
+    }
+
+    /// Run `command`, which runs tests, in `root`: what it prints is read when it ends.
+    fn capture_tests(&mut self, ctx: &Context, root: PathBuf, command: String) {
+        self.test_output = format!("$ {command}\n");
         let (sender, receiver) = channel();
         let waking = ctx.clone();
         std::thread::spawn(move || {
@@ -4027,18 +4048,22 @@ impl GodApp {
         };
         match run.try_recv() {
             Ok(printed) => {
-                self.test_results = outline::results(&printed);
+                let read = outline::results(&printed);
+                let failed = read.iter().filter(|(_, passed)| !passed).count();
+                let passed = read.len() - failed;
+                if std::mem::take(&mut self.test_single) {
+                    // What was said before of the tests it ran is out of date.
+                    let ran_again = |name: &String| read.iter().any(|(ran, _)| ran == name);
+                    self.test_results.retain(|(name, _)| !ran_again(name));
+                    self.test_results.extend(read);
+                } else {
+                    self.test_results = read;
+                }
                 self.test_output.push_str(&printed);
                 self.test_run = None;
                 if std::mem::take(&mut self.covering) {
                     self.load_coverage();
                 }
-                let failed = self
-                    .test_results
-                    .iter()
-                    .filter(|(_, passed)| !passed)
-                    .count();
-                let passed = self.test_results.len() - failed;
                 match (passed, failed) {
                     (0, 0) => self
                         .toasts
@@ -4118,7 +4143,7 @@ impl GodApp {
                             Some(false) => marked(ui, &row, icon::X_CIRCLE, FAILED),
                             None => marked(ui, &row, icon::PLAY, palette.text_dim),
                         }
-                        if row.on_hover_text("Run this test in the terminal").clicked() {
+                        if row.on_hover_text("Run this test and show whether it passes").clicked() {
                             run = Some(name.clone());
                         }
                     }
@@ -4189,15 +4214,8 @@ impl GodApp {
             let start = godcode_core::line_start(&tab.text, line + 1);
             tab.select(&ctx, start..start);
         }
-        let command = run.and_then(|name| {
-            let tab = self.tabs.get(self.active)?;
-            tools::test_one(tab.language.name, tab.path.as_deref()?, &name)
-        });
-        if let Some(command) = command {
-            self.show_terminal(&ctx);
-            if let Some(terminal) = &mut self.terminal {
-                terminal.send(&command);
-            }
+        if let Some(name) = run {
+            self.start_test(&ctx, &name);
         }
     }
 
