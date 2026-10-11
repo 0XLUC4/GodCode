@@ -250,7 +250,8 @@ s'affichent et rien ne tourne avant `Allow` ; `Refuse` le lui dit. Il peut encha
 d'outils par question. Les serveurs démarrent à la première ouverture du panneau.
 `Assistant: Toggle Completion While Typing` (éteint par défaut) demande la suite à chaque pause de 0,7 s dans
 la frappe : le code autour du curseur part alors au modèle sans autre geste, et c'est dit en l'allumant.
-Reste : serveurs MCP par HTTP.
+Serveurs MCP distants : une entrée `url` (et `headers` pour un jeton) dans `mcp.json` est jointe par HTTP, via `curl` ;
+`http://` seulement vers cette machine, sinon `https://`. Pas d'OAuth : le jeton se met dans `headers`.
 
 ### Hors périmètre tant que le reste n'est pas solide (❌)
 
