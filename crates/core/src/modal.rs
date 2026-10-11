@@ -1,6 +1,7 @@
 //! The Vim and Emacs ways of editing: what a key does to a text and its caret. Places are
 //! counted in chars.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// A key, as these ways of editing name them.
@@ -197,6 +198,25 @@ pub struct Vim {
     shown: Range<usize>,
     /// What was last deleted or copied, and whether it is whole lines.
     register: (String, bool),
+    /// The registers that have a name: `a` to `z`, and `0` for what was last copied. Each
+    /// holds a text and whether it is whole lines; a macro is kept there as text too.
+    registers: HashMap<char, (String, bool)>,
+    /// The register named with `"` for the command that follows.
+    named: Option<char>,
+    /// `"`, `q` or `@` was typed: the next key names a register.
+    prefix: Option<char>,
+    /// The register a macro is being recorded into, and the keys typed so far.
+    macro_into: Option<char>,
+    macro_keys: String,
+    /// The register whose macro was last played, for `@@`.
+    macro_last: Option<char>,
+    /// How many macros are being played, one inside the other, and how many keys they may
+    /// still type.
+    running: usize,
+    keys_left: usize,
+    /// Where insert mode was entered and how long the text was then, for a macro to keep
+    /// what is typed there.
+    typed_from: Option<(usize, usize)>,
     /// A key that waits for a char: `f`, `F`, `t`, `T` for the one to go to, `i` or `a` for
     /// the text object to take.
     waiting: Option<char>,
@@ -226,6 +246,28 @@ impl Vim {
         selection: &Range<usize>,
         key: Stroke,
     ) -> Option<Done> {
+        let recorded = self.recorded();
+        let done = self.press(text, selection, key);
+        // Neither the keys that start a recording nor the `q` that ends it are part of it.
+        if let (true, true, Some(_), Some(ch)) = (recorded, self.recorded(), &done, key_char(key)) {
+            self.macro_keys.push(ch);
+        }
+        done
+    }
+
+    /// The register a macro is being recorded into, to show while it is.
+    pub fn recording(&self) -> Option<char> {
+        self.macro_into
+    }
+
+    /// The keys typed now go into a macro: one is being recorded, and it is the keyboard
+    /// that types, not `.` or another macro.
+    fn recorded(&self) -> bool {
+        self.macro_into.is_some() && self.running == 0 && !self.replaying
+    }
+
+    /// What `key` does, whoever types it.
+    fn press(&mut self, text: &mut String, selection: &Range<usize>, key: Stroke) -> Option<Done> {
         let mut chars: Vec<char> = text.chars().collect();
         let mut done = Done::default();
         if self.mode == Mode::Insert {
@@ -233,15 +275,13 @@ impl Vim {
                 return None;
             }
             let at = selection.start.min(chars.len());
-            // What was typed since insert mode was entered, for `.` to type again.
-            if let (Some((from, length)), false) = (self.insert_from.take(), self.replaying) {
-                let typed = at
-                    .checked_sub(from)
-                    .filter(|typed| length + typed == chars.len());
-                self.last_typed = match typed {
-                    Some(typed) => chars[from..from + typed].iter().collect(),
-                    None => String::new(),
-                };
+            // What was typed since insert mode was entered: for the macro being recorded,
+            // and for `.` to type again.
+            if let (Some(since), true) = (self.typed_from.take(), self.recorded()) {
+                self.macro_keys.push_str(&typed(&chars, at, since));
+            }
+            if let (Some(since), false) = (self.insert_from.take(), self.replaying) {
+                self.last_typed = typed(&chars, at, since);
             }
             // Out of insert mode the caret is on a char: the one just typed.
             let at = at.max(line_start(&chars, at) + 1) - 1;
@@ -280,9 +320,28 @@ impl Vim {
             self.mode = Mode::Normal;
             visual = false;
         }
+        // The key after `"`, `q` or `@` names a register.
+        if let Some(prefix) = self.prefix.take() {
+            let done = self.name(text, selection, prefix, key);
+            self.shown = done.selection.clone();
+            return Some(done);
+        }
         let idle = self.pending.is_none() && self.waiting.is_none();
         if key == Stroke::Char('.') && idle && !visual {
             return Some(self.repeat(text, selection));
+        }
+        if let (Stroke::Char(prefix @ ('"' | 'q' | '@')), true) = (key, idle) {
+            // While a macro is recorded, `q` ends it: its keys go to its register.
+            match self.macro_into.take_if(|_| prefix == 'q') {
+                Some(name) => {
+                    let keys = std::mem::take(&mut self.macro_keys);
+                    self.keep(name, keys, false);
+                }
+                None => self.prefix = Some(prefix),
+            }
+            done.selection = selection.clone();
+            self.shown = done.selection.clone();
+            return Some(done);
         }
         if !self.replaying {
             self.recording.push(key);
@@ -434,9 +493,16 @@ impl Vim {
                 at..at
             }
         };
+        let complete = self.pending.is_none() && self.waiting.is_none() && !keep_count;
+        if complete {
+            // The register named is for one command only.
+            self.named = None;
+        }
+        if self.mode == Mode::Insert {
+            self.typed_from = Some((at, chars.len()));
+        }
         if !self.replaying {
             // A command that changed the text, or went to insert mode, is what `.` repeats.
-            let complete = self.pending.is_none() && self.waiting.is_none() && !keep_count;
             let changes = (done.changed || self.mode == Mode::Insert) && !visual;
             if complete && changes {
                 self.last = std::mem::take(&mut self.recording);
@@ -470,16 +536,9 @@ impl Vim {
             selection: selection.clone(),
             ..Done::default()
         };
-        let step = |vim: &mut Self, text: &mut String, done: &mut Done, key: Stroke| {
-            if let Some(did) = vim.key(text, &done.selection.clone(), key) {
-                done.selection = did.selection;
-                done.changed |= did.changed;
-                done.copied = did.copied.or(done.copied.take());
-            }
-        };
         self.replaying = true;
         for key in keys {
-            step(self, text, &mut done, key);
+            self.retype(text, &mut done, key);
         }
         if self.mode == Mode::Insert {
             let at = done.selection.start;
@@ -487,10 +546,132 @@ impl Vim {
             let after = at + typed.chars().count();
             done.selection = after..after;
             done.changed = true;
-            step(self, text, &mut done, Stroke::Escape);
+            self.retype(text, &mut done, Stroke::Escape);
         }
         self.replaying = false;
         self.shown = done.selection.clone();
+        done
+    }
+
+    /// Type `key` where `done` left the caret, and add what it does to `done`. False when
+    /// the key is not for Vim.
+    fn retype(&mut self, text: &mut String, done: &mut Done, key: Stroke) -> bool {
+        let Some(did) = self.key(text, &done.selection, key) else {
+            return false;
+        };
+        done.selection = did.selection;
+        done.changed |= did.changed;
+        done.copied = did.copied.or(done.copied.take());
+        done.ask = did.ask.or(done.ask);
+        true
+    }
+
+    /// The key after `"`, `q` or `@` (`prefix`): the register to use for the next command,
+    /// to record a macro into, or whose macro to play. Any other key gives the command up.
+    fn name(
+        &mut self,
+        text: &mut String,
+        selection: &Range<usize>,
+        prefix: char,
+        key: Stroke,
+    ) -> Done {
+        let done = Done {
+            selection: selection.clone(),
+            ..Done::default()
+        };
+        let Stroke::Char(name) = key else {
+            return done;
+        };
+        match prefix {
+            '"' if name.is_ascii_alphabetic() || "0_+*".contains(name) => {
+                // The clipboard is where the register without a name goes already.
+                self.named = Some(name).filter(|name| !"+*".contains(*name));
+                if !self.replaying {
+                    self.recording.extend([Stroke::Char('"'), key]);
+                }
+            }
+            'q' if name.is_ascii_alphabetic() => {
+                self.macro_into = Some(name);
+                self.macro_keys.clear();
+            }
+            '@' if name.is_ascii_alphanumeric() || name == '@' => {
+                let times = self.count.max(1);
+                self.count = 0;
+                self.named = None;
+                self.recording.clear();
+                return self.play(text, selection, name, times);
+            }
+            _ => {}
+        }
+        done
+    }
+
+    /// Keep `taken` in the register `name`; a capital letter adds it to what the small
+    /// letter holds. Returns what the register holds now.
+    fn keep(&mut self, name: char, taken: String, whole_lines: bool) -> (String, bool) {
+        let held = self.registers.entry(name.to_ascii_lowercase()).or_default();
+        if name.is_ascii_uppercase() {
+            // Lines added after a few chars start on a line of their own.
+            if whole_lines && !held.1 && !held.0.is_empty() {
+                held.0.push('\n');
+            }
+            held.0.push_str(&taken);
+            held.1 |= whole_lines;
+            if held.1 && !held.0.ends_with('\n') {
+                held.0.push('\n');
+            }
+        } else {
+            *held = (taken, whole_lines);
+        }
+        held.clone()
+    }
+
+    /// `@`: the keys the register `name` holds, typed `times` times; `@` is the register
+    /// last played. A key that asks something of the application ends it, and so does a
+    /// macro that goes on calling itself.
+    fn play(
+        &mut self,
+        text: &mut String,
+        selection: &Range<usize>,
+        name: char,
+        times: usize,
+    ) -> Done {
+        let mut done = Done {
+            selection: selection.clone(),
+            ..Done::default()
+        };
+        let name = match name {
+            '@' => self.macro_last,
+            name => Some(name.to_ascii_lowercase()),
+        };
+        let held = name.and_then(|name| Some((name, self.registers.get(&name)?.0.clone())));
+        let Some((name, keys)) = held.filter(|(_, keys)| !keys.is_empty()) else {
+            return done;
+        };
+        self.macro_last = Some(name);
+        if self.running == 0 {
+            self.keys_left = MACRO_KEYS;
+        }
+        if self.running == MACRO_DEPTH {
+            return done;
+        }
+        self.running += 1;
+        'played: for _ in 0..times {
+            for ch in keys.chars() {
+                if self.keys_left == 0 || done.ask.is_some() {
+                    break 'played;
+                }
+                self.keys_left -= 1;
+                if !self.retype(text, &mut done, char_key(ch)) {
+                    // Insert mode: the char is typed.
+                    let at = done.selection.start;
+                    text.insert(crate::byte_index(text, at), ch);
+                    done.selection = at + 1..at + 1;
+                    done.changed = true;
+                }
+            }
+        }
+        self.running -= 1;
         done
     }
 
@@ -509,8 +690,20 @@ impl Vim {
             // with one after it.
             taken = taken.trim_matches('\n').to_owned() + "\n";
         }
-        done.copied = Some(taken.clone());
-        self.register = (taken, whole_lines);
+        let named = self.named.take();
+        // `"_` is the black hole: nothing is kept, and what was kept before stays.
+        if named != Some('_') {
+            self.register = match named {
+                Some(name) => self.keep(name, taken, whole_lines),
+                None => {
+                    done.copied = Some(taken.clone());
+                    if op == 'y' {
+                        self.registers.insert('0', (taken.clone(), whole_lines));
+                    }
+                    (taken, whole_lines)
+                }
+            };
+        }
         self.mode = Mode::Normal;
         if op == 'y' {
             // Copying lines leaves the caret where it is.
@@ -632,7 +825,13 @@ impl Vim {
                 return start + indent.chars().count();
             }
             'p' | 'P' => {
-                let (written, whole_lines) = self.register.clone();
+                let (written, whole_lines) = match self.named.take() {
+                    Some(name) => {
+                        let held = self.registers.get(&name.to_ascii_lowercase());
+                        held.cloned().unwrap_or_default()
+                    }
+                    None => self.register.clone(),
+                };
                 let length = written.chars().count();
                 if length == 0 {
                     return at;
@@ -668,6 +867,57 @@ impl Vim {
             _ => {}
         }
         at
+    }
+}
+
+/// How many macros may play one inside the other, and how many keys one `@` may type in
+/// all: where a macro that calls itself stops.
+const MACRO_DEPTH: usize = 32;
+const MACRO_KEYS: usize = 100_000;
+
+/// What was typed up to the caret `at` since it was at `from`, the text being `length`
+/// chars long then; nothing when more than typing was done.
+fn typed(chars: &[char], at: usize, (from, length): (usize, usize)) -> String {
+    let typed = at
+        .checked_sub(from)
+        .filter(|typed| length + typed == chars.len());
+    typed.map_or_else(String::new, |typed| {
+        chars[from..from + typed].iter().collect()
+    })
+}
+
+/// The char that stands for a key in a register, where a macro is kept as text. Keys
+/// that Vim has no use for have none.
+fn key_char(key: Stroke) -> Option<char> {
+    Some(match key {
+        Stroke::Char(ch) => ch,
+        Stroke::Ctrl(ch @ 'a'..='z') => char::from(ch as u8 - b'a' + 1),
+        Stroke::Ctrl(_) | Stroke::Alt(_) => return None,
+        Stroke::Escape => '\u{1b}',
+        Stroke::Enter => '\n',
+        Stroke::Backspace => '\u{8}',
+        Stroke::Delete => '\u{7f}',
+        Stroke::Left => '←',
+        Stroke::Right => '→',
+        Stroke::Up => '↑',
+        Stroke::Down => '↓',
+    })
+}
+
+/// The key a char of a register stands for, when the register is played as a macro.
+fn char_key(ch: char) -> Stroke {
+    match ch {
+        '\u{1b}' => Stroke::Escape,
+        '\n' | '\r' => Stroke::Enter,
+        '\u{8}' => Stroke::Backspace,
+        '\u{7f}' => Stroke::Delete,
+        '←' => Stroke::Left,
+        '→' => Stroke::Right,
+        '↑' => Stroke::Up,
+        '↓' => Stroke::Down,
+        '\t' => Stroke::Char(ch),
+        '\u{1}'..='\u{1a}' => Stroke::Ctrl(char::from(ch as u8 - 1 + b'a')),
+        ch => Stroke::Char(ch),
     }
 }
 
@@ -1019,26 +1269,34 @@ mod tests {
 
     /// Type `keys` in Vim, from the char `at`. Returns the text and the caret.
     fn vim(text: &str, at: usize, keys: &str) -> (String, usize) {
-        let mut vim = Vim::default();
         let mut text = text.to_owned();
-        let mut selection = at..at;
+        let done = type_in(&mut Vim::default(), &mut text, at, keys);
+        (text, done.selection.start)
+    }
+
+    /// Type `keys` in `vim`, from the char `at`. Returns what the last of them did.
+    fn type_in(vim: &mut Vim, text: &mut String, at: usize, keys: &str) -> Done {
+        let mut last = Done {
+            selection: at..at,
+            ..Done::default()
+        };
         for key in keys.chars() {
             let stroke = match key {
                 '\u{1b}' => Stroke::Escape,
                 '\r' => Stroke::Enter,
                 key => Stroke::Char(key),
             };
-            match vim.key(&mut text, &selection, stroke) {
-                Some(done) => selection = done.selection,
+            match vim.key(text, &last.selection, stroke) {
+                Some(done) => last = done,
                 // Insert mode: the text field would write it.
                 None => {
-                    let byte = crate::byte_index(&text, selection.start);
-                    text.insert(byte, key);
-                    selection = selection.start + 1..selection.start + 1;
+                    let at = last.selection.start;
+                    text.insert(crate::byte_index(text, at), key);
+                    last.selection = at + 1..at + 1;
                 }
             }
         }
-        (text, selection.start)
+        last
     }
 
     #[test]
@@ -1213,6 +1471,263 @@ mod tests {
         assert_eq!(vim("abcd", 0, "xl."), ("bd".to_owned(), 1));
         // Nothing done yet: nothing to do again.
         assert_eq!(vim("abc", 1, "."), ("abc".to_owned(), 1));
+    }
+
+    #[test]
+    fn a_named_register_keeps_what_is_yanked_into_it() {
+        // Something else is deleted meanwhile: the register still holds the word.
+        assert_eq!(
+            vim("one two three", 0, "\"aywwdw\"aP"),
+            ("one one three".to_owned(), 7)
+        );
+        // From a selection too.
+        assert_eq!(
+            vim("one two", 0, "ve\"ay$\"ap"),
+            ("one twoone".to_owned(), 9)
+        );
+        // A register nothing was put in pastes nothing.
+        assert_eq!(vim("one", 0, "yw\"bp"), ("one".to_owned(), 0));
+    }
+
+    #[test]
+    fn a_named_register_keeps_what_is_deleted_or_changed_into_it() {
+        assert_eq!(vim("ab", 0, "\"bx\"bp"), ("ba".to_owned(), 1));
+        assert_eq!(
+            vim("one two", 0, "\"ccwX\u{1b}\"cp"),
+            ("Xone two".to_owned(), 3)
+        );
+        assert_eq!(vim("one two", 4, "\"dDyl\"dp"), ("one two".to_owned(), 6));
+    }
+
+    #[test]
+    fn lines_kept_in_a_named_register_are_pasted_as_lines() {
+        // The line in `a` goes under the caret's; the one copied since, with a plain `p`.
+        assert_eq!(vim("a\nb\nc", 0, "\"addyy\"ap"), ("b\na\nc".to_owned(), 2));
+        assert_eq!(
+            vim("a\nb\nc", 0, "\"addyy\"app"),
+            ("b\na\nb\nc".to_owned(), 4)
+        );
+        assert_eq!(vim("a\nb", 2, "\"ayyk\"aP"), ("b\na\nb".to_owned(), 0));
+    }
+
+    #[test]
+    fn a_count_goes_before_or_after_the_name_of_the_register() {
+        assert_eq!(
+            vim("a\nb\nc\nd", 0, "\"a2ddG\"ap"),
+            ("c\nd\na\nb".to_owned(), 4)
+        );
+        assert_eq!(
+            vim("a\nb\nc\nd", 0, "2\"addG\"ap"),
+            ("c\nd\na\nb".to_owned(), 4)
+        );
+    }
+
+    #[test]
+    fn a_capital_letter_adds_to_the_register_of_its_small_letter() {
+        assert_eq!(
+            vim("one two three", 0, "\"ayww\"Ayw\"aP"),
+            ("one one two two three".to_owned(), 11)
+        );
+        assert_eq!(
+            vim("a\nb\nc", 0, "\"ayyj\"Ayy\"ap"),
+            ("a\nb\na\nb\nc".to_owned(), 4)
+        );
+        // Lines added to a few chars: the whole is lines.
+        assert_eq!(
+            vim("one x\ntwo", 0, "\"aywj\"Ayy\"ap"),
+            ("one x\ntwo\none \ntwo".to_owned(), 10)
+        );
+        // A capital letter reads the same register as its small one.
+        assert_eq!(vim("ab", 0, "\"ayl\"Ap"), ("aab".to_owned(), 1));
+    }
+
+    #[test]
+    fn the_black_hole_keeps_nothing_and_leaves_what_was_kept() {
+        assert_eq!(vim("a\nb\nc", 0, "yyj\"_ddP"), ("a\na\nc".to_owned(), 2));
+        assert_eq!(vim("ab", 0, "yl\"_x\"_p"), ("b".to_owned(), 0));
+        // Nothing goes to the clipboard either.
+        let (mut vim, mut text) = (Vim::default(), "one two".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, "\"_dw");
+        assert_eq!((text.as_str(), done.copied), ("two", None));
+    }
+
+    #[test]
+    fn register_zero_holds_the_last_yank_whatever_is_deleted_after() {
+        assert_eq!(vim("a\nb\nc", 0, "yyjdd\"0p"), ("a\nc\na".to_owned(), 4));
+        assert_eq!(vim("one two", 0, "ywx\"0P"), ("one ne two".to_owned(), 3));
+        // A yank into a register with a name is not the one it holds.
+        assert_eq!(vim("a\nb", 0, "yyj\"byy\"0P"), ("a\na\nb".to_owned(), 2));
+    }
+
+    #[test]
+    fn the_register_without_a_name_gets_what_goes_into_a_named_one() {
+        assert_eq!(vim("one two", 0, "\"aywP"), ("one one two".to_owned(), 3));
+        assert_eq!(vim("a\nb", 0, "\"addp"), ("b\na".to_owned(), 2));
+    }
+
+    #[test]
+    fn only_the_register_without_a_name_and_the_clipboard_ones_reach_the_clipboard() {
+        let (mut vim, mut text) = (Vim::default(), "one two".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, "yw");
+        assert_eq!(done.copied.as_deref(), Some("one "));
+        let done = type_in(&mut vim, &mut text, 4, "\"ayw");
+        assert_eq!(done.copied, None);
+        let done = type_in(&mut vim, &mut text, 4, "\"+yw");
+        assert_eq!(done.copied.as_deref(), Some("two"));
+        let done = type_in(&mut vim, &mut text, 0, "\"*yw");
+        assert_eq!(done.copied.as_deref(), Some("one "));
+        // They paste what the register without a name holds.
+        type_in(&mut vim, &mut text, 0, "\"+P");
+        type_in(&mut vim, &mut text, 0, "\"*P");
+        assert_eq!(text, "one one one two");
+    }
+
+    #[test]
+    fn a_key_that_names_no_register_gives_the_command_up() {
+        assert_eq!(vim("a\nb", 0, "\"!dd"), ("b".to_owned(), 0));
+        assert_eq!(vim("ab", 0, "\"\u{1b}x"), ("b".to_owned(), 0));
+        // The register is for one command: a move uses it up.
+        assert_eq!(vim("ab cd", 0, "yl\"awdw\"ap"), ("ab ".to_owned(), 2));
+        // Quotes are still what `f` goes to and what a text object takes.
+        assert_eq!(vim("a \"b\" c", 0, "f\"").1, 2);
+        assert_eq!(vim("a \"b\" c", 3, "di\""), ("a \"\" c".to_owned(), 3));
+        assert_eq!(vim("a q b @", 0, "fq").1, 2);
+        assert_eq!(vim("abc", 1, "rq"), ("aqc".to_owned(), 1));
+    }
+
+    #[test]
+    fn the_last_change_is_done_again_with_its_register() {
+        assert_eq!(
+            vim("a\nb\nc\nd", 0, "\"Add.\"aP"),
+            ("a\nb\nc\nd".to_owned(), 0)
+        );
+        assert_eq!(vim("abcd", 0, "\"ax.\"ap"), ("cbd".to_owned(), 1));
+    }
+
+    #[test]
+    fn a_recording_is_known_from_its_start_to_its_end() {
+        let (mut vim, mut text) = (Vim::default(), "a q b".to_owned());
+        assert_eq!(vim.recording(), None);
+        type_in(&mut vim, &mut text, 0, "q");
+        assert_eq!(vim.recording(), None);
+        type_in(&mut vim, &mut text, 0, "a");
+        assert_eq!(vim.recording(), Some('a'));
+        // A `q` that another key was waiting for does not end it.
+        let done = type_in(&mut vim, &mut text, 0, "fq");
+        assert_eq!((vim.recording(), done.selection), (Some('a'), 2..2));
+        type_in(&mut vim, &mut text, 2, "q");
+        assert_eq!(vim.recording(), None);
+        assert_eq!(type_in(&mut vim, &mut text, 0, "@a").selection, 2..2);
+        // `q` then a key that names no register starts nothing.
+        type_in(&mut vim, &mut text, 0, "q\u{1b}");
+        assert_eq!((vim.recording(), text.as_str()), (None, "a q b"));
+    }
+
+    #[test]
+    fn a_macro_does_again_the_keys_that_were_recorded() {
+        assert_eq!(
+            vim("one two three four", 0, "qadwq@a"),
+            ("three four".to_owned(), 0)
+        );
+        // With what was typed in insert mode.
+        assert_eq!(
+            vim("a\nb\nc", 0, "qaA;\u{1b}jq@a@a"),
+            ("a;\nb;\nc;".to_owned(), 7)
+        );
+        assert_eq!(vim("one two", 0, "qavecX\u{1b}wq@a"), ("X X".to_owned(), 2));
+        // With a register named inside it, and a command after a `:`.
+        assert_eq!(vim("a\nb\nc", 0, "qa\"bddq@a\"bP"), ("b\nc".to_owned(), 0));
+        assert_eq!(
+            vim("a\nb\nc\nd", 0, "qa:3\rxq1G@a"),
+            ("a\nb\n\nd".to_owned(), 4)
+        );
+    }
+
+    #[test]
+    fn a_count_plays_a_macro_that_many_times() {
+        assert_eq!(vim("abcdef", 0, "qaxq3@a"), ("ef".to_owned(), 0));
+        assert_eq!(vim("abcdefgh", 0, "qaxlq2@a"), ("bdfgh".to_owned(), 3));
+        // The count is used up: the next command is done once.
+        assert_eq!(vim("abcdef", 0, "qaxq2@ax"), ("ef".to_owned(), 0));
+    }
+
+    #[test]
+    fn two_at_signs_play_the_macro_last_played() {
+        assert_eq!(vim("abcdef", 0, "qaxq@a@@"), ("def".to_owned(), 0));
+        assert_eq!(vim("abcdefgh", 0, "qaxqqbxxq@a2@@"), ("gh".to_owned(), 0));
+        // None was played yet: nothing to play.
+        assert_eq!(vim("abc", 0, "qaxq@@"), ("bc".to_owned(), 0));
+        assert_eq!(vim("abc", 0, "@z"), ("abc".to_owned(), 0));
+    }
+
+    #[test]
+    fn a_macro_is_kept_as_text_in_its_register() {
+        // Its keys are pasted; a text copied into a register is played as keys.
+        assert_eq!(vim("one two", 0, "qadwq\"ap"), ("tdwwo".to_owned(), 2));
+        assert_eq!(vim("dw\none two", 0, "\"ayyj@a"), ("dw\ntwo".to_owned(), 3));
+        assert_eq!(
+            vim("ab", 0, "qaiX\u{1b}q\"ap"),
+            ("XiX\u{1b}ab".to_owned(), 3)
+        );
+        // A capital letter adds keys to the macro.
+        assert_eq!(vim("abcdefgh", 0, "qaxqqAxq@a"), ("efgh".to_owned(), 0));
+        // Recorded again, it is replaced; recorded empty, it does nothing.
+        assert_eq!(vim("abcdef", 0, "qaxxqqaxq@a"), ("ef".to_owned(), 0));
+        assert_eq!(vim("abcdef", 0, "qaxqqaq@a"), ("bcdef".to_owned(), 0));
+    }
+
+    #[test]
+    fn every_key_has_a_char_that_stands_for_it_in_a_register() {
+        let keys = [
+            Stroke::Char('x'),
+            Stroke::Char('\t'),
+            Stroke::Ctrl('r'),
+            Stroke::Escape,
+            Stroke::Enter,
+            Stroke::Backspace,
+            Stroke::Delete,
+            Stroke::Left,
+            Stroke::Right,
+            Stroke::Up,
+            Stroke::Down,
+        ];
+        for key in keys {
+            assert_eq!(key_char(key).map(char_key), Some(key));
+        }
+        assert_eq!(key_char(Stroke::Alt('f')), None);
+    }
+
+    #[test]
+    fn a_macro_plays_other_macros_and_is_recorded_as_one_key_in_another() {
+        assert_eq!(vim("abcdefgh", 0, "qaxqqb@a@aq@b"), ("fgh".to_owned(), 0));
+        // `.` inside a recording is one key, and after a macro it does its last change.
+        assert_eq!(vim("abcdefgh", 0, "qax.q@a"), ("efgh".to_owned(), 0));
+        assert_eq!(vim("abcdef", 0, "qaxq@a."), ("def".to_owned(), 0));
+    }
+
+    #[test]
+    fn a_macro_ends_at_a_key_that_asks_something_of_the_application() {
+        let (mut vim, mut text) = (Vim::default(), "abcd".to_owned());
+        type_in(&mut vim, &mut text, 0, "qaxuxq");
+        assert_eq!(text, "cd");
+        let done = type_in(&mut vim, &mut text, 0, "@a");
+        assert_eq!((text.as_str(), done.ask), ("d", Some(Ask::Undo)));
+        assert!(done.changed);
+    }
+
+    #[test]
+    fn a_macro_that_calls_itself_stops() {
+        // Once while it is recorded, then once at each depth: on a small stack too.
+        let small = std::thread::Builder::new().stack_size(256 * 1024);
+        let played = small.spawn(|| vim(&"a".repeat(200), 0, "qax@aq@a"));
+        let (text, _) = played.expect("a thread").join().expect("no overflow");
+        assert_eq!(text.len(), 200 - 1 - MACRO_DEPTH);
+        // Calling itself twice, it would go on for ever: the keys it may type run out.
+        let (text, _) = vim(&"a".repeat(200), 0, "qa@a@axq@a");
+        assert!(text.len() < 199);
+        // Two macros that call each other stop as well.
+        let (text, _) = vim(&"a".repeat(200), 0, "qbq qax@bq qbx@aq @a");
+        assert!(text.len() < 198);
     }
 
     #[test]
