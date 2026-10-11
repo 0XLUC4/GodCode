@@ -6750,6 +6750,11 @@ impl GodApp {
                         }
                         None => {}
                     }
+                    // The keys typed are being kept as a macro.
+                    if let Some(register) = self.vim.recording().filter(|_| self.keys == Keys::Vim)
+                    {
+                        ui.label(dim(format!("recording @{register}")));
+                    }
                     ui.label(dim(tab.ending.name().to_owned()));
                     ui.label(dim("UTF-8".to_owned()));
                     ui.label(dim(tab.indent.name()));
