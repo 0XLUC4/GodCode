@@ -4276,6 +4276,7 @@ impl GodApp {
             }
             None => assistant::system(None, "", "", None),
         };
+        self.chat.laid.push(Vec::new());
         self.chat.messages.push(Message {
             from_user: true,
             text: question,
@@ -4305,6 +4306,7 @@ impl GodApp {
             Some(Ok(Ok(text))) => {
                 self.chat.asking = None;
                 let from_user = false;
+                self.chat.laid.push(markdown::blocks(&text));
                 self.chat.messages.push(Message { from_user, text });
             }
             Some(Ok(Err(err))) => (self.chat.asking, self.chat.error) = (None, Some(err)),
@@ -4328,6 +4330,7 @@ impl GodApp {
             self.list_models(&ctx);
         }
         let asking = self.chat.asking.is_some();
+        let zoom = self.zoom;
         let mut provider = self.chat.provider;
         ui.horizontal(|ui| {
             ui.add_space(10.0);
@@ -4353,6 +4356,7 @@ impl GodApp {
             });
             if ui.button("New chat").clicked() {
                 self.chat.messages.clear();
+                self.chat.laid.clear();
                 self.chat.error = None;
             }
             if asking || self.chat.listing.is_some() {
@@ -4379,14 +4383,26 @@ impl GodApp {
                                     it, are sent to the model with each question.";
                         ui.label(RichText::new(hint).color(palette.text_dim));
                     }
-                    for message in &self.chat.messages {
+                    for (message, laid) in self.chat.messages.iter().zip(&self.chat.laid) {
                         let (who, ink) = match message.from_user {
                             true => ("You", palette.accent),
                             false => (self.chat.provider.name(), palette.text_dim),
                         };
-                        ui.label(RichText::new(who).size(11.0).strong().color(ink));
-                        let text = RichText::new(&message.text).size(13.0);
-                        ui.add(egui::Label::new(text).selectable(true).wrap());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(who).size(11.0).strong().color(ink));
+                            let copy = Button::new(RichText::new("Copy").size(11.0));
+                            let copy = copy.frame_when_inactive(false);
+                            if !message.from_user && ui.add(copy).clicked() {
+                                ui.ctx().copy_text(message.text.clone());
+                            }
+                        });
+                        if message.from_user {
+                            let text = RichText::new(&message.text).size(13.0);
+                            ui.add(egui::Label::new(text).selectable(true).wrap());
+                        } else {
+                            // Laid out as the page of a Markdown file is: its code in blocks.
+                            ui.scope(|ui| preview::show(ui, laid, zoom));
+                        }
                         ui.add_space(8.0);
                     }
                     if let Some(error) = &self.chat.error {
@@ -8877,6 +8893,9 @@ struct Chat {
     listed: bool,
     listing: Option<Receiver<Result<Vec<String>, String>>>,
     messages: Vec<crate::assistant::Message>,
+    /// What each of them reads as once laid out: the answers alone are, the questions
+    /// show as they were typed.
+    laid: Vec<Vec<markdown::Placed>>,
     /// The question being written, the answer awaited, why the last one did not come.
     typed: String,
     asking: Option<Receiver<Result<String, String>>>,
@@ -8900,6 +8919,7 @@ impl Chat {
             listed: false,
             listing: None,
             messages: Vec::new(),
+            laid: Vec::new(),
             typed: String::new(),
             asking: None,
             error: None,
