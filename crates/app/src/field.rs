@@ -439,11 +439,8 @@ pub struct Cache {
     rows: Option<(u64, Option<Arc<Vec<usize>>>)>,
     /// The text as it last showed.
     seen: Option<Seen>,
-    /// What the history was last given (the key of the text, the caret), when that first
-    /// showed, and whether the history has seen it stay long enough to keep it.
-    fed: Option<(u64, CCursorRange, f64, bool)>,
-    /// The history was told how many copies of a big text it may keep.
-    capped: bool,
+    /// The changes made to the text, to take back.
+    history: History,
 }
 
 /// The text as it last showed: the revision it is expected to come back with, its size,
@@ -459,7 +456,8 @@ struct Seen {
 /// that can be done without reading it all.
 struct Pen<'a> {
     index: Option<&'a mut Index>,
-    edited: bool,
+    /// What was written, in order.
+    steps: Vec<Written>,
 }
 
 impl Pen<'_> {
@@ -475,23 +473,213 @@ impl Pen<'_> {
     fn write(&mut self, text: &mut String, caret: Caret, written: &str) -> Caret {
         let chars = caret.sorted();
         // Writing nothing over nothing changes nothing.
-        self.edited |= !written.is_empty() || !chars.is_empty();
-        let Some(index) = &mut self.index else {
-            return replace(text, caret, written);
+        if written.is_empty() && chars.is_empty() {
+            return Caret::at(chars.start);
+        }
+        let bytes = match &self.index {
+            Some(index) => index.byte_of(text, chars.start)..index.byte_of(text, chars.end),
+            None => byte(text, chars.start)..byte(text, chars.end),
         };
-        let bytes = index.byte_of(text, chars.start)..index.byte_of(text, chars.end);
+        let removed = text[bytes.clone()].to_owned();
+        self.steps.push((bytes.start, removed, written.to_owned()));
         text.replace_range(bytes.clone(), written);
-        index.splice(text, bytes.start, bytes.len(), written.len());
+        if let Some(index) = &mut self.index {
+            index.splice(text, bytes.start, bytes.len(), written.len());
+        }
         Caret::at(chars.start + written.chars().count())
     }
 }
 
-/// The copies of the text the history keeps take no more than this.
-const HISTORY_BYTES: usize = 256 * 1024 * 1024;
-/// The history keeps a change once it has seen it stay this long.
-const SETTLE_SECONDS: f64 = 1.05;
+/// A change as the keyboard made it: the byte it is at, what was there, what was written.
+type Written = (usize, String, String);
+
+/// A change of the text: at the byte `at`, `removed` gave way to `written`.
+struct Step {
+    at: usize,
+    removed: String,
+    written: String,
+    /// The selection before it and after it.
+    before: CCursorRange,
+    after: CCursorRange,
+    /// Changes made in one go are taken back in one go.
+    group: u64,
+}
+
+/// Changes less than this apart are made in one go.
+const PAUSE_SECONDS: f64 = 1.0;
+/// What the history keeps of the text taken out and written takes no more than this: the
+/// oldest changes are forgotten first.
+const HISTORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The changes made to a text, to take back and to make again. Only what changed is kept,
+/// so a big text costs no more than a small one; and one copy of the text as the history
+/// last saw it, against which a change made elsewhere is found.
+#[derive(Default)]
+pub struct History {
+    shadow: Option<String>,
+    undos: Vec<Step>,
+    redos: Vec<Step>,
+    group: u64,
+    changed_at: f64,
+    /// The selection as last seen: where it was before the next change.
+    caret: Option<CCursorRange>,
+    /// Bytes of text held by the changes kept.
+    bytes: usize,
+}
+
+/// How many bytes two texts start with in common.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    const BLOCK: usize = 4096;
+    let mut at = 0;
+    // Whole blocks are compared at once.
+    while let (Some(ours), Some(theirs)) = (a.get(at..at + BLOCK), b.get(at..at + BLOCK)) {
+        if ours != theirs {
+            break;
+        }
+        at += BLOCK;
+    }
+    let rest = a[at..].iter().zip(&b[at..]);
+    at + rest.take_while(|(ours, theirs)| ours == theirs).count()
+}
+
+/// How many bytes two texts end with in common.
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    const BLOCK: usize = 4096;
+    let mut len = 0;
+    while len + BLOCK <= a.len().min(b.len())
+        && a[a.len() - len - BLOCK..a.len() - len] == b[b.len() - len - BLOCK..b.len() - len]
+    {
+        len += BLOCK;
+    }
+    let rest = a[..a.len() - len]
+        .iter()
+        .rev()
+        .zip(b[..b.len() - len].iter().rev());
+    len + rest.take_while(|(ours, theirs)| ours == theirs).count()
+}
+
+impl History {
+    /// Take in the text as it is now, at `time`. `own`: what the keyboard wrote since the
+    /// last time, when nothing else can have changed the text; with `elsewhere`, the text
+    /// may have been changed by anything, and is compared with what it was.
+    pub fn see(
+        &mut self,
+        text: &str,
+        caret: Option<CCursorRange>,
+        time: f64,
+        own: Vec<Written>,
+        elsewhere: bool,
+    ) {
+        let caret = caret.or(self.caret);
+        let Some(mut shadow) = self.shadow.take() else {
+            self.shadow = Some(text.to_owned());
+            self.caret = caret;
+            return;
+        };
+        let after = caret.unwrap_or_default();
+        if !elsewhere {
+            for (at, removed, written) in own {
+                shadow.replace_range(at..at + removed.len(), &written);
+                self.push(at, removed, written, after, time);
+            }
+        } else if shadow != text {
+            // One stretch differs: what the two have in common around it stays.
+            let mut prefix = common_prefix(shadow.as_bytes(), text.as_bytes());
+            while !text.is_char_boundary(prefix) {
+                prefix -= 1;
+            }
+            let (ours, theirs) = (&shadow.as_bytes()[prefix..], &text.as_bytes()[prefix..]);
+            let mut suffix = common_suffix(ours, theirs);
+            while !text.is_char_boundary(text.len() - suffix) {
+                suffix -= 1;
+            }
+            let removed = shadow[prefix..shadow.len() - suffix].to_owned();
+            let written = text[prefix..text.len() - suffix].to_owned();
+            shadow.replace_range(prefix..shadow.len() - suffix, &written);
+            self.push(prefix, removed, written, after, time);
+        }
+        self.shadow = Some(shadow);
+        self.caret = caret;
+    }
+
+    fn push(
+        &mut self,
+        at: usize,
+        removed: String,
+        written: String,
+        after: CCursorRange,
+        time: f64,
+    ) {
+        if time - self.changed_at > PAUSE_SECONDS {
+            self.group += 1;
+        }
+        self.changed_at = time;
+        let held = |step: &Step| step.removed.len() + step.written.len();
+        // What was taken back cannot be made again once the text went another way.
+        self.bytes -= self.redos.drain(..).map(|step| held(&step)).sum::<usize>();
+        self.bytes += removed.len() + written.len();
+        self.undos.push(Step {
+            at,
+            removed,
+            written,
+            before: self.caret.unwrap_or(after),
+            after,
+            group: self.group,
+        });
+        while self.bytes > HISTORY_BYTES && self.undos.len() > 1 {
+            self.bytes -= held(&self.undos.remove(0));
+        }
+    }
+
+    /// Take back the last changes made in one go. Returns the selection as it was before
+    /// them; `None` when there is nothing to take back.
+    pub fn undo(&mut self, text: &mut String) -> Option<CCursorRange> {
+        self.step(text, true)
+    }
+
+    /// Make again the changes last taken back. Returns the selection after them.
+    pub fn redo(&mut self, text: &mut String) -> Option<CCursorRange> {
+        self.step(text, false)
+    }
+
+    fn step(&mut self, text: &mut String, back: bool) -> Option<CCursorRange> {
+        let (from, to) = match back {
+            true => (&mut self.undos, &mut self.redos),
+            false => (&mut self.redos, &mut self.undos),
+        };
+        let group = from.last()?.group;
+        let mut caret = None;
+        while let Some(step) = from.pop_if(|step| step.group == group) {
+            let (there, wanted) = match back {
+                true => (&step.written, &step.removed),
+                false => (&step.removed, &step.written),
+            };
+            let range = step.at..step.at + there.len();
+            if text.get(range.clone()) != Some(there.as_str()) {
+                // The text is not what the history thinks: better to forget than to spoil it.
+                *self = Self::default();
+                return caret;
+            }
+            text.replace_range(range.clone(), wanted);
+            if let Some(shadow) = &mut self.shadow {
+                shadow.replace_range(range, wanted);
+            }
+            caret = Some(if back { step.before } else { step.after });
+            to.push(step);
+        }
+        // What is typed next is a change of its own.
+        self.group += 1;
+        self.caret = caret;
+        caret
+    }
+}
 
 impl Cache {
+    /// The changes made to the text.
+    pub fn history(&mut self) -> &mut History {
+        &mut self.history
+    }
+
     /// The text may have changed in a way the revision will not tell: read it again.
     pub fn forget(&mut self) {
         self.seen = None;
@@ -843,6 +1031,7 @@ fn word_at(text: &str, index: usize) -> Range<usize> {
 }
 
 /// Write `written` over the selection. Returns the caret after it.
+#[cfg(test)]
 fn replace(text: &mut String, caret: Caret, written: &str) -> Caret {
     let chars = caret.sorted();
     let bytes = byte(text, chars.start)..byte(text, chars.end);
@@ -859,10 +1048,10 @@ fn typed(
     page: usize,
     wrap: Option<usize>,
     index: Option<&mut Index>,
-) -> (Caret, bool) {
+) -> (Caret, Vec<Written>) {
     let mut pen = Pen {
         index,
-        edited: false,
+        steps: Vec::new(),
     };
     let events = ui.input(|input| input.events.clone());
     for event in events {
@@ -975,7 +1164,7 @@ fn typed(
             _ => {}
         }
     }
-    (caret, pen.edited)
+    (caret, pen.steps)
 }
 
 /// Show `text` over the rest of `ui`, which is expected to scroll. `cache` holds what was
@@ -1005,15 +1194,6 @@ pub fn show(
     });
 
     let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-    // A history of whole copies of a big text is given fewer of them to keep.
-    if !cache.capped && text.len() > HISTORY_BYTES / 100 {
-        let settings = egui::util::undoer::Settings {
-            max_undos: (HISTORY_BYTES / text.len()).clamp(4, 100),
-            ..Default::default()
-        };
-        state.set_undoer(egui::util::undoer::Undoer::with_settings(settings));
-        cache.capped = true;
-    }
     // The text as it last showed, when nothing can have changed it since.
     let known = cache
         .seen
@@ -1041,6 +1221,9 @@ pub fn show(
     let mut changed = false;
     // What is known of the text was kept in step with what was typed.
     let mut followed = false;
+    // What the keyboard wrote, and whether it asked to take a change back or make it again.
+    let mut own = Vec::new();
+    let mut wanted = None;
     if focused && let Some(old) = caret {
         // The arrows and Tab are the field's, not a way to another widget.
         let filter = EventFilter {
@@ -1064,28 +1247,23 @@ pub fn show(
             _ => None,
         };
         followed = live.is_some();
-        let (mut new, mut edited) = typed(ui, text, old, page, wrap, live);
-        if undo || redo {
-            let mut undoer = state.undoer();
-            // Lent to the history, not copied for it.
-            let current = (new.range(), std::mem::take(text));
-            let step = if undo {
-                undoer.undo(&current)
-            } else {
-                undoer.redo(&current)
-            };
-            match step.cloned() {
-                Some((range, restored)) => {
-                    *text = restored;
-                    new = Caret::of(range, text.chars().count());
-                    edited = true;
-                }
-                None => *text = current.1,
-            }
-            state.set_undoer(undoer);
-        }
-        changed = edited;
+        let (new, written) = typed(ui, text, old, page, wrap, live);
+        own = written;
+        wanted = undo.then_some(true).or(redo.then_some(false));
+        changed = !own.is_empty();
         caret = Some(new);
+    }
+    // The history is told what changed, here or elsewhere; then it is asked to step.
+    let time = ui.input(|input| input.time);
+    let history = &mut cache.history;
+    history.see(text, caret.map(Caret::range), time, own, known.is_none());
+    let stepped = wanted.and_then(|back| match back {
+        true => history.undo(text),
+        false => history.redo(text),
+    });
+    if let Some(range) = stepped {
+        caret = Some(Caret::of(range, text.chars().count()));
+        changed = true;
     }
 
     // What is known of the text, made again when it changed. Once the field itself changed
@@ -1351,32 +1529,6 @@ pub fn show(
 
     let cursor = caret.map(Caret::range);
     state.cursor.set_char_range(cursor);
-    if focused && let Some(range) = cursor {
-        let time = ui.input(|input| input.time);
-        // The history takes a copy of the text: it is given one while the text or the
-        // caret change, and until it has seen them stay, not at every frame of a text at
-        // rest.
-        let same = |(fed_key, fed_range, ..): &(u64, CCursorRange, f64, bool)| {
-            (*fed_key, *fed_range) == (key, range)
-        };
-        if !cache.fed.as_ref().is_some_and(same) {
-            cache.fed = Some((key, range, time, false));
-            // Come back once the change has settled, for the history to keep it.
-            let settled = std::time::Duration::from_secs_f64(SETTLE_SECONDS + 0.05);
-            ui.ctx().request_repaint_after(settled);
-        }
-        if let Some((.., since, settled)) = &mut cache.fed
-            && !*settled
-        {
-            let mut undoer = state.undoer();
-            // Lent to the history, which copies the text only when it keeps it.
-            let current = (range, std::mem::take(text));
-            undoer.feed_state(time, &current);
-            *text = current.1;
-            state.set_undoer(undoer);
-            *settled = time - *since >= SETTLE_SECONDS;
-        }
-    }
     state.store(ui.ctx(), id);
     Shown {
         response,
@@ -1602,6 +1754,58 @@ mod tests {
         text.clear();
         index.splice(&text, 0, end + 5, 0);
         assert_eq!((index.lines(), index.total()), (1, 0));
+    }
+
+    #[test]
+    fn the_history_keeps_what_changed_and_gives_it_back() {
+        let at = |index: usize| CCursorRange::one(CCursor::new(index));
+        let mut history = History::default();
+        let mut text = "one é two".to_owned();
+        history.see(&text, Some(at(0)), 0.0, Vec::new(), true);
+        // Typed here: told as it was written.
+        text.insert_str(3, "!!");
+        history.see(
+            &text,
+            Some(at(5)),
+            0.1,
+            vec![(3, String::new(), "!!".to_owned())],
+            false,
+        );
+        // Changed elsewhere, after a pause: found by comparing, cut on whole chars.
+        text = text.replace('é', "è");
+        history.see(&text, Some(at(7)), 5.0, Vec::new(), true);
+        text.push_str(" three");
+        history.see(&text, Some(at(18)), 5.2, Vec::new(), true);
+        assert_eq!(text, "one!! è two three");
+        // The two changes made together go together; then the one before.
+        assert_eq!(history.undo(&mut text), Some(at(5)));
+        assert_eq!(text, "one!! é two");
+        assert_eq!(history.undo(&mut text), Some(at(0)));
+        assert_eq!(text, "one é two");
+        assert_eq!(history.undo(&mut text), None);
+        assert_eq!(history.redo(&mut text), Some(at(5)));
+        assert_eq!(history.redo(&mut text), Some(at(18)));
+        assert_eq!(text, "one!! è two three");
+        assert_eq!(history.redo(&mut text), None);
+        // A new change after going back: what was taken back is gone for good.
+        history.undo(&mut text);
+        text.push('?');
+        history.see(&text, Some(at(12)), 9.0, Vec::new(), true);
+        assert_eq!(
+            (history.redo(&mut text), text.as_str()),
+            (None, "one!! é two?")
+        );
+        // A text the history was not told about is left alone.
+        let mut other = "something else".to_owned();
+        assert_eq!(history.undo(&mut other), None);
+        assert_eq!(other, "something else");
+
+        assert_eq!(common_prefix(b"abcd", b"abXd"), 2);
+        assert_eq!(common_suffix(b"abcd", b"Xd"), 1);
+        let (long, mut longer) = ("ab".repeat(5000), "ab".repeat(5000));
+        longer.insert(7001, '-');
+        assert_eq!(common_prefix(long.as_bytes(), longer.as_bytes()), 7001);
+        assert_eq!(common_suffix(long.as_bytes(), longer.as_bytes()), 2999);
     }
 
     #[test]

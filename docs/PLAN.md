@@ -23,8 +23,8 @@ crates/
 ```
 
 L'éditeur repose sur un champ de texte maison (`crates/app/src/field.rs`) qui ne met en page
-que les rangées visibles. Limite connue : le texte reste une seule `String`, copiée en entier
-dans l'historique d'annulation ; au-delà de 2 Mo un fichier s'ouvre en texte brut (voir phase 3).
+que les rangées visibles. Limite connue : le texte reste une seule `String` ;
+au-delà de 2 Mo un fichier s'ouvre en texte brut (voir phase 3).
 
 ## État
 
@@ -118,8 +118,9 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Touches Vim (`Switch Keys`) : modes normal, insertion, visuel et visuel ligne ; déplacements `h j k l w b e 0 ^ $ gg G f F t T ; ,` avec compte ; `d c y` avec déplacement, doublés ou sur un objet de texte (`iw aw`, `i( a(`, `i{`, `i[`, `i<`, `i"`, `i'`) ; `x D C p P r J o O i a I A u Ctrl+R /` ; `.` refait le dernier changement, texte tapé compris ; mode affiché dans la barre d'état, curseur bloc. Moteur pur et testé : `crates/core/src/modal.rs` | ✅ |
 | Touches Emacs : `Ctrl+F B N P A E`, `Alt+F B`, `Ctrl+D K Y W`, `Alt+W D`, marque `Ctrl+Espace`, `Ctrl+G`, `Ctrl+/`, `Ctrl+S` cherche, `Ctrl+X Ctrl+S` enregistre, `Ctrl+X Ctrl+F` ouvre | ✅ |
 | Vim : registres nommés, marques, macros, `:`, `%`, `*`, compte devant `.` | ⏳ |
-| Fichiers jusqu'à 64 Mo (2 Mo avant). Au repos, rien n'est relu (70 µs par image à 50 Mo) ; le texte n'est relu qu'après un changement. Au-delà de 2 Mo : texte brut, sans couleurs, serveur de langage, plan, complétion par mots ni historique local. Mesuré : une frappe coûte 16 ms à 10 Mo, 80 ms à 50 Mo (`cargo test --release -p godcode typing_in_a_big -- --ignored --nocapture`) | ✅ |
-| Gros fichiers : frappe en temps constant (corde ou tampon à trou au lieu d'une `String`), couleurs refaites pour les seules lignes changées, annulation par différences au lieu de copies entières (aujourd'hui : copies plafonnées à 256 Mo) | ⏳ |
+| Fichiers jusqu'à 64 Mo (2 Mo avant). Au-delà de 2 Mo : texte brut, sans couleurs, serveur de langage, plan, complétion par mots ni historique local. Au repos rien n'est relu ; pendant la frappe, seules les lignes touchées le sont. Mesuré à 50 Mo : une frappe en fin de fichier coûte 50 µs, 21 ms tout au début (le texte est une `String` : ce qui suit le curseur est déplacé) ; 82 ms avant (`cargo test --release -p godcode typing_in_a_big -- --ignored --nocapture`) | ✅ |
+| Historique d'annulation par différences : seul ce qui change est gardé (64 Mo au plus), donc autant de niveaux dans un gros fichier que dans un petit ; une frappe groupée par pauses d'une seconde ; un changement fait ailleurs (commande, Vim, serveur de langage) est trouvé par comparaison | ✅ |
+| Gros fichiers : frappe en temps constant partout (corde ou tampon à trou au lieu d'une `String`) ; Entrée, Tab et les touches Vim relisent encore tout le texte ; couleurs refaites pour les seules lignes changées | ⏳ |
 
 ### Phase 4 — exécution, tests, débogage (⏳)
 

@@ -276,21 +276,25 @@ pub fn run(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>, op: Op
     *text != before
 }
 
-/// Step the editor's own history; `None` when there is nothing to undo / redo.
-pub fn history(ctx: &Context, id: Id, text: &mut String, undo: bool) -> Option<Range<usize>> {
+/// Step the history of the editor `id`, whose view is `view`; `None` when there is nothing
+/// to undo / redo.
+pub fn history(
+    ctx: &Context,
+    id: Id,
+    text: &mut String,
+    view: &mut View,
+    undo: bool,
+) -> Option<Range<usize>> {
     let mut state = TextEdit::load_state(ctx, id)?;
-    let range = state.cursor.char_range()?;
-    let mut undoer = state.undoer();
-    let current = (range, text.clone());
-    let step = if undo {
-        undoer.undo(&current)
+    let time = ctx.input(|input| input.time);
+    let history = view.index.history();
+    // What changed since the editor last showed is a change like the others.
+    history.see(text, state.cursor.char_range(), time, Vec::new(), true);
+    let range = if undo {
+        history.undo(text)
     } else {
-        undoer.redo(&current)
-    }
-    .cloned();
-    state.set_undoer(undoer);
-    let (range, restored) = step?;
-    *text = restored;
+        history.redo(text)
+    }?;
     state.cursor.set_char_range(Some(range));
     state.store(ctx, id);
     Some(sorted(range))
@@ -2021,10 +2025,22 @@ mod tests {
         harness.type_text(" second");
         harness.time += 5.0;
         harness.frame(Vec::new());
-        let selection = history(&harness.ctx, editor_id(), &mut harness.text, true);
+        let selection = history(
+            &harness.ctx,
+            editor_id(),
+            &mut harness.text,
+            &mut harness.view,
+            true,
+        );
         assert_eq!(harness.text, "first");
         assert_eq!(selection, Some(5..5));
-        history(&harness.ctx, editor_id(), &mut harness.text, false);
+        history(
+            &harness.ctx,
+            editor_id(),
+            &mut harness.text,
+            &mut harness.view,
+            false,
+        );
         assert_eq!(harness.text, "first second");
     }
 }

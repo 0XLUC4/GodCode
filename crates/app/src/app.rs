@@ -1185,6 +1185,10 @@ fn folds_of(text: &str) -> std::collections::HashMap<PathBuf, Vec<usize>> {
     files.collect()
 }
 
+/// Where a selection starts and ends, as (line, column) from 1, and what that was found
+/// for: a tab, its revision, its selection.
+type CaretPlace = ((u64, u64, Range<usize>), (usize, usize), (usize, usize));
+
 /// Whose keys the editor obeys.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keys {
@@ -1356,7 +1360,7 @@ pub struct GodApp {
     signature: Option<Call>,
     /// Line and column (from 1) of the start and of the end of the selection, and what
     /// they were found for: a tab, its revision, its selection.
-    caret_place: ((u64, u64, Range<usize>), (usize, usize), (usize, usize)),
+    caret_place: CaretPlace,
     /// The foot of the caret on screen.
     caret_pos: Option<egui::Pos2>,
     /// The editor in front had the keyboard the last time it showed.
@@ -4225,7 +4229,9 @@ impl GodApp {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let undo = cmd == Cmd::Undo;
                     let id = tab.editor_id();
-                    if let Some(selection) = editor::history(ctx, id, &mut tab.text, undo) {
+                    if let Some(selection) =
+                        editor::history(ctx, id, &mut tab.text, &mut tab.view, undo)
+                    {
                         tab.selection = selection;
                         tab.touched();
                     }
@@ -5959,8 +5965,13 @@ impl GodApp {
         // A completion just picked is not typing: asking again would have the server
         // forget the list it is about to be asked about.
         let typed = typed && tab.view.accepted.is_none();
-        // The char before the caret: looked for only when something was typed.
-        let before = typed
+        // The char before the caret is for the language server: looked for only when
+        // something was typed in a file one of them knows.
+        let served = tab
+            .path
+            .as_deref()
+            .is_some_and(|path| self.servers.serves(path));
+        let before = (typed && served)
             .then(|| {
                 tab.text[..godcode_core::byte_index(&tab.text, caret)]
                     .chars()
