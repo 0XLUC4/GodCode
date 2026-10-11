@@ -183,6 +183,41 @@ enum Span {
     Lines,
 }
 
+/// The places Vim remembers in a text. They are kept right through what Vim itself does to
+/// the text.
+#[derive(Default)]
+struct Places {
+    /// The places that have a name: `a` to `z` set with `m`, `'` where the caret was
+    /// before the last jump, `<` and `>` the two ends of the last selection.
+    marks: HashMap<char, usize>,
+    /// Where the jumps started, the oldest first: what `Ctrl-O` goes back through.
+    jumps: Vec<usize>,
+    /// Which of the jumps `Ctrl-O` or `Ctrl-I` last went to; how many there are when it
+    /// went to none since the last jump.
+    jump: usize,
+    /// The starts of the lines `:g` has marked and not yet run its command on.
+    lines: Vec<usize>,
+}
+
+impl Places {
+    fn all(&mut self) -> impl Iterator<Item = &mut usize> {
+        let named = self.marks.values_mut();
+        named.chain(&mut self.jumps).chain(&mut self.lines)
+    }
+
+    /// The chars from `low` to `middle` and those from `middle` to `high` changed places:
+    /// the places in them went with them.
+    fn swapped(&mut self, low: usize, middle: usize, high: usize) {
+        for place in self.all() {
+            if (low..middle).contains(place) {
+                *place += high - middle;
+            } else if (middle..high).contains(place) {
+                *place -= middle - low;
+            }
+        }
+    }
+}
+
 /// Vim: its mode and what it remembers between keys.
 #[derive(Default)]
 pub struct Vim {
@@ -235,9 +270,10 @@ pub struct Vim {
     replaying: bool,
     /// The command being typed after a `:`.
     line: Option<String>,
-    /// The places that have a name: `a` to `z` set with `m`, `'` where the caret was
-    /// before the last jump, `<` and `>` the two ends of the last selection.
-    marks: HashMap<char, usize>,
+    /// The marks and the list of the jumps.
+    places: Places,
+    /// `:g` is running its command: another `:g` in that command is not done.
+    global: bool,
     /// The pattern and the replacement of the last `:s`, for `&` and a bare `:s`.
     last_substitute: Option<(String, String)>,
     /// What one level of indent is, for `>>` and `<<`: four spaces unless told.
@@ -288,7 +324,7 @@ impl Vim {
                 let low = from.min(at);
                 let added = at - low;
                 let removed = (added + length).saturating_sub(chars.len());
-                edited(&mut self.marks, low, removed, added);
+                edited(&mut self.places, low, removed, added);
             }
             // What was typed since insert mode was entered: for the macro being recorded,
             // and for `.` to type again.
@@ -390,15 +426,19 @@ impl Vim {
             (_, Stroke::Escape) => self.mode = Mode::Normal,
             (_, Stroke::Char(name)) if waiting == Some('m') => {
                 if name.is_ascii_lowercase() {
-                    self.marks.insert(name, at);
+                    self.places.marks.insert(name, at);
                 } else if "'`".contains(name) {
-                    self.marks.insert('\'', at);
+                    self.places.marks.insert('\'', at);
                 }
             }
             // To a mark: the first letter of its line, or with a backtick its very place.
             (_, Stroke::Char(name)) if matches!(waiting, Some('\'' | '`')) => {
                 let name = if name == '`' { '\'' } else { name };
-                let mark = self.marks.get(&name).map(|mark| (*mark).min(chars.len()));
+                let mark = self
+                    .places
+                    .marks
+                    .get(&name)
+                    .map(|mark| (*mark).min(chars.len()));
                 target = mark.map(|mark| match waiting {
                     Some('`') => (mark, Span::Upto),
                     _ => (first_text(&chars, mark), Span::Lines),
@@ -444,7 +484,7 @@ impl Vim {
             (Some(op @ ('>' | '<')), Stroke::Char(again)) if op == again => {
                 let last = (1..times).fold(at, |at, _| vertical(&chars, at, true));
                 let unit = self.indent().to_owned();
-                at = shift(&mut chars, &mut self.marks, at, last, op == '>', &unit);
+                at = shift(&mut chars, &mut self.places, at, last, op == '>', &unit);
                 done.changed = true;
             }
             // An operator typed twice is done on whole lines.
@@ -478,6 +518,12 @@ impl Vim {
                     target = find(&chars, at, kind, wanted, times);
                 }
             }
+            // Back and forth in the list of the jumps. A Tab is what a macro keeps `Ctrl-I`
+            // as.
+            (None, Stroke::Ctrl('o' | 'i') | Stroke::Char('\t')) => {
+                let back = key == Stroke::Ctrl('o');
+                at = self.travel(&chars, at, back, times).unwrap_or(at);
+            }
             _ => {
                 target = motion(&chars, at, key, counted);
                 jump = matches!(key, Stroke::Char('G' | '%' | '*' | '#'));
@@ -485,7 +531,7 @@ impl Vim {
         }
         if let Some((mut to, mut span)) = target {
             if jump {
-                self.marks.insert('\'', at);
+                self.leave(&chars, at);
             }
             match operator {
                 Some(op) if !visual => {
@@ -529,7 +575,7 @@ impl Vim {
                 }
                 self.head = at;
                 let (low, high) = (self.anchor.min(at), self.anchor.max(at));
-                self.marks.extend([('<', low), ('>', high)]);
+                self.places.marks.extend([('<', low), ('>', high)]);
                 if self.mode == Mode::Visual {
                     low..(high + 1).min(chars.len())
                 } else {
@@ -576,10 +622,44 @@ impl Vim {
         self.line.as_deref()
     }
 
-    /// Forget every mark. They are places in one text, kept right through what Vim itself
-    /// does to it: for the application to call when the text becomes another one.
+    /// Forget every mark and the list of the jumps. They are places in one text, kept right
+    /// through what Vim itself does to it: for the application to call when the text
+    /// becomes another one.
     pub fn forget_marks(&mut self) {
-        self.marks.clear();
+        self.places = Places::default();
+    }
+
+    /// A jump starts at `at`: the place is kept for `''` and for `Ctrl-O` to come back to.
+    fn leave(&mut self, chars: &[char], at: usize) {
+        self.places.marks.insert('\'', at);
+        let line = line_number(chars, at);
+        let jumps = &mut self.places.jumps;
+        // One place a line: this one takes the place of an older one on its line.
+        jumps.retain(|place| line_number(chars, (*place).min(chars.len())) != line);
+        jumps.push(at);
+        if jumps.len() > JUMPS {
+            jumps.remove(0);
+        }
+        self.places.jump = jumps.len();
+    }
+
+    /// `Ctrl-O` (`back`) and `Ctrl-I`: the place `times` earlier or later in the list of the
+    /// jumps than the one last gone to, when the list goes that far.
+    fn travel(&mut self, chars: &[char], at: usize, back: bool, times: usize) -> Option<usize> {
+        if back && self.places.jump >= self.places.jumps.len() {
+            // The first step back: where the caret is becomes the newest place of the
+            // list, for `Ctrl-I` to come back to.
+            self.leave(chars, at);
+            self.places.jump = self.places.jumps.len().saturating_sub(1);
+        }
+        let places = &mut self.places;
+        let to = match back {
+            true => places.jump.checked_sub(times)?,
+            false => places.jump.checked_add(times)?,
+        };
+        let place = *places.jumps.get(to)?;
+        places.jump = to;
+        Some(place.min(chars.len()))
     }
 
     fn indent(&self) -> &str {
@@ -589,31 +669,71 @@ impl Vim {
         }
     }
 
-    /// The line an address names, counted from 1, and what is written after it: a number,
-    /// `.` for the line of the caret `at`, `$` for the last one, `'a` for the line of a mark.
+    /// The line an address names, counted from 1, and what is written after it. An address
+    /// is a number, `.` for the line of the caret `at`, `$` for the last line, `'a` for the
+    /// line of a mark, `/pattern/` for the next line where a pattern is found or `?pattern?`
+    /// for the one before; then `+` or `-` and a number, as many times as wanted, for so
+    /// many lines after or before it. `+` and `-` alone count from the line of the caret.
     fn address<'a>(&self, chars: &[char], at: usize, written: &'a str) -> Option<(usize, &'a str)> {
+        let here = line_number(chars, at);
+        let digits = |written: &str| {
+            let rest = written.trim_start_matches(|sign: char| sign.is_ascii_digit());
+            written.len() - rest.len()
+        };
         let mut signs = written.chars();
-        let line = match signs.next()? {
-            '.' => line_number(chars, at),
-            '$' => line_number(chars, chars.len()),
+        let (mut line, mut rest) = match signs.next()? {
+            '.' => (here, signs.as_str()),
+            '$' => (line_number(chars, chars.len()), signs.as_str()),
             '\'' => {
-                let mark = *self.marks.get(&signs.next()?)?;
-                line_number(chars, mark.min(chars.len()))
+                let mark = *self.places.marks.get(&signs.next()?)?;
+                (line_number(chars, mark.min(chars.len())), signs.as_str())
             }
             '0'..='9' => {
-                let rest = written.trim_start_matches(|sign: char| sign.is_ascii_digit());
-                let digits = written.len() - rest.len();
-                return Some((written[..digits].parse().ok()?, rest));
+                let (number, rest) = written.split_at(digits(written));
+                (number.parse().ok()?, rest)
+            }
+            '+' | '-' => (here, written),
+            between @ ('/' | '?') => {
+                let (pattern, rest) = quoted(signs.as_str(), between);
+                let wanted = self.wanted(&pattern)?;
+                let line = found_line(chars, here, &wanted, between == '/')?;
+                (line, rest.unwrap_or(""))
             }
             _ => return None,
         };
-        Some((line, signs.as_str()))
+        while let Some(after) = rest.strip_prefix(['+', '-']) {
+            let (number, after) = after.split_at(digits(after));
+            let by = match number {
+                "" => 1,
+                number => number.parse().ok()?,
+            };
+            line = match rest.starts_with('+') {
+                true => line.saturating_add(by),
+                false => line.saturating_sub(by),
+            };
+            rest = after;
+        }
+        Some((line, rest))
+    }
+
+    /// The regular expression `pattern` is; the pattern of the last substitution when it
+    /// is empty. `None` when it cannot be read.
+    fn wanted(&self, pattern: &str) -> Option<regex::Regex> {
+        let pattern = match (pattern, &self.last_substitute) {
+            ("", last) => last.as_ref()?.0.as_str(),
+            (pattern, _) => pattern,
+        };
+        regex::Regex::new(pattern).ok()
     }
 
     /// Carry out `command`, written after a `:`, when it is not one for the application:
-    /// lines alone to go to the last of them, or lines and `d` to take them out, or `s` to
-    /// substitute in them. The lines are one address or two with a comma, or `%` for all;
-    /// without any, the line of the caret `at`. Returns where the caret goes.
+    /// lines alone to go to the last of them, or lines and what to do with them. `d` takes
+    /// them out, `y` copies them, `s` substitutes in them, `m` moves them and `t` copies
+    /// them below another line, `>` and `<` push them in and out, `normal` types keys on
+    /// each of them, `g` and `v` run a command on those of them where a pattern is found
+    /// or is not. The lines are one address or two with a comma, or `%` for all; without
+    /// any, the line of the caret `at`, and for `g` and `v` all of them. Returns where the
+    /// caret goes.
     fn ex(&mut self, chars: &mut Vec<char>, at: usize, command: &str, done: &mut Done) -> usize {
         let last = line_number(chars, chars.len());
         let whole = command.strip_prefix('%');
@@ -633,24 +753,192 @@ impl Vim {
             let Some((_, to)) = range else {
                 return at;
             };
-            self.marks.insert('\'', at);
+            self.leave(chars, at);
             return line_numbered(chars, to);
         }
+        // The name of the command is its letters; what is written after them is for it.
+        let letters = rest.find(|sign: char| !sign.is_ascii_alphabetic());
+        let (name, written) = rest.split_at(letters.unwrap_or(rest.len()));
+        let global = matches!(name, "g" | "global" | "v" | "vglobal");
         let here = line_number(chars, at);
-        let (first, to) = range.unwrap_or((here, here));
+        let (first, to) = range.unwrap_or(if global { (1, last) } else { (here, here) });
         // Lines the text does not have: nothing is done, as in Vim.
         if first == 0 || to > last {
             return at;
         }
-        if let Some(written) = rest.strip_prefix('s') {
-            return self.substitute(chars, at, (first, to), written, done);
+        let (low, high) = (line_numbered(chars, first), line_numbered(chars, to));
+        match name {
+            "s" => self.substitute(chars, at, (first, to), written, done),
+            "d" | "delete" | "y" | "yank" if written.trim_end().is_empty() => {
+                let op = if name.starts_with('d') { 'd' } else { 'y' };
+                let range = lines(chars, low, high, false);
+                self.operate(chars, (op, at), range, true, done)
+            }
+            "g" | "global" | "v" | "vglobal" if !self.global => {
+                let (written, matching) = match written.strip_prefix('!') {
+                    Some(written) => (written, false),
+                    None => (written, name.starts_with('g')),
+                };
+                self.global = true;
+                let at = self.globally(chars, at, (first, to), written, matching, done);
+                self.global = false;
+                at
+            }
+            "m" | "move" => {
+                let Some(below) = self.below(chars, at, written) else {
+                    return at;
+                };
+                // Lines do not go into themselves.
+                if (first..to).contains(&below) {
+                    return at;
+                }
+                // With a line end after the last line too, lines change places as they
+                // are: those to move and those they go past.
+                chars.push('\n');
+                let start = |number: usize| line_numbered(chars, number);
+                let (low, middle, high) = match below >= to {
+                    true => (start(first), start(to + 1), start(below + 1)),
+                    false => (start(below + 1), start(first), start(to + 1)),
+                };
+                chars[low..high].rotate_left(middle - low);
+                chars.pop();
+                self.places.swapped(low, middle, high);
+                done.changed |= low < middle && middle < high;
+                let moved = if below >= to {
+                    below
+                } else {
+                    below + to + 1 - first
+                };
+                first_text(chars, line_numbered(chars, moved))
+            }
+            "t" | "co" | "copy" => {
+                let Some(below) = self.below(chars, at, written) else {
+                    return at;
+                };
+                let copy: String = chars[low..line_end(chars, high)].iter().collect();
+                match below {
+                    0 => put(chars, &mut self.places, 0, &format!("{copy}\n")),
+                    below => {
+                        let end = line_end(chars, line_numbered(chars, below));
+                        put(chars, &mut self.places, end, &format!("\n{copy}"));
+                    }
+                }
+                done.changed = true;
+                first_text(chars, line_numbered(chars, below + to + 1 - first))
+            }
+            // One level for each sign.
+            "" if written.starts_with(['>', '<']) => {
+                let (signs, deeper) = (written.trim_end(), written.starts_with('>'));
+                if signs.contains(|sign| (sign == '>') != deeper || !"<>".contains(sign)) {
+                    return at;
+                }
+                let unit = self.indent().to_owned();
+                for _ in signs.chars() {
+                    let high = line_numbered(chars, to);
+                    shift(chars, &mut self.places, low, high, deeper, &unit);
+                }
+                done.changed = true;
+                first_text(chars, line_numbered(chars, to))
+            }
+            "normal" | "norm" => {
+                let keys = written.strip_prefix('!').unwrap_or(written).trim_start();
+                self.normal(chars, at, (first, to), keys, done)
+            }
+            _ => at,
         }
-        if matches!(rest.trim_end(), "d" | "delete") {
-            let (low, high) = (line_numbered(chars, first), line_numbered(chars, to));
-            let range = lines(chars, low, high, false);
-            return self.operate(chars, ('d', at), range, true, done);
+    }
+
+    /// The line `:m` and `:t` put lines below, as the address `written` after them names
+    /// it: 0 is above the first line. `None` when it is not a line of the text.
+    fn below(&self, chars: &[char], at: usize, written: &str) -> Option<usize> {
+        let (below, rest) = self.address(chars, at, written.trim())?;
+        (rest.is_empty() && below <= line_number(chars, chars.len())).then_some(below)
+    }
+
+    /// `:g` and `:v`: run a command on each of the lines `first` to `to` where a pattern is
+    /// found (`matching`) or is not. `written` is the pattern and the command, with a sign
+    /// of any kind before and after the pattern. The lines are marked first; the command
+    /// is then run on each of them that is still there, the caret being on it. Returns
+    /// where the caret goes: where the last command left it.
+    fn globally(
+        &mut self,
+        chars: &mut Vec<char>,
+        at: usize,
+        (first, to): (usize, usize),
+        written: &str,
+        matching: bool,
+        done: &mut Done,
+    ) -> usize {
+        let mut signs = written.chars();
+        let Some(between) = signs.next().filter(|sign| !unfit_between(*sign)) else {
+            return at;
+        };
+        let (pattern, command) = quoted(signs.as_str(), between);
+        let command = command.unwrap_or_default();
+        let Some(wanted) = self.wanted(&pattern).filter(|_| !command.trim().is_empty()) else {
+            return at;
+        };
+        let text: String = chars.iter().collect();
+        let mut start = 0;
+        self.places.lines.clear();
+        for (index, line) in text.split('\n').enumerate() {
+            if (first..=to).contains(&(index + 1)) && wanted.is_match(line) == matching {
+                self.places.lines.push(start);
+            }
+            start += line.chars().count() + 1;
+        }
+        let mut at = at;
+        while !self.places.lines.is_empty() {
+            let line = self.places.lines.remove(0).min(chars.len());
+            at = self.ex(chars, line_start(chars, line), command, done);
         }
         at
+    }
+
+    /// `:normal`: type `keys` as in normal mode on each of the lines `first` to `to`, the
+    /// caret being at the start of the line. The lines are taken by their numbers as the
+    /// text is then, as in Vim. What the keys leave unfinished ends as with Escape.
+    /// Returns where the caret goes.
+    fn normal(
+        &mut self,
+        chars: &mut Vec<char>,
+        at: usize,
+        (first, to): (usize, usize),
+        keys: &str,
+        done: &mut Done,
+    ) -> usize {
+        if self.running == MACRO_DEPTH {
+            return at;
+        }
+        let outermost = self.running == 0;
+        let mut text: String = chars.iter().collect();
+        let mut typed = Done {
+            selection: at..at,
+            ..Done::default()
+        };
+        self.running += 1;
+        for number in first..=to {
+            let now: Vec<char> = text.chars().collect();
+            if number > line_number(&now, now.len()) {
+                break;
+            }
+            let start = line_numbered(&now, number);
+            typed.selection = start..start;
+            if outermost {
+                self.keys_left = MACRO_KEYS;
+            }
+            let ended = self.type_out(&mut text, &mut typed, keys);
+            self.retype(&mut text, &mut typed, Stroke::Escape);
+            if !ended {
+                break;
+            }
+        }
+        self.running -= 1;
+        *chars = text.chars().collect();
+        done.changed |= typed.changed;
+        done.copied = typed.copied.or(done.copied.take());
+        done.ask = typed.ask.or(done.ask);
+        typed.selection.start
     }
 
     /// `:s`: in the lines `first` to `to`, counted from 1, write a replacement where a
@@ -674,8 +962,7 @@ impl Vim {
                 None => return at,
             },
             Some(between) => {
-                if between.is_alphanumeric() || between.is_whitespace() || "\\\"|".contains(between)
-                {
+                if unfit_between(between) {
                     return at;
                 }
                 let mut parts = split(signs.as_str(), between).into_iter();
@@ -708,7 +995,7 @@ impl Vim {
             let line: String = chars[start..end].iter().collect();
             if let Some(line) = substituted(&line, &wanted, &replacement, flags.contains('g')) {
                 let (removed, added) = (end - start, line.chars().count());
-                edited(&mut self.marks, start, removed, added);
+                edited(&mut self.places, start, removed, added);
                 chars.splice(start..end, line.chars());
                 // The last line that changed, which a change above it moves.
                 reached = Some(reached.map_or(start, |below: usize| below + added - removed));
@@ -854,23 +1141,33 @@ impl Vim {
             return done;
         }
         self.running += 1;
-        'played: for _ in 0..times {
-            for ch in keys.chars() {
-                if self.keys_left == 0 || done.ask.is_some() {
-                    break 'played;
-                }
-                self.keys_left -= 1;
-                if !self.retype(text, &mut done, char_key(ch)) {
-                    // Insert mode: the char is typed.
-                    let at = done.selection.start;
-                    text.insert(crate::byte_index(text, at), ch);
-                    done.selection = at + 1..at + 1;
-                    done.changed = true;
-                }
+        for _ in 0..times {
+            if !self.type_out(text, &mut done, &keys) {
+                break;
             }
         }
         self.running -= 1;
         done
+    }
+
+    /// Type the keys the chars of `keys` stand for, where `done` left the caret. False when
+    /// they were not all typed: one of them asked something of the application, or no more
+    /// keys may be typed.
+    fn type_out(&mut self, text: &mut String, done: &mut Done, keys: &str) -> bool {
+        for ch in keys.chars() {
+            if self.keys_left == 0 || done.ask.is_some() {
+                return false;
+            }
+            self.keys_left -= 1;
+            if !self.retype(text, done, char_key(ch)) {
+                // Insert mode: the char is typed.
+                let at = done.selection.start;
+                text.insert(crate::byte_index(text, at), ch);
+                done.selection = at + 1..at + 1;
+                done.changed = true;
+            }
+        }
+        true
     }
 
     /// Do the operator `op` on `range`, the caret being at `at`. Returns where it goes.
@@ -919,8 +1216,16 @@ impl Vim {
             // Copying lines leaves the caret where it is.
             return if whole_lines { at } else { range.start };
         }
+        if whole_lines && op == 'd' {
+            // The lines are gone for `:g` too: those that start in the range, or one char
+            // after it when it is the last lines with the line end before them.
+            let ends = range.end.checked_sub(1).and_then(|end| chars.get(end));
+            let after = chars.get(range.start) == Some(&'\n') && ends != Some(&'\n');
+            let gone = range.start + usize::from(after)..range.end + usize::from(after);
+            self.places.lines.retain(|line| !gone.contains(line));
+        }
         chars.drain(range.clone());
-        edited(&mut self.marks, range.start, range.len(), 0);
+        edited(&mut self.places, range.start, range.len(), 0);
         done.changed = true;
         if op == 'c' {
             self.mode = Mode::Insert;
@@ -965,7 +1270,7 @@ impl Vim {
                     let unit = self.indent().to_owned();
                     self.mode = Mode::Normal;
                     done.changed = true;
-                    return shift(chars, &mut self.marks, low, high, named == '>', &unit);
+                    return shift(chars, &mut self.places, low, high, named == '>', &unit);
                 }
                 // The command is for the lines of the selection, unless told otherwise.
                 ':' => {
@@ -1037,10 +1342,10 @@ impl Vim {
                 let indent: String = chars[start..first_text(chars, at)].iter().collect();
                 self.mode = Mode::Insert;
                 if named == 'o' {
-                    put(chars, &mut self.marks, end, &format!("\n{indent}"));
+                    put(chars, &mut self.places, end, &format!("\n{indent}"));
                     return end + 1 + indent.chars().count();
                 }
-                put(chars, &mut self.marks, start, &format!("{indent}\n"));
+                put(chars, &mut self.places, start, &format!("{indent}\n"));
                 return start + indent.chars().count();
             }
             'p' | 'P' => {
@@ -1059,16 +1364,16 @@ impl Vim {
                 return match (whole_lines, after) {
                     (true, true) => {
                         let lines = format!("\n{}", written.trim_end_matches('\n'));
-                        put(chars, &mut self.marks, end, &lines);
+                        put(chars, &mut self.places, end, &lines);
                         end + 1
                     }
                     (true, false) => {
-                        put(chars, &mut self.marks, start, &written);
+                        put(chars, &mut self.places, start, &written);
                         start
                     }
                     (false, _) => {
                         let to = if after { (at + 1).min(end) } else { at };
-                        put(chars, &mut self.marks, to, &written);
+                        put(chars, &mut self.places, to, &written);
                         to + length - 1
                     }
                 };
@@ -1076,8 +1381,12 @@ impl Vim {
             'J' if end < chars.len() => {
                 // The next line comes up, its indent becoming one space.
                 let next = first_text(chars, end + 1);
+                // The line that comes up is no longer one for `:g`.
+                self.places.lines.retain(|line| *line != end + 1);
                 chars.splice(end..next, [' ']);
-                edited(&mut self.marks, end, next - end, 1);
+                edited(&mut self.places, end, next - end, 1);
+                // Changed, though as long as it was when the next line had no indent.
+                done.changed = true;
                 return end;
             }
             'u' => done.ask = Some(Ask::Undo),
@@ -1095,16 +1404,39 @@ impl Vim {
 const MACRO_DEPTH: usize = 32;
 const MACRO_KEYS: usize = 100_000;
 
+/// How many places the list of the jumps holds: the oldest go first.
+const JUMPS: usize = 100;
+
+/// The number of the nearest line after line `here` (`forward`) or before it where `wanted`
+/// is found; the search goes round the ends of the text, and ends on the line itself.
+fn found_line(chars: &[char], here: usize, wanted: &regex::Regex, forward: bool) -> Option<usize> {
+    let text: String = chars.iter().collect();
+    let lines: Vec<&str> = text.split('\n').collect();
+    let found = |number: &usize| wanted.is_match(lines[*number - 1]);
+    let last = lines.len();
+    match forward {
+        true => (here + 1..=last).chain(1..=here).find(found),
+        false => (1..here).rev().chain((here..=last).rev()).find(found),
+    }
+}
+
+/// A sign that cannot go between the parts of `:s` or around the pattern of `:g`.
+fn unfit_between(sign: char) -> bool {
+    sign.is_alphanumeric() || sign.is_whitespace() || "\\\"|".contains(sign)
+}
+
 /// The number of the line of `at`, counted from 1.
 fn line_number(chars: &[char], at: usize) -> usize {
     chars[..at].iter().filter(|ch| **ch == '\n').count() + 1
 }
 
-/// Move the marks after a change of the text: `removed` chars went from `at` on, and
+/// Move the places after a change of the text: `removed` chars went from `at` on, and
 /// `added` came in their place. A mark that was in what went stays as far into what came
-/// as it can.
-fn edited(marks: &mut HashMap<char, usize>, at: usize, removed: usize, added: usize) {
-    for mark in marks.values_mut() {
+/// as it can; a line `:g` marked is gone when its start is in what went.
+fn edited(places: &mut Places, at: usize, removed: usize, added: usize) {
+    let gone = at + 1..at + removed;
+    places.lines.retain(|line| !gone.contains(line));
+    for mark in places.all() {
         if *mark >= at + removed {
             *mark = *mark + added - removed;
         } else if *mark > at {
@@ -1114,10 +1446,10 @@ fn edited(marks: &mut HashMap<char, usize>, at: usize, removed: usize, added: us
 }
 
 /// Write `written` at `at`, the marks after it moving with their text.
-fn put(chars: &mut Vec<char>, marks: &mut HashMap<char, usize>, at: usize, written: &str) {
+fn put(chars: &mut Vec<char>, places: &mut Places, at: usize, written: &str) {
     let before = chars.len();
     chars.splice(at..at, written.chars());
-    edited(marks, at, 0, chars.len() - before);
+    edited(places, at, 0, chars.len() - before);
 }
 
 /// The keys of a command with `count` as its number, in place of any typed with it.
@@ -1159,6 +1491,18 @@ fn counted(keys: &[Stroke], count: usize) -> Vec<Stroke> {
 /// text.
 fn split(written: &str, between: char) -> Vec<String> {
     let mut parts = Vec::new();
+    let mut rest = Some(written);
+    while let Some(written) = rest {
+        let (part, after) = quoted(written, between);
+        parts.push(part);
+        rest = after;
+    }
+    parts
+}
+
+/// What is written up to the sign `between`, which a `\` before it makes part of the text,
+/// and what is written after that sign when it is there.
+fn quoted(written: &str, between: char) -> (String, Option<&str>) {
     let mut part = String::new();
     let mut signs = written.chars();
     while let Some(sign) = signs.next() {
@@ -1171,12 +1515,11 @@ fn split(written: &str, between: char) -> Vec<String> {
                 part.push(next);
                 signs.next();
             }
-            _ if sign == between => parts.push(std::mem::take(&mut part)),
+            _ if sign == between => return (part, Some(signs.as_str())),
             _ => part.push(sign),
         }
     }
-    parts.push(part);
-    parts
+    (part, None)
 }
 
 /// `line` with `replacement` where `wanted` is found: the first time, or every time
@@ -1374,7 +1717,7 @@ fn object(chars: &[char], at: usize, named: char, around: bool) -> Option<Range<
 /// out. Returns the first letter of the first of them, where the caret goes.
 fn shift(
     chars: &mut Vec<char>,
-    marks: &mut HashMap<char, usize>,
+    places: &mut Places,
     first: usize,
     last: usize,
     deeper: bool,
@@ -1386,7 +1729,7 @@ fn shift(
     loop {
         let end = line_end(chars, start);
         if deeper && end > start {
-            put(chars, marks, start, unit);
+            put(chars, places, start, unit);
         } else if !deeper {
             let blank = chars[start..end].iter().take_while(|ch| **ch == ' ');
             let spaces = blank.count().min(unit.chars().count());
@@ -1395,7 +1738,7 @@ fn shift(
                 _ => spaces,
             };
             chars.drain(start..start + taken);
-            edited(marks, start, taken, 0);
+            edited(places, start, taken, 0);
         }
         if start <= top {
             break;
@@ -2535,6 +2878,734 @@ mod tests {
         assert_eq!(vim("a\nb\nc", 0, "dd\"add\"1p").0, "c\na");
         assert_eq!(vim("a\nb\nc", 0, "dd\"_dd\"1p").0, "c\na");
         assert_eq!(vim("a\nb\nc", 0, "dd\"_dd\"2p").0, "c");
+    }
+
+    const BACK: Stroke = Stroke::Ctrl('o');
+    const FORTH: Stroke = Stroke::Ctrl('i');
+
+    /// Press `keys` in `vim`, from the char `at`. Returns where the caret is then.
+    fn press_in(vim: &mut Vim, text: &mut String, at: usize, keys: &[Stroke]) -> usize {
+        let mut selection = at..at;
+        for key in keys {
+            if let Some(done) = vim.key(text, &selection, *key) {
+                selection = done.selection;
+            }
+        }
+        selection.start
+    }
+
+    /// Type `keys` in a new Vim, from the char `at`. Returns what the last of them did.
+    fn last_done(text: &str, at: usize, keys: &str) -> (String, Done) {
+        let mut text = text.to_owned();
+        let done = type_in(&mut Vim::default(), &mut text, at, keys);
+        (text, done)
+    }
+
+    #[test]
+    fn control_o_goes_back_to_where_a_jump_started() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc\nd\ne".to_owned());
+        let at = type_in(&mut vim, &mut text, 2, "G").selection.start;
+        assert_eq!(at, 8);
+        assert_eq!(press_in(&mut vim, &mut text, at, &[BACK]), 2);
+    }
+
+    #[test]
+    fn control_i_goes_forward_again_after_control_o() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc\nd\ne".to_owned());
+        type_in(&mut vim, &mut text, 2, "G");
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[BACK, FORTH]), 8);
+        // Back and forth as many times as wanted.
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[BACK, FORTH, BACK]), 2);
+    }
+
+    #[test]
+    fn a_tab_goes_forward_as_control_i_does() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc\nd\ne".to_owned());
+        type_in(&mut vim, &mut text, 2, "G");
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[BACK]), 2);
+        assert_eq!(type_in(&mut vim, &mut text, 2, "\t").selection, 8..8);
+    }
+
+    #[test]
+    fn control_o_goes_back_through_the_jumps_one_by_one() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc\nd\ne".to_owned());
+        type_in(&mut vim, &mut text, 0, "3G");
+        type_in(&mut vim, &mut text, 4, "G");
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[BACK]), 4);
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 0);
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[FORTH]), 4);
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[FORTH]), 8);
+    }
+
+    #[test]
+    fn a_count_goes_that_many_jumps_back_or_forth() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc\nd\ne".to_owned());
+        type_in(&mut vim, &mut text, 0, "3G");
+        type_in(&mut vim, &mut text, 4, "G");
+        let two = Stroke::Char('2');
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[two, BACK]), 0);
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[two, FORTH]), 8);
+        // The list does not go that far: the caret stays.
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[two, FORTH]), 8);
+        assert_eq!(
+            press_in(&mut vim, &mut text, 8, &[Stroke::Char('9'), BACK]),
+            8
+        );
+    }
+
+    #[test]
+    fn the_caret_stays_at_either_end_of_the_list_of_the_jumps() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        // No jump yet.
+        assert_eq!(press_in(&mut vim, &mut text, 2, &[BACK]), 2);
+        assert_eq!(press_in(&mut vim, &mut text, 2, &[FORTH]), 2);
+        type_in(&mut vim, &mut text, 2, "G");
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[FORTH]), 4);
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK, BACK, BACK]), 2);
+        assert_eq!(press_in(&mut vim, &mut text, 2, &[FORTH, FORTH, FORTH]), 4);
+    }
+
+    #[test]
+    fn a_jump_made_after_going_back_is_the_newest_place() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc\nd\ne".to_owned());
+        type_in(&mut vim, &mut text, 0, "3G");
+        type_in(&mut vim, &mut text, 4, "G");
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[BACK]), 4);
+        type_in(&mut vim, &mut text, 4, "gg");
+        // Nothing is after it, and what is before it is where it started.
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[FORTH]), 0);
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[BACK]), 4);
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 8);
+    }
+
+    #[test]
+    fn the_list_of_the_jumps_keeps_one_place_a_line() {
+        let (mut vim, mut text) = (Vim::default(), "ab\ncd".to_owned());
+        type_in(&mut vim, &mut text, 0, "Ggg");
+        type_in(&mut vim, &mut text, 1, "G");
+        // The first line was left twice: only the last place on it is kept.
+        assert_eq!(press_in(&mut vim, &mut text, 3, &[BACK]), 1);
+        assert_eq!(press_in(&mut vim, &mut text, 1, &[BACK]), 1);
+    }
+
+    #[test]
+    fn the_list_of_the_jumps_holds_a_hundred_places() {
+        let (mut vim, mut text) = (Vim::default(), vec!["x"; 150].join("\n"));
+        let mut at = 0;
+        for line in 2..=150 {
+            at = type_in(&mut vim, &mut text, at, &format!("{line}G"))
+                .selection
+                .start;
+        }
+        assert_eq!(at, 298);
+        // Back from line 150 through the 99 places before it: to line 51 and no further.
+        assert_eq!(press_in(&mut vim, &mut text, at, &[BACK; 98]), 102);
+        assert_eq!(press_in(&mut vim, &mut text, 102, &[BACK]), 100);
+        assert_eq!(press_in(&mut vim, &mut text, 100, &[BACK; 50]), 100);
+    }
+
+    #[test]
+    fn the_place_of_a_jump_follows_its_text_when_lines_come_in_above_it() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        type_in(&mut vim, &mut text, 4, "gg");
+        let at = type_in(&mut vim, &mut text, 0, "Onew\u{1b}")
+            .selection
+            .start;
+        assert_eq!(text, "new\na\nb\nc");
+        assert_eq!(press_in(&mut vim, &mut text, at, &[BACK]), 8);
+    }
+
+    #[test]
+    fn the_place_of_a_jump_follows_its_text_when_lines_above_it_go() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        type_in(&mut vim, &mut text, 4, "gg");
+        type_in(&mut vim, &mut text, 0, "dd");
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[BACK]), 2);
+        // And when a command typed after a colon takes them out.
+        let mut text = "a\nb\nc\nd".to_owned();
+        vim.forget_marks();
+        type_in(&mut vim, &mut text, 6, "gg");
+        type_in(&mut vim, &mut text, 0, ":2,3d\r");
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[BACK]), 2);
+    }
+
+    #[test]
+    fn the_place_of_a_jump_past_the_end_of_a_text_changed_elsewhere_is_its_end() {
+        let (mut vim, mut text) = (Vim::default(), "a\nbcdef".to_owned());
+        type_in(&mut vim, &mut text, 6, "gg");
+        text = "a\nb".to_owned();
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[BACK]), 2);
+    }
+
+    #[test]
+    fn the_jumps_are_forgotten_with_the_marks() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        type_in(&mut vim, &mut text, 0, "G");
+        vim.forget_marks();
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 4);
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[FORTH]), 4);
+    }
+
+    #[test]
+    fn going_to_a_line_typed_after_a_colon_is_a_jump_for_control_o() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        assert_eq!(type_in(&mut vim, &mut text, 2, ":3\r").selection, 4..4);
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 2);
+    }
+
+    #[test]
+    fn going_to_a_mark_or_to_a_partner_is_a_jump_for_control_o() {
+        let (mut vim, mut text) = (Vim::default(), "f(\na)".to_owned());
+        type_in(&mut vim, &mut text, 1, "maG'a");
+        assert_eq!(press_in(&mut vim, &mut text, 0, &[BACK]), 3);
+        vim.forget_marks();
+        assert_eq!(type_in(&mut vim, &mut text, 1, "%").selection, 4..4);
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 1);
+    }
+
+    #[test]
+    fn a_plain_move_is_not_a_jump_for_control_o() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        type_in(&mut vim, &mut text, 0, "jj");
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 4);
+    }
+
+    #[test]
+    fn two_backticks_come_back_from_the_first_control_o() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        type_in(&mut vim, &mut text, 2, "G");
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 2);
+        assert_eq!(type_in(&mut vim, &mut text, 2, "``").selection, 4..4);
+    }
+
+    #[test]
+    fn control_o_after_an_operator_gives_the_operator_up() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        type_in(&mut vim, &mut text, 0, "Gd");
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 4);
+        assert_eq!(text, "a\nb\nc");
+        assert_eq!(press_in(&mut vim, &mut text, 4, &[BACK]), 0);
+    }
+
+    #[test]
+    fn control_o_moves_the_end_of_a_selection() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        type_in(&mut vim, &mut text, 0, "G");
+        let shown = type_in(&mut vim, &mut text, 4, "v").selection;
+        assert_eq!(
+            vim.key(&mut text, &shown, BACK).map(|done| done.selection),
+            Some(0..5)
+        );
+    }
+
+    #[test]
+    fn a_macro_keeps_control_o_and_control_i_and_does_them_again() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc\nd\ne".to_owned());
+        type_in(&mut vim, &mut text, 2, "qaG");
+        press_in(&mut vim, &mut text, 8, &[BACK, FORTH]);
+        type_in(&mut vim, &mut text, 8, "q");
+        assert_eq!(vim.registers[&'a'].0, "G\u{f}\t");
+        vim.forget_marks();
+        assert_eq!(type_in(&mut vim, &mut text, 4, "@a").selection, 8..8);
+        assert_eq!(press_in(&mut vim, &mut text, 8, &[BACK]), 4);
+    }
+
+    #[test]
+    fn an_address_is_so_many_lines_after_or_before_the_line_of_the_caret() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(vim(text, 2, ":.+2d\r").0, "a\nb\nc\ne");
+        assert_eq!(vim(text, 4, ":.-1d\r").0, "a\nc\nd\ne");
+        // Without a number, one line.
+        assert_eq!(vim(text, 2, ":.+d\r").0, "a\nb\nd\ne");
+        assert_eq!(vim(text, 2, ":.-d\r").0, "b\nc\nd\ne");
+    }
+
+    #[test]
+    fn an_address_is_so_many_lines_before_the_last_line() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(vim(text, 0, ":$-3d\r").0, "a\nc\nd\ne");
+        assert_eq!(vim(text, 0, ":$-1\r").1, 6);
+    }
+
+    #[test]
+    fn a_plus_or_a_minus_alone_counts_from_the_line_of_the_caret() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(vim(text, 0, ":+3\r").1, 6);
+        assert_eq!(vim(text, 8, ":-2\r").1, 4);
+        assert_eq!((vim(text, 0, ":+\r").1, vim(text, 4, ":-\r").1), (2, 2));
+        assert_eq!(vim(text, 0, ":++\r").1, 4);
+        assert_eq!(vim(text, 0, ":+2d\r").0, "a\nb\nd\ne");
+        assert_eq!(vim(text, 8, ":-2d\r").0, "a\nb\nd\ne");
+    }
+
+    #[test]
+    fn an_address_is_so_many_lines_after_a_mark_or_a_number() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(vim(text, 2, "magg:'a+1d\r").0, "a\nb\nd\ne");
+        assert_eq!(vim(text, 2, "maG:'a-1d\r").0, "b\nc\nd\ne");
+        assert_eq!(vim(text, 0, ":2+1d\r").0, "a\nb\nd\ne");
+    }
+
+    #[test]
+    fn an_address_counts_lines_after_and_before_one_after_the_other() {
+        assert_eq!(vim("a\nb\nc\nd\ne", 0, ":.+3-1d\r").0, "a\nb\nd\ne");
+        assert_eq!(vim("a\nb\nc\nd\ne", 0, ":$-3+1-1d\r").0, "a\nc\nd\ne");
+    }
+
+    #[test]
+    fn addresses_that_count_lines_make_a_range() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(vim(text, 2, ":.,.+2d\r"), ("a\ne".to_owned(), 2));
+        assert_eq!(vim(text, 4, ":-1,+1d\r").0, "a\ne");
+        assert_eq!(vim(text, 2, ":.,$-1d\r").0, "a\ne");
+        assert_eq!(vim(text, 2, ":.,$s/./x/\r").0, "a\nx\nx\nx\nx");
+        assert_eq!(vim(text, 0, ":.+1,.+2s/./x/\r").0, "a\nx\nx\nd\ne");
+    }
+
+    #[test]
+    fn an_address_that_counts_out_of_the_text_does_nothing() {
+        let text = "a\nb\nc";
+        assert_eq!(vim(text, 2, ":.-5d\r"), (text.to_owned(), 2));
+        assert_eq!(vim(text, 2, ":.+9d\r"), (text.to_owned(), 2));
+        assert_eq!(vim(text, 2, ":.,.+9d\r"), (text.to_owned(), 2));
+        assert_eq!(vim(text, 2, ":-2,.d\r"), (text.to_owned(), 2));
+    }
+
+    #[test]
+    fn a_pattern_between_slashes_is_the_next_line_where_it_is_found() {
+        let text = "foo\nbar\nfoo\nbaz";
+        assert_eq!(vim(text, 0, ":/foo/d\r").0, "foo\nbar\nbaz");
+        assert_eq!(vim(text, 0, ":/ba/\r").1, 4);
+        assert_eq!(vim(text, 4, ":/ba/\r").1, 12);
+        // The slash that ends it may be left out; the pattern is a regular expression.
+        assert_eq!(vim(text, 0, ":/baz\r").1, 12);
+        assert_eq!(vim(text, 0, ":/^b.z$/\r").1, 12);
+    }
+
+    #[test]
+    fn the_search_for_a_pattern_goes_round_the_end_of_the_text() {
+        let text = "foo\nbar\nfoo\nbaz";
+        assert_eq!(vim(text, 8, ":/bar/\r").1, 4);
+        assert_eq!(vim(text, 8, ":/foo/\r").1, 0);
+        // Found nowhere else, it is the line of the caret.
+        assert_eq!(vim("foo\nbar", 0, ":/foo/d\r").0, "bar");
+    }
+
+    #[test]
+    fn a_pattern_between_question_marks_is_the_line_before_where_it_is_found() {
+        let text = "foo\nbar\nfoo\nbaz";
+        assert_eq!(vim(text, 12, ":?foo?\r").1, 8);
+        assert_eq!(vim(text, 8, ":?foo?\r").1, 0);
+        assert_eq!(vim(text, 8, ":?bar?d\r").0, "foo\nfoo\nbaz");
+        // Round the start of the text.
+        assert_eq!(vim(text, 0, ":?baz?\r").1, 12);
+        assert_eq!(vim(text, 0, ":?foo\r").1, 8);
+    }
+
+    #[test]
+    fn patterns_make_a_range_and_have_lines_counted_from_them() {
+        let text = "foo\nbar\nfoo\nbaz";
+        assert_eq!(vim(text, 0, ":/bar/,/baz/d\r").0, "foo");
+        assert_eq!(vim(text, 0, ":.,/bar/d\r").0, "foo\nbaz");
+        assert_eq!(vim(text, 12, ":?bar?,.d\r").0, "foo");
+        assert_eq!(vim(text, 0, ":/bar/+1d\r").0, "foo\nbar\nbaz");
+        assert_eq!(vim(text, 0, ":/bar/s/a/o/\r").0, "foo\nbor\nfoo\nbaz");
+    }
+
+    #[test]
+    fn a_pattern_that_is_found_on_no_line_is_no_address() {
+        let text = "foo\nbar";
+        assert_eq!(
+            last_done(text, 4, ":/zzz/d\r"),
+            (
+                text.to_owned(),
+                Done {
+                    selection: 4..4,
+                    ..Done::default()
+                }
+            )
+        );
+        assert_eq!(vim(text, 4, ":/zzz/\r"), (text.to_owned(), 4));
+        assert_eq!(vim(text, 4, ":?zzz?d\r"), (text.to_owned(), 4));
+        assert_eq!(vim(text, 0, ":.,/zzz/d\r"), (text.to_owned(), 0));
+        // Neither is one that cannot be read.
+        assert_eq!(vim(text, 4, ":/(/d\r"), (text.to_owned(), 4));
+    }
+
+    #[test]
+    fn a_slash_after_a_backslash_is_part_of_the_pattern_of_an_address() {
+        assert_eq!(vim("a\nb/c\nb", 0, ":/b\\/c/d\r").0, "a\nb");
+    }
+
+    #[test]
+    fn an_address_without_a_pattern_takes_the_one_of_the_last_substitution() {
+        assert_eq!(vim("x\nb\nx", 0, ":s/x/y/\r://d\r").0, "y\nb");
+        // None was done yet: no address.
+        assert_eq!(vim("x\nb\nx", 0, "://d\r").0, "x\nb\nx");
+    }
+
+    #[test]
+    fn going_to_the_line_of_a_pattern_is_a_jump_to_come_back_from() {
+        assert_eq!(vim("foo\nbar", 1, ":/bar/\r``").1, 1);
+    }
+
+    #[test]
+    fn a_global_command_deletes_the_lines_where_its_pattern_is_found() {
+        assert_eq!(vim("ax\nb\ncx\nd", 0, ":g/x/d\r"), ("b\nd".to_owned(), 2));
+        assert_eq!(vim("ax\nb\ncx\nd", 0, ":global/x/delete\r").0, "b\nd");
+        // The pattern is a regular expression.
+        assert_eq!(vim("a1\nb\nc22", 0, ":g/\\d+$/d\r").0, "b");
+    }
+
+    #[test]
+    fn a_global_command_skips_none_of_the_lines_that_follow_one_another() {
+        assert_eq!(vim("x\nx\nx\na", 0, ":g/x/d\r").0, "a");
+        assert_eq!(vim("a\nx\nx\nx", 0, ":g/x/d\r").0, "a");
+        assert_eq!(vim("x\nx", 0, ":g/x/d\r").0, "");
+        assert_eq!(vim("a\n\n\nb\n\n", 0, ":g/^$/d\r").0, "a\nb");
+    }
+
+    #[test]
+    fn a_global_command_substitutes_in_the_lines_where_its_pattern_is_found() {
+        assert_eq!(
+            vim("ax a\nb a\n cx a", 0, ":g/x/s/a/o/g\r"),
+            ("ox o\nb a\n cx o".to_owned(), 10)
+        );
+    }
+
+    #[test]
+    fn a_v_or_a_bang_is_for_the_lines_where_the_pattern_is_not_found() {
+        assert_eq!(vim("ax\nb\ncx\nd", 0, ":v/x/d\r").0, "ax\ncx");
+        assert_eq!(vim("ax\nb\ncx\nd", 0, ":g!/x/d\r").0, "ax\ncx");
+        assert_eq!(
+            vim("ax\nb\ncx\nd", 0, ":vglobal/x/s/$/!/\r").0,
+            "ax\nb!\ncx\nd!"
+        );
+    }
+
+    #[test]
+    fn a_range_before_a_global_command_limits_its_lines() {
+        let text = "ax\nb\ncx\nd";
+        assert_eq!(vim(text, 0, ":2,4g/x/d\r").0, "ax\nb\nd");
+        assert_eq!(vim(text, 0, ":1,2v/x/d\r").0, "ax\ncx\nd");
+        assert_eq!(vim(text, 0, ":.,.+1g/x/d\r").0, "b\ncx\nd");
+        assert_eq!(vim(text, 0, ":/b/,$g/x/d\r").0, "ax\nb\nd");
+        // Lines the text does not have: nothing is done.
+        assert_eq!(vim(text, 0, ":2,9g/x/d\r").0, text);
+    }
+
+    #[test]
+    fn a_global_command_with_a_pattern_that_cannot_be_read_does_nothing() {
+        let text = "a(\nb";
+        assert_eq!(
+            last_done(text, 3, ":g/(/d\r"),
+            (
+                text.to_owned(),
+                Done {
+                    selection: 3..3,
+                    ..Done::default()
+                }
+            )
+        );
+        // Neither does one without its pattern, or with a space before it.
+        assert_eq!(vim(text, 3, ":g\r"), (text.to_owned(), 3));
+        assert_eq!(vim(text, 3, ":g a d\r"), (text.to_owned(), 3));
+    }
+
+    #[test]
+    fn a_global_command_whose_pattern_is_found_nowhere_does_nothing() {
+        let text = "a\nb";
+        assert_eq!(
+            last_done(text, 2, ":g/z/d\r"),
+            (
+                text.to_owned(),
+                Done {
+                    selection: 2..2,
+                    ..Done::default()
+                }
+            )
+        );
+        assert_eq!(vim(text, 2, ":v/./d\r"), (text.to_owned(), 2));
+    }
+
+    #[test]
+    fn a_global_command_without_a_command_does_nothing() {
+        assert_eq!(vim("ax\nb\ncx", 3, ":g/x/\r"), ("ax\nb\ncx".to_owned(), 3));
+        assert_eq!(vim("ax\nb\ncx", 3, ":g/x\r"), ("ax\nb\ncx".to_owned(), 3));
+    }
+
+    #[test]
+    fn a_global_command_is_one_change_made_when_enter_is_pressed() {
+        let (mut vim, mut text) = (Vim::default(), "ax\nb\ncx\nd".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, ":g/x/d");
+        assert_eq!((text.as_str(), done.changed), ("ax\nb\ncx\nd", false));
+        let done = type_in(&mut vim, &mut text, 0, "\r");
+        assert_eq!((text.as_str(), done.changed), ("b\nd", true));
+        // What it took out last is what is kept.
+        assert_eq!((done.copied.as_deref(), done.ask), (Some("cx\n"), None));
+        assert_eq!((vim.typing(), vim.mode), (None, Mode::Normal));
+    }
+
+    #[test]
+    fn another_sign_than_a_slash_goes_around_the_pattern_of_a_global_command() {
+        assert_eq!(vim("a/x\nb", 0, ":g#/x#d\r").0, "b");
+        assert_eq!(vim("a/x\nb", 0, ":g/a\\/x/d\r").0, "b");
+    }
+
+    #[test]
+    fn the_lines_of_a_global_command_are_marked_before_its_command_runs() {
+        // The lines the command makes are not lines for it, though the pattern is there.
+        assert_eq!(vim("x\nx", 0, ":g/x/s/x/x\\rx/\r").0, "x\nx\nx\nx");
+        assert_eq!(vim("ax\nb", 0, ":g/x/t.\r").0, "ax\nax\nb");
+    }
+
+    #[test]
+    fn a_global_command_leaves_out_a_marked_line_its_command_took_out() {
+        assert_eq!(vim("x\nx\nx", 0, ":g/x/+1d\r").0, "x\nx");
+        assert_eq!(vim("x\na\nx", 0, ":g/x/$d\r").0, "x\na");
+        // A line that came up onto the one before it is no longer a line.
+        assert_eq!(vim("x\nx\na", 0, ":g/x/normal J\r").0, "x x\na");
+        assert_eq!(vim("x\n  x\na", 0, ":g/x/normal J\r").0, "x x\na");
+    }
+
+    #[test]
+    fn joining_a_line_with_one_that_has_no_indent_changes_the_text() {
+        let (text, done) = last_done("a\nb", 0, "J");
+        assert_eq!((text.as_str(), done.changed), ("a b", true));
+    }
+
+    #[test]
+    fn a_global_command_runs_its_command_with_addresses_of_its_own() {
+        assert_eq!(vim("x\na\nb\nx\nc", 0, ":g/x/+1d\r").0, "x\nb\nx");
+        assert_eq!(vim("x\na\nb\nx\nc", 0, ":g/x/.,+1d\r").0, "b");
+    }
+
+    #[test]
+    fn a_global_command_moves_copies_and_pushes_in_its_lines() {
+        // Each line in turn above the first: the text upside down.
+        assert_eq!(vim("a\nb\nc", 0, ":g/^/m0\r"), ("c\nb\na".to_owned(), 0));
+        assert_eq!(vim("ax\nb\ncx", 0, ":g/x/m$\r").0, "b\nax\ncx");
+        assert_eq!(vim("ax\nb\ncx", 0, ":g/x/t$\r").0, "ax\nb\ncx\nax\ncx");
+        assert_eq!(vim("ax\nb\ncx", 0, ":g/x/>\r").0, "    ax\nb\n    cx");
+    }
+
+    #[test]
+    fn a_global_command_types_keys_on_its_lines() {
+        assert_eq!(vim("ax\nb\ncx\nd", 0, ":g/x/normal dd\r").0, "b\nd");
+        assert_eq!(
+            vim("ax\nb\ncx", 0, ":g/x/normal Aend\r"),
+            ("axend\nb\ncxend".to_owned(), 12)
+        );
+    }
+
+    #[test]
+    fn a_global_command_inside_another_is_not_done() {
+        assert_eq!(vim("ax\nb", 0, ":g/x/g/x/d\r").0, "ax\nb");
+        // The one after it is done as any other.
+        assert_eq!(vim("ax\nb", 0, ":g/x/g/x/d\r:g/x/d\r").0, "b");
+    }
+
+    #[test]
+    fn a_global_command_without_a_pattern_takes_the_one_of_the_last_substitution() {
+        assert_eq!(vim("ax\nb\ncx", 0, ":s/x/y/\r:g//d\r").0, "ay\nb");
+        assert_eq!(vim("ax\nb\ncx", 0, ":g//d\r").0, "ax\nb\ncx");
+    }
+
+    #[test]
+    fn lines_move_below_the_line_of_an_address() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(vim(text, 2, ":m+1\r"), ("a\nc\nb\nd\ne".to_owned(), 4));
+        assert_eq!(vim(text, 4, ":m-2\r"), ("a\nc\nb\nd\ne".to_owned(), 2));
+        assert_eq!(vim(text, 0, ":2,3m0\r"), ("b\nc\na\nd\ne".to_owned(), 2));
+        assert_eq!(vim(text, 0, ":1,2m4\r"), ("c\nd\na\nb\ne".to_owned(), 6));
+        assert_eq!(vim(text, 8, ":move 2\r"), ("a\nb\ne\nc\nd".to_owned(), 4));
+        assert_eq!(vim(text, 0, ":2,3m/e/\r").0, "a\nd\ne\nb\nc");
+    }
+
+    #[test]
+    fn lines_move_to_the_ends_of_a_text_that_has_no_line_end_after_its_last_line() {
+        let text = "a\nb\nc";
+        assert_eq!(vim(text, 0, ":m$\r"), ("b\nc\na".to_owned(), 4));
+        assert_eq!(vim(text, 4, ":m0\r"), ("c\na\nb".to_owned(), 0));
+        assert_eq!(vim(text, 0, ":1,2m$\r"), ("c\na\nb".to_owned(), 4));
+        assert_eq!(vim("a\nb\n", 0, ":m$\r").0, "b\n\na");
+    }
+
+    #[test]
+    fn lines_moved_to_where_they_are_or_into_themselves_stay() {
+        let text = "a\nb\nc\nd";
+        let (after, done) = last_done(text, 2, ":m.\r");
+        assert_eq!((after.as_str(), done.changed), (text, false));
+        assert!(!last_done(text, 2, ":m1\r").1.changed);
+        assert_eq!(vim(text, 0, ":2,4m3\r"), (text.to_owned(), 0));
+        // Neither do they go below a line the text does not have, or below no line.
+        assert_eq!(vim(text, 0, ":m9\r"), (text.to_owned(), 0));
+        assert_eq!(vim(text, 0, ":m\r"), (text.to_owned(), 0));
+        assert_eq!(vim(text, 0, ":m 2 x\r"), (text.to_owned(), 0));
+    }
+
+    #[test]
+    fn a_mark_goes_with_its_line_when_lines_move() {
+        assert_eq!(
+            vim("a\nbb\nc", 3, "mb:m$\rgg`b"),
+            ("a\nc\nbb".to_owned(), 5)
+        );
+        // And so does one in the lines they go past.
+        assert_eq!(vim("a\nbb\nc", 5, "mc:2m$\rgg`c").1, 2);
+        assert_eq!(vim("a\nbb\nc", 0, "ma:3m0\rG`a").1, 2);
+    }
+
+    #[test]
+    fn moving_lines_is_one_change() {
+        let (text, done) = last_done("a\nb", 0, ":m$\r");
+        assert_eq!(
+            (text.as_str(), done.changed, done.copied),
+            ("b\na", true, None)
+        );
+    }
+
+    #[test]
+    fn lines_are_copied_below_the_line_of_an_address() {
+        let text = "a\nb\nc";
+        assert_eq!(vim(text, 2, ":t.\r"), ("a\nb\nb\nc".to_owned(), 4));
+        assert_eq!(vim(text, 4, ":t0\r"), ("c\na\nb\nc".to_owned(), 0));
+        assert_eq!(vim(text, 0, ":1,2t$\r"), ("a\nb\nc\na\nb".to_owned(), 8));
+        assert_eq!(vim(text, 0, ":co 2\r").0, "a\nb\na\nc");
+        assert_eq!(vim(text, 0, ":2,3copy 1\r").0, "a\nb\nc\nb\nc");
+        assert_eq!(vim(text, 4, ":t-2\r").0, "a\nc\nb\nc");
+    }
+
+    #[test]
+    fn lines_copied_below_no_line_of_the_text_change_nothing() {
+        let text = "a\nb";
+        assert_eq!(
+            last_done(text, 0, ":t9\r"),
+            (text.to_owned(), Done::default())
+        );
+        assert_eq!(vim(text, 0, ":t\r").0, text);
+        assert_eq!(vim(text, 0, ":5t0\r").0, text);
+    }
+
+    #[test]
+    fn copying_lines_leaves_what_was_put_aside() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb".to_owned());
+        type_in(&mut vim, &mut text, 2, "yy");
+        let done = type_in(&mut vim, &mut text, 0, ":t.\r");
+        assert_eq!(
+            (text.as_str(), done.changed, done.copied),
+            ("a\na\nb", true, None)
+        );
+        type_in(&mut vim, &mut text, 0, "P");
+        assert_eq!(text, "b\na\na\nb");
+    }
+
+    #[test]
+    fn the_lines_of_a_range_are_pushed_in_and_out() {
+        let text = "a\nb\nc";
+        assert_eq!(vim(text, 0, ":2,3>\r"), ("a\n    b\n    c".to_owned(), 12));
+        assert_eq!(vim(text, 2, ":>\r"), ("a\n    b\nc".to_owned(), 6));
+        assert_eq!(vim("    a\n  b\nc", 0, ":%<\r"), ("a\nb\nc".to_owned(), 4));
+        // A sign more, a level more.
+        assert_eq!(vim(text, 0, ":>>\r").0, "        a\nb\nc");
+        assert_eq!(vim("        a", 0, ":<<\r").0, "a");
+        assert_eq!(vim(text, 0, ":><\r").0, text);
+        assert_eq!(vim(text, 0, ":>x\r").0, text);
+    }
+
+    #[test]
+    fn lines_are_pushed_in_by_the_indent_of_the_file() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb".to_owned());
+        vim.unit = "\t".to_owned();
+        assert!(type_in(&mut vim, &mut text, 0, ":%>\r").changed);
+        assert_eq!(text, "\ta\n\tb");
+    }
+
+    #[test]
+    fn the_lines_of_a_range_are_copied_without_changing_the_text() {
+        let (mut vim, mut text) = (Vim::default(), "a\nb\nc".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, ":2,3y\r");
+        assert_eq!(
+            (done.copied.as_deref(), done.changed),
+            (Some("b\nc\n"), false)
+        );
+        assert_eq!((text.as_str(), done.selection), ("a\nb\nc", 0..0));
+        type_in(&mut vim, &mut text, 0, "P");
+        assert_eq!(text, "b\nc\na\nb\nc");
+        assert_eq!(
+            last_done("a\nb", 0, ":yank\r").1.copied.as_deref(),
+            Some("a\n")
+        );
+        // With something after it, it is another command.
+        assert_eq!(last_done("a\nb", 0, ":y a\r").1.copied, None);
+    }
+
+    #[test]
+    fn keys_are_typed_on_each_line_of_a_range() {
+        assert_eq!(
+            vim("a\nb\nc\nd", 0, ":2,3normal Ax\r"),
+            ("a\nbx\ncx\nd".to_owned(), 6)
+        );
+        assert_eq!(vim("ab\ncd", 3, ":normal x\r"), ("ab\nd".to_owned(), 3));
+        assert_eq!(vim("ab\ncd", 0, ":%norm! x\r").0, "b\nd");
+        assert_eq!(vim("a b\nc d", 0, ":%normal wD\r").0, "a \nc ");
+    }
+
+    #[test]
+    fn the_keys_typed_on_a_range_are_one_change() {
+        let (mut vim, mut text) = (Vim::default(), "ab\ncd".to_owned());
+        let done = type_in(&mut vim, &mut text, 0, ":%normal x\r");
+        assert_eq!(
+            (text.as_str(), done.changed, done.ask),
+            ("b\nd", true, None)
+        );
+        assert_eq!(done.copied.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn keys_typed_on_a_range_take_its_lines_by_their_numbers_as_the_text_is_then() {
+        // As in Vim: with a line less each time, every second line is taken out.
+        assert_eq!(vim("a\nb\nc\nd\ne", 0, ":%normal dd\r").0, "b\nd");
+    }
+
+    #[test]
+    fn what_the_keys_typed_on_a_range_leave_unfinished_ends_there() {
+        let (mut vim, mut text) = (Vim::default(), "ab\ncd".to_owned());
+        type_in(&mut vim, &mut text, 0, ":normal ihi\r");
+        assert_eq!((text.as_str(), vim.mode), ("hiab\ncd", Mode::Normal));
+        // An operator that waits is given up: the next key is a command of its own.
+        type_in(&mut vim, &mut text, 0, ":normal d\r");
+        type_in(&mut vim, &mut text, 0, "x");
+        assert_eq!(text, "iab\ncd");
+        type_in(&mut vim, &mut text, 0, ":normal v\r");
+        assert_eq!((vim.mode, vim.typing()), (Mode::Normal, None));
+        type_in(&mut vim, &mut text, 0, ":normal :s/a/b/\r");
+        assert_eq!((text.as_str(), vim.typing()), ("iab\ncd", None));
+    }
+
+    #[test]
+    fn the_keys_typed_on_a_range_play_a_macro() {
+        let (mut vim, mut text) = (Vim::default(), "abc\nabc\nabc".to_owned());
+        type_in(&mut vim, &mut text, 0, "qaxq");
+        type_in(&mut vim, &mut text, 0, ":2,3normal @a\r");
+        assert_eq!(text, "bc\nbc\nbc");
+    }
+
+    #[test]
+    fn the_keys_typed_on_a_range_do_not_go_into_the_macro_being_recorded() {
+        let (mut vim, mut text) = (Vim::default(), "ab\ncd".to_owned());
+        type_in(&mut vim, &mut text, 0, "qa:%normal x\rq");
+        assert_eq!(vim.registers[&'a'].0, ":%normal x\n");
+    }
+
+    #[test]
+    fn a_change_typed_on_a_range_is_what_the_dot_does_again() {
+        assert_eq!(vim("abc\nabc", 0, ":normal x\rj.").0, "bc\nbc");
+    }
+
+    #[test]
+    fn a_substitution_that_asks_before_each_change_is_still_not_done() {
+        assert_eq!(vim("a\na", 0, ":%s/a/b/c\r").0, "a\na");
+        assert_eq!(vim("a\na", 0, ":g/a/s/a/b/gc\r").0, "a\na");
     }
 
     #[test]
