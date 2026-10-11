@@ -4189,6 +4189,7 @@ impl GodApp {
                                         ("Stop", Action::Stop),
                                         ("Restart", Action::Restart),
                                         ("Logs", Action::Logs),
+                                        ("Shell", Action::Shell),
                                     ],
                                     false => &[("Start", Action::Start), ("Logs", Action::Logs)],
                                 };
@@ -4236,6 +4237,12 @@ impl GodApp {
             Some((Action::Logs, command)) if !command.is_empty() => {
                 self.docker = None;
                 self.run_task(ctx, command);
+            }
+            // So is a shell in the container. The terminal here is no real one: the
+            // shell is asked for without one, and shows no prompt.
+            Some((Action::Shell, command)) if !command.is_empty() => {
+                self.docker = None;
+                self.run_task(ctx, command.replacen(" -it ", " -i ", 1));
             }
             Some((_, command)) if !command.is_empty() => self.ask_docker(ctx, Some(command)),
             _ if refresh => self.ask_docker(ctx, None),

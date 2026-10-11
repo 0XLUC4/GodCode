@@ -205,7 +205,9 @@ Docker : `Docker…` liste conteneurs et images (par la commande `docker`), dém
 conteneur, suit ses logs dans le terminal ; rien n'y supprime quoi que ce soit.
 Docker compose : quand le dossier a un fichier compose, ses services sont nommés avec `Up` (`up -d`),
 `Stop` et `Logs`.
-Reste : requêtes SQL, PostgreSQL, shell dans un conteneur.
+`Shell` ouvre un `sh` dans un conteneur lancé, dans le terminal (sans invite : le terminal d'ici n'est
+pas un vrai terminal).
+Reste : requêtes SQL, PostgreSQL.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 
