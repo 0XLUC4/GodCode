@@ -252,7 +252,8 @@ pub fn run(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>, op: Op
     let before = text.clone();
     let selection = match op {
         Op::Newline => {
-            let caret = edit::newline(text, selection, config.indent);
+            let markup = config.language.is_markup();
+            let caret = edit::newline(text, selection, config.indent, markup);
             caret..caret
         }
         Op::Indent => edit::indent(text, selection, config.indent),
@@ -342,6 +343,39 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
         set_selection(ui.ctx(), id, &(caret + 1..caret + 1));
         return true;
     }
+    let blank = |lead: &str| lead.chars().all(|ch| ch == ' ' || ch == '\t');
+    let indent_at = |text: &str, byte: usize| {
+        let line = text[..byte].rfind('\n').map_or(0, |found| found + 1);
+        let lead = text[line..]
+            .chars()
+            .take_while(|ch| *ch == ' ' || *ch == '\t');
+        lead.collect::<String>()
+    };
+    // `</` closes the element still open: its name is written, and a closing tag that
+    // starts its line goes under the tag it closes.
+    if typed == '/' && config.language.is_markup() {
+        let at = godcode_core::byte_index(text, caret);
+        let Some(before) = text[..at].strip_suffix('<') else {
+            return false;
+        };
+        let Some((name, opened)) = complete::unclosed_tag(before) else {
+            return false;
+        };
+        take(ui, typed);
+        let line = before.rfind('\n').map_or(0, |found| found + 1);
+        let (mut at, mut caret) = (at, caret);
+        if blank(&before[line..]) {
+            let indent = indent_at(text, opened);
+            let lead = line..before.len();
+            caret = caret - text[lead.clone()].chars().count() + indent.chars().count();
+            at = line + indent.len() + 1;
+            text.replace_range(lead, &indent);
+        }
+        text.insert_str(at, &format!("/{name}>"));
+        caret += name.chars().count() + 2;
+        set_selection(ui.ctx(), id, &(caret..caret));
+        return true;
+    }
     let mut around = text.chars().skip(caret.saturating_sub(1));
     let before = if caret == 0 { None } else { around.next() };
     let after = around.next();
@@ -357,6 +391,26 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
         && after.is_none_or(|ch| ch.is_whitespace() || ")]},;".contains(ch))
         // A quote after a word or a backslash closes or escapes, it does not open.
         && (typed != '"' || !before.is_some_and(|ch| ch.is_alphanumeric() || "\"\\".contains(ch)));
+    // A closing bracket typed first on its line goes under the line of the one it closes.
+    if matches!(typed, ')' | ']' | '}') && !steps_over {
+        let at = godcode_core::byte_index(text, caret);
+        let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+        if at > line && blank(&text[line..at]) {
+            text.insert(at, typed);
+            let pair = check::matching_bracket(text, config.language, caret);
+            let Some(opener) = pair.map(|(one, other)| one.min(other)) else {
+                // It closes nothing: typed as it is.
+                text.remove(at);
+                return false;
+            };
+            take(ui, typed);
+            let indent = indent_at(text, godcode_core::byte_index(text, opener));
+            let after = caret - text[line..at].chars().count() + indent.chars().count() + 1;
+            text.replace_range(line..at, &indent);
+            set_selection(ui.ctx(), id, &(after..after));
+            return true;
+        }
+    }
     if !steps_over && !opens {
         return false;
     }
@@ -1687,6 +1741,43 @@ mod tests {
         harness.type_text("<br");
         harness.type_text(">");
         assert_eq!(harness.text, "<div><br></div>");
+    }
+
+    #[test]
+    fn code_is_laid_out_as_it_is_typed() {
+        // Enter between the two tags of an element.
+        let mut harness = Harness::of("index.html", "<body></body>", false);
+        set_selection(&harness.ctx, editor_id(), &(6..6));
+        harness.frame(Vec::new());
+        let out = harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "<body>\n    \n</body>");
+        assert_eq!(out.selection, Some(11..11));
+        // An element whose closing tag is already there is not closed twice.
+        let mut harness = Harness::of("index.html", "\n</body>", false);
+        set_selection(&harness.ctx, editor_id(), &(0..0));
+        harness.frame(Vec::new());
+        harness.type_text("<body");
+        harness.type_text(">");
+        assert_eq!(harness.text, "<body>\n</body>");
+        // `</` writes the name of the element still open, under its opening tag.
+        let mut harness = Harness::of("index.html", "<div>\n    <p>x</p>\n    ", false);
+        let end = harness.text.chars().count();
+        set_selection(&harness.ctx, editor_id(), &(end..end));
+        harness.frame(Vec::new());
+        harness.type_text("<");
+        let out = harness.type_text("/");
+        assert_eq!(harness.text, "<div>\n    <p>x</p>\n</div>");
+        assert_eq!(out.selection, Some(25..25));
+        // A closing bracket typed first on its line goes under what it closes.
+        let mut harness = Harness::new("fn a() {\n    if x {\n        y();\n        ");
+        let end = harness.text.chars().count();
+        set_selection(&harness.ctx, editor_id(), &(end..end));
+        harness.frame(Vec::new());
+        harness.type_text("}");
+        assert_eq!(harness.text, "fn a() {\n    if x {\n        y();\n    }");
+        harness.key(Key::Enter, Modifiers::NONE);
+        harness.type_text("}");
+        assert_eq!(harness.text, "fn a() {\n    if x {\n        y();\n    }\n}");
     }
 
     #[test]

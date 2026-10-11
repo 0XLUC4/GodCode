@@ -158,20 +158,90 @@ pub fn complete(text: &str, caret: usize, language: &Language) -> Vec<Completion
     found
 }
 
+/// What a tag may be named with.
+fn in_tag_name(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '-' | ':' | '.')
+}
+
+/// The tags named `name` in `text`, in order: `true` for one that opens an element, `false`
+/// for one that closes it. A tag that closes itself (`<a />`) is neither.
+fn tags_named<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = bool> + 'a {
+    text.match_indices('<').filter_map(move |(at, _)| {
+        let rest = &text[at + 1..];
+        let (closes, rest) = match rest.strip_prefix('/') {
+            Some(rest) => (true, rest),
+            None => (false, rest),
+        };
+        let found = rest.get(..name.len())?;
+        let longer = rest[name.len()..].chars().next().is_some_and(in_tag_name);
+        if !found.eq_ignore_ascii_case(name) || longer {
+            return None;
+        }
+        let empty = rest.find('>').is_some_and(|end| rest[..end].ends_with('/'));
+        (closes || !empty).then_some(!closes)
+    })
+}
+
 /// The closing tag to write after a `>` typed between `before` and `after`, when that `>`
-/// ends an opening tag that wants one.
+/// ends an opening tag that wants one: not when a closing tag after it is already waiting
+/// for it.
 pub fn closing_tag(before: &str, after: &str) -> Option<String> {
-    let tag = &before[before.rfind('<')? + 1..];
+    let opened = before.rfind('<')?;
+    let tag = &before[opened + 1..];
     if tag.contains('>') || tag.ends_with('/') {
         return None;
     }
-    let name: String = tag
-        .chars()
-        .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '-' | ':' | '.'))
-        .collect();
+    let name: String = tag.chars().take_while(|ch| in_tag_name(*ch)).collect();
     let void = crate::format::VOID_TAGS.contains(&name.to_ascii_lowercase().as_str());
-    let closing = format!("</{name}>");
-    (!name.is_empty() && !void && !after.starts_with(&closing)).then_some(closing)
+    if name.is_empty() || void {
+        return None;
+    }
+    // Elements of that name still open before this one: each has a closing tag coming.
+    let open = tags_named(&before[..opened], &name).fold(0_usize, |open, opens| match opens {
+        true => open + 1,
+        false => open.saturating_sub(1),
+    });
+    // Closing tags after it that close nothing opened there: one more of them than of
+    // those elements, and it is the one this tag was missing.
+    let (mut depth, mut spare) = (0_usize, 0_usize);
+    for opens in tags_named(after, &name) {
+        match (opens, depth) {
+            (true, _) => depth += 1,
+            (false, 0) => spare += 1,
+            (false, _) => depth -= 1,
+        }
+    }
+    (spare <= open).then(|| format!("</{name}>"))
+}
+
+/// The element still open at the end of `before`: its name, and the byte its opening tag
+/// starts at.
+pub fn unclosed_tag(before: &str) -> Option<(String, usize)> {
+    let mut open: Vec<(String, usize)> = Vec::new();
+    for (at, _) in before.match_indices('<') {
+        let rest = &before[at + 1..];
+        let (closes, rest) = match rest.strip_prefix('/') {
+            Some(rest) => (true, rest),
+            None => (false, rest),
+        };
+        let name: String = rest.chars().take_while(|ch| in_tag_name(*ch)).collect();
+        // A tag still being written closes and opens nothing yet.
+        let Some(end) = rest.find('>').filter(|_| !name.is_empty()) else {
+            continue;
+        };
+        let same = |(other, _): &(String, usize)| other.eq_ignore_ascii_case(&name);
+        if closes {
+            // What was left open inside it is closed with it.
+            if let Some(found) = open.iter().rposition(same) {
+                open.truncate(found);
+            }
+        } else if !rest[..end].ends_with('/')
+            && !crate::format::VOID_TAGS.contains(&name.to_ascii_lowercase().as_str())
+        {
+            open.push((name, at));
+        }
+    }
+    open.pop()
 }
 
 /// Replace the word ending at `caret` by `completion`. Returns the new caret.
@@ -263,6 +333,33 @@ mod tests {
         for (before, after) in none {
             assert_eq!(closing_tag(before, after), None, "{before}");
         }
+        // A closing tag already there, further down, is the one: no second one is written.
+        assert_eq!(
+            closing_tag("<html>\n<body", "\n<p>a</p>\n</body>\n</html>"),
+            None
+        );
+        assert_eq!(closing_tag("<BODY", "\n</body>"), None);
+        // One that closes an element opened before is not for this tag.
+        assert_eq!(
+            closing_tag("<div>\n  <div", "\n</div>").as_deref(),
+            Some("</div>")
+        );
+        assert_eq!(closing_tag("<div>\n  <div", "\n  </div>\n</div>"), None);
+        // Nor is one that closes an element opened after it.
+        assert_eq!(closing_tag("<p", "<p>a</p>").as_deref(), Some("</p>"));
+        // A name that only starts the same is another element.
+        assert_eq!(closing_tag("<b", "</body>").as_deref(), Some("</b>"));
+    }
+
+    #[test]
+    fn the_element_still_open_is_found() {
+        let text = "<html>\n  <body>\n    <p>a <b>b</b><br></p>\n    <img src=\"x\" />\n    ";
+        assert_eq!(unclosed_tag(text), Some(("body".to_owned(), 9)));
+        assert_eq!(unclosed_tag("<ul><li>a"), Some(("li".to_owned(), 4)));
+        // A closing tag closes what was left open inside its element too.
+        assert_eq!(unclosed_tag("<ul><li>a</ul>"), None);
+        assert_eq!(unclosed_tag("<!doctype html>\n"), None);
+        assert_eq!(unclosed_tag("<div"), None);
     }
 
     #[test]

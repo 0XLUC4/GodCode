@@ -26,9 +26,24 @@ fn is_blank(line: &str) -> bool {
     line.trim().is_empty()
 }
 
+/// The name of the element a line ends by opening: `<div class="a">`, not `</div>`,
+/// `<br>` or `<img />`, which hold nothing.
+fn opened_tag(line: &str) -> Option<&str> {
+    let inside = line.trim_end().strip_suffix('>')?;
+    let tag = &inside[inside.rfind('<')? + 1..];
+    if tag.contains('>') || tag.ends_with('/') || tag.starts_with(['/', '!', '?']) {
+        return None;
+    }
+    let named = |ch: char| ch.is_alphanumeric() || matches!(ch, '-' | ':' | '.');
+    let name = tag.split(|ch| !named(ch)).next()?;
+    let void = crate::format::VOID_TAGS.contains(&name.to_ascii_lowercase().as_str());
+    (!name.is_empty() && !void).then_some(name)
+}
+
 /// Break the line at the selection, keeping the indent of the line and adding one level
-/// after an opening bracket or a colon. Returns the caret.
-pub fn newline(text: &mut String, selection: Range<usize>, unit: &str) -> usize {
+/// after an opening bracket or a colon, and in `markup` after a tag that opens an element.
+/// Returns the caret.
+pub fn newline(text: &mut String, selection: Range<usize>, unit: &str, markup: bool) -> usize {
     let start = byte_index(text, selection.start);
     let end = byte_index(text, selection.end);
     let line = &text[line_start(text, start)..start];
@@ -38,16 +53,28 @@ pub fn newline(text: &mut String, selection: Range<usize>, unit: &str) -> usize 
         .collect();
     let before = line.trim_end().chars().next_back();
     let after = text[end..].chars().next();
+    let element = markup.then(|| opened_tag(line)).flatten();
     let mut inserted = format!("\n{lead}");
-    if matches!(before, Some('{' | '[' | '(' | ':')) {
+    if matches!(before, Some('{' | '[' | '(' | ':')) || element.is_some() {
         inserted.push_str(unit);
     }
     let caret = selection.start + inserted.chars().count();
-    // Between a pair of brackets the closing one goes on its own line.
-    if matches!(
-        (before, after),
-        (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
-    ) {
+    // Between a pair of brackets, or the two tags of an element, what closes goes on its
+    // own line.
+    let closed_here = element.is_some_and(|name| {
+        let closing = text[end..].strip_prefix("</");
+        closing.is_some_and(|rest| {
+            rest.get(..name.len())
+                .is_some_and(|found| found.eq_ignore_ascii_case(name))
+                && rest[name.len()..].starts_with('>')
+        })
+    });
+    if closed_here
+        || matches!(
+            (before, after),
+            (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+        )
+    {
         inserted.push('\n');
         inserted.push_str(&lead);
     }
@@ -330,7 +357,7 @@ mod tests {
     #[test]
     fn a_new_line_keeps_the_indent() {
         let mut text = "    let a = 1;".to_owned();
-        let caret = newline(&mut text, 14..14, "    ");
+        let caret = newline(&mut text, 14..14, "    ", false);
         assert_eq!(text, "    let a = 1;\n    ");
         assert_eq!(caret, 19);
     }
@@ -338,13 +365,43 @@ mod tests {
     #[test]
     fn a_new_line_after_a_bracket_indents_and_splits_the_pair() {
         let mut text = "fn main() {}".to_owned();
-        let caret = newline(&mut text, 11..11, "    ");
+        let caret = newline(&mut text, 11..11, "    ", false);
         assert_eq!(text, "fn main() {\n    \n}");
         assert_eq!(caret, 16);
 
         let mut text = "if ok:".to_owned();
-        newline(&mut text, 6..6, "  ");
+        newline(&mut text, 6..6, "  ", false);
         assert_eq!(text, "if ok:\n  ");
+    }
+
+    #[test]
+    fn a_new_line_after_a_tag_indents_and_splits_the_element() {
+        let broken = |text: &str, at: usize| {
+            let mut text = text.to_owned();
+            let caret = newline(&mut text, at..at, "  ", true);
+            (text, caret)
+        };
+        // Between the two tags of an element: the closing one goes under the opening one.
+        assert_eq!(
+            broken("<body></body>", 6),
+            ("<body>\n  \n</body>".to_owned(), 9)
+        );
+        assert_eq!(
+            broken("  <div class=\"a\"></DIV>", 17),
+            ("  <div class=\"a\">\n    \n  </DIV>".to_owned(), 22)
+        );
+        // After a tag that opens, one level deeper; after any other, the same level.
+        assert_eq!(broken("<ul>", 4), ("<ul>\n  ".to_owned(), 7));
+        assert_eq!(broken("<ul><li>a</li>", 14).0, "<ul><li>a</li>\n");
+        assert_eq!(broken("  <br>", 6).0, "  <br>\n  ");
+        assert_eq!(broken("<img src=\"a\" />", 16).0, "<img src=\"a\" />\n");
+        assert_eq!(broken("<!doctype html>", 15).0, "<!doctype html>\n");
+        // What holds another element still splits from its own closing tag only.
+        assert_eq!(broken("<p></b>", 3).0, "<p>\n  </b>");
+        // In code a `>` ends no tag.
+        let mut code = "let a: Vec<String>".to_owned();
+        newline(&mut code, 18..18, "    ", false);
+        assert_eq!(code, "let a: Vec<String>\n");
     }
 
     #[test]
