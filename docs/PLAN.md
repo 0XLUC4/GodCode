@@ -247,7 +247,10 @@ Command…` les liste. Ils tournent enfermés : aucun import ne leur est donné 
 horloge), calcul et mémoire (64 Mo) sont bornés, chaque lancement repart de zéro. L'interface à écrire est
 décrite en tête de `plugins.rs`, avec un exemple. Passe par `wasmi`, interpréteur en Rust pur : la seconde
 dépendance de ce poids après `wry`.
-Reste : des plugins qui font plus que transformer du texte (panneaux, touches, accès au projet).
+Une commande de plugin peut aussi insérer au curseur, montrer son résultat dans une fenêtre, ou l'ouvrir
+comme nouveau fichier ; demander un raccourci (ceux de l'éditeur gardent la priorité) ; et lire les fichiers
+du projet, en lecture seule, confinée au dossier ouvert (ni `..`, ni chemin absolu, ni `.git`), avec des
+plafonds. Un plugin qui lit le projet demande l'accord au premier lancement, gardé ensuite.
 
 ### Phase 8 — IA (✅ livré, jamais essayé avec un vrai modèle)
 

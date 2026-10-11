@@ -1746,6 +1746,11 @@ pub struct GodApp {
     /// one chosen, while they are picked from.
     plugins: Vec<crate::plugins::Plugin>,
     plugin_pick: Option<(String, usize)>,
+    /// The plugins let read the project, by name; the command of one that is not yet,
+    /// waiting for a yes; and what a command gave to show, under its name.
+    plugins_allowed: std::collections::HashSet<String>,
+    plugin_asked: Option<(usize, usize)>,
+    plugin_shown: Option<(String, String)>,
     /// The servers that lend tools to the assistant, once started; and their tools,
     /// each with the name the model knows it by and the place of its server here.
     mcp: Vec<crate::mcp::Server>,
@@ -2005,6 +2010,13 @@ impl GodApp {
             // One that cannot be read is told when they are next reloaded.
             plugins: load_plugins().0,
             plugin_pick: None,
+            plugins_allowed: get("plugins_allowed")
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            plugin_asked: None,
+            plugin_shown: None,
             mcp: Vec::new(),
             mcp_tools: Vec::new(),
             mcp_started: false,
@@ -4562,7 +4574,16 @@ impl GodApp {
         let mut offered = Vec::new();
         for (plugin, loaded) in self.plugins.iter().enumerate() {
             for (command, name) in loaded.commands().iter().enumerate() {
-                let row = format!("{}: {name}", loaded.name());
+                let keys = loaded.keys(command).map(ToString::to_string);
+                let keys = keys.map_or_else(String::new, |keys| format!("      {keys}"));
+                // What it does with what it gives, when that is not to replace the text.
+                let does = match loaded.kind(command) {
+                    crate::plugins::Kind::Replace => "",
+                    crate::plugins::Kind::Insert => "  (inserts)",
+                    crate::plugins::Kind::Show => "  (shows)",
+                    crate::plugins::Kind::Open => "  (new file)",
+                };
+                let row = format!("{}: {name}{does}{keys}", loaded.name());
                 if row.to_lowercase().contains(&wanted) {
                     offered.push((plugin, command, row));
                 }
@@ -4583,30 +4604,167 @@ impl GodApp {
         let Some((plugin, command, _)) = picked.and_then(|row| offered.get(row)) else {
             return;
         };
-        let (Some(loaded), Some(tab)) = (self.plugins.get(*plugin), self.tabs.get_mut(self.active))
-        else {
+        let (plugin, command) = (*plugin, *command);
+        self.run_plugin(ctx, plugin, command);
+    }
+
+    /// Run the command `command` of the plugin `plugin` on what is selected in the file
+    /// in front, or on all of it; what it gives replaces that text, is put in at the
+    /// caret, shown, or opened as a new file, as the command says. A plugin that reads
+    /// the project is asked about the first time.
+    fn run_plugin(&mut self, ctx: &Context, plugin: usize, command: usize) {
+        use crate::plugins::Kind;
+        let Some(loaded) = self.plugins.get(plugin) else {
             return;
         };
-        let (start, end) = (tab.selection.start, tab.selection.end);
+        if loaded.reads_project() && !self.plugins_allowed.contains(loaded.name()) {
+            self.plugin_asked = Some((plugin, command));
+            return;
+        }
+        let root = self.folder();
+        let front = self.tabs.get(self.active);
+        let text = front.map_or("", |tab| tab.text.as_str());
+        let (start, end) = front.map_or((0, 0), |tab| (tab.selection.start, tab.selection.end));
         let chars = start.min(end)..start.max(end);
         let bytes = match chars.is_empty() {
-            true => 0..tab.text.len(),
+            true => 0..text.len(),
             false => {
-                let place = |at| godcode_core::byte_index(&tab.text, at);
+                let place = |at| godcode_core::byte_index(text, at);
                 place(chars.start)..place(chars.end)
             }
         };
+        let (line, column) = godcode_core::line_col(text, end);
+        let context = crate::plugins::Context {
+            file: front.map(|tab| tab.name.as_str()),
+            language: front.map_or("", |tab| tab.language.name),
+            line,
+            column,
+            selection: !chars.is_empty(),
+            root: root.as_deref(),
+        };
+        let named = loaded.commands().get(command).cloned().unwrap_or_default();
+        let title = format!("{}: {named}", loaded.name());
         // Shut in and stopped when it runs too long: a few seconds at the very most.
-        match loaded.run(*command, &tab.text[bytes.clone()]) {
-            Ok(written) => {
-                let end = chars.start + written.chars().count();
-                tab.text.replace_range(bytes, &written);
+        let outcome = match loaded.run_in(command, &text[bytes.clone()], &context) {
+            Ok(outcome) => outcome,
+            Err(why) => {
+                self.toasts.error(why);
+                return;
+            }
+        };
+        match (outcome.kind, self.tabs.get_mut(self.active)) {
+            (Kind::Replace, Some(tab)) => {
+                let until = chars.start + outcome.text.chars().count();
+                tab.text.replace_range(bytes, &outcome.text);
                 tab.touched();
                 if !chars.is_empty() {
-                    tab.select(ctx, chars.start..end);
+                    tab.select(ctx, chars.start..until);
                 }
             }
-            Err(why) => self.toasts.error(why),
+            (Kind::Insert, Some(tab)) => {
+                let at = godcode_core::byte_index(&tab.text, end);
+                tab.text.insert_str(at, &outcome.text);
+                tab.touched();
+            }
+            (Kind::Replace | Kind::Insert, None) => {
+                self.toasts.error("There is no file to write in");
+            }
+            // Shown with what the plugin wrote down as it went.
+            (Kind::Show, _) => {
+                let mut said = outcome.text;
+                for line in &outcome.log {
+                    said.push('\n');
+                    said.push_str(line);
+                }
+                self.plugin_shown = Some((title, said));
+            }
+            (Kind::Open, _) => {
+                self.new_file();
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.text = outcome.text;
+                    tab.touched();
+                }
+            }
+        }
+    }
+
+    /// The shortcuts the plugins ask for: seen after those of the editor, which keep
+    /// theirs.
+    fn plugin_keys(&mut self, ctx: &Context) {
+        let mut pressed = None;
+        for (plugin, loaded) in self.plugins.iter().enumerate() {
+            for command in 0..loaded.commands().len() {
+                let keys = loaded.keys(command).map(ToString::to_string);
+                let Some((modifiers, key)) = keys.as_deref().and_then(parse_shortcut) else {
+                    continue;
+                };
+                if ctx.input_mut(|input| input.consume_key(modifiers, key)) {
+                    pressed = Some((plugin, command));
+                }
+            }
+        }
+        if let Some((plugin, command)) = pressed {
+            self.run_plugin(ctx, plugin, command);
+        }
+    }
+
+    /// A plugin that reads the files of the project is let do it, or not, the first time
+    /// one of its commands is run.
+    fn plugin_consent(&mut self, ctx: &Context) {
+        let Some((plugin, command)) = self.plugin_asked else {
+            return;
+        };
+        let Some(name) = self
+            .plugins
+            .get(plugin)
+            .map(|loaded| loaded.name().to_owned())
+        else {
+            self.plugin_asked = None;
+            return;
+        };
+        let (mut allow, mut refuse) = (false, false);
+        let response = Modal::new(Id::new("plugin-consent")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Let this plugin read the project?");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "{name} asks to read the files of the open folder. It cannot write, reach the \
+                 network, nor read outside the folder or in .git."
+            ));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                allow = ui.button("Allow").clicked();
+                refuse = ui.button("Cancel").clicked();
+            });
+        });
+        if allow {
+            self.plugins_allowed.insert(name);
+            self.plugin_asked = None;
+            self.run_plugin(ctx, plugin, command);
+        } else if refuse || response.should_close() {
+            self.plugin_asked = None;
+        }
+    }
+
+    /// What a command of a plugin gave to show.
+    fn plugin_window(&mut self, ctx: &Context) {
+        let Some((title, said)) = &self.plugin_shown else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(title.as_str())
+            .id(Id::new("plugin-window"))
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_size(vec2(760.0, 480.0))
+            .show(ctx, |ui| {
+                ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    let text = RichText::new(said).monospace().size(13.0);
+                    ui.add(egui::Label::new(text).selectable(true).extend());
+                });
+            });
+        if !open {
+            self.plugin_shown = None;
         }
     }
 
@@ -10052,6 +10210,7 @@ impl eframe::App for GodApp {
         let mut clicked = std::mem::take(&mut self.pending);
         self.poll();
         self.shortcuts(&ctx, &mut clicked);
+        self.plugin_keys(&ctx);
         self.guard_close(&ctx);
         self.update_title(&ctx);
         self.refresh_find();
@@ -10223,6 +10382,8 @@ impl eframe::App for GodApp {
         self.docker_window(&ctx);
         self.postgres_window(&ctx);
         self.plugins_dialog(&ctx);
+        self.plugin_consent(&ctx);
+        self.plugin_window(&ctx);
         self.merge_window(&ctx);
         self.database_window(&ctx);
         self.log_dialog(&ctx);
@@ -10240,6 +10401,8 @@ impl eframe::App for GodApp {
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
         storage.set_string("layouts", layouts_text(&self.layouts));
+        let allowed: Vec<&str> = self.plugins_allowed.iter().map(String::as_str).collect();
+        storage.set_string("plugins_allowed", allowed.join("\n"));
         storage.set_string("auto_suggest", flag(self.auto_suggest));
         storage.set_string("assistant_provider", self.chat.provider.name().to_owned());
         storage.set_string("assistant_model", self.chat.model.clone());

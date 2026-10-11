@@ -403,7 +403,6 @@ impl Kind {
 }
 
 /// A shortcut a plugin asks for: the keys held, and the key, in capitals (`U`, `7`, `F9`).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keys {
     pub ctrl: bool,
@@ -476,7 +475,6 @@ pub struct Context<'a> {
 }
 
 /// What a command gave back, and what the editor is to do with it.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
     pub kind: Kind,
@@ -582,26 +580,24 @@ impl Plugin {
     }
 
     /// What is done with the text the command at `index` gives back.
-    #[allow(dead_code)]
     pub fn kind(&self, index: usize) -> Kind {
         self.kinds.get(index).copied().unwrap_or(Kind::Replace)
     }
 
     /// The shortcut the command at `index` asks for, when it asks for one.
-    #[allow(dead_code)]
     pub fn keys(&self, index: usize) -> Option<&Keys> {
         self.keys.get(index)?.as_ref()
     }
 
     /// Whether it may read the files of the project it is run in: to be told to the user
     /// before its first run.
-    #[allow(dead_code)]
     pub fn reads_project(&self) -> bool {
         self.reads
     }
 
     /// Run the command at `index` on `text`: the text it gives back, or why it failed.
     /// It is told nothing of where it runs, and reads no project.
+    #[allow(dead_code)]
     pub fn run(&self, index: usize, text: &str) -> Result<String, String> {
         self.run_in(index, text, &Context::default())
             .map(|outcome| outcome.text)
