@@ -18,6 +18,7 @@ pub mod merge;
 pub mod modal;
 pub mod outline;
 pub mod search;
+pub mod sql;
 pub mod sqlite;
 pub mod syntax;
 
