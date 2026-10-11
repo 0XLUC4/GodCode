@@ -134,6 +134,14 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Entrée, Tab, Maj+Tab, commenter, dupliquer / supprimer / déplacer une ligne, fermeture auto des crochets : ne lisent plus que les lignes autour du curseur (≈20–35 ms → ≈2 ms à 40 Mo pour leur part) | ✅ |
 | Gros fichiers, ce qui reste lié à la taille : dans un fichier coloré le champ relit encore le texte à chaque frappe (≈26 ms à 2 Mo) ; dans un texte brut de 40 Mo, Entrée et Tab coûtent ≈40 ms car le champ relit le texte après une touche traitée par l'éditeur ; les touches Vim relisent tout le texte. Une corde ou un tampon à trou à la place de la `String` n'est pas fait | ⏳ |
 
+Aides à l'écriture : `Ctrl+X` / `Ctrl+C` sans sélection prennent la ligne ; une parenthèse ou un guillemet tapé
+sur une sélection l'entoure ; un fermant déjà là est enjambé ; Retour arrière entre une paire vide enlève
+les deux, et dans l'indentation recule d'un niveau ; `Ctrl+Entrée` / `Ctrl+Maj+Entrée` ouvrent une ligne
+dessous / dessus ; `Alt+J` sélectionne le mot ; un bloc collé prend l'indentation de sa ligne, une ligne
+entière collée va au-dessus ; Entrée continue un commentaire `///` ou `/* */` et ne laisse pas d'espaces
+sur une ligne vide ; dans la liste de complétion, Entrée accepte comme Tab, Échap ferme, les lettres
+trouvées ressortent, un snippet montre ce qu'il écrit.
+
 ### Phase 4 — exécution, tests, débogage (✅)
 
 | Fonction | État |

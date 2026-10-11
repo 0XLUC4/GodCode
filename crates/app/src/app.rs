@@ -703,14 +703,24 @@ const COMMANDS: &[Spec] = &[
 ];
 
 /// Keys of the editor that are not commands, for the shortcut list.
-const EDITOR_KEYS: [(&str, &str); 10] = [
+const EDITOR_KEYS: [(&str, &str); 17] = [
     ("Select a rectangle of text", "Alt+Shift+Drag"),
     ("Grow the rectangle", "Ctrl+Alt+Shift+Arrows"),
     ("Go to the declaration of a name", "Ctrl+Click"),
     ("Search everywhere", "Ctrl+P"),
     ("Close the tag being typed", ">"),
-    ("Accept the completion", "Tab"),
-    ("Move in the completions", "Up / Down"),
+    ("Accept the completion", "Tab / Enter"),
+    ("Move in the completions", "Up / Down / Page Up / Page Down"),
+    (
+        "Cut or copy the line, with nothing selected",
+        "Ctrl+X / Ctrl+C",
+    ),
+    ("Open a line below, above", "Ctrl+Enter / Ctrl+Shift+Enter"),
+    ("Select the word at the caret", "Alt+J"),
+    ("Put the selection in brackets or quotes", "( [ { \" '"),
+    ("First letter of the line, then its start", "Home"),
+    ("Back one level of indent, in the indent", "Backspace"),
+    ("Close a tab", "Middle click"),
     ("Close the completions or the find bar", "Esc"),
     ("New line, indented like the code", "Enter"),
     ("Previous commands, in the terminal", "Up / Down"),

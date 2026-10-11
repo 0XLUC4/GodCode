@@ -1171,11 +1171,19 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
         } else if pressed(Modifiers::NONE, Key::PageUp) {
             popup.selected = popup.selected.saturating_sub(POPUP_ROWS);
             popup.navigated = true;
-        } else if pressed(Modifiers::NONE, Key::Tab)
-            || (popup.navigated && pressed(Modifiers::NONE, Key::Enter))
-        {
-            accept(ui.ctx(), id, text, config, view);
-            return true;
+        } else {
+            // Enter picks as Tab does, unless the one in front is the very word typed
+            // and writes nothing more: the line is then broken.
+            let chosen = popup.items.get(popup.selected);
+            let start = complete::word_start(text, popup.caret);
+            let at = godcode_core::byte_index(text, popup.caret);
+            let typed = &text[godcode_core::byte_index(text, start)..at];
+            let more = chosen.is_some_and(|item| item.body != typed);
+            let enter = (popup.navigated || more) && pressed(Modifiers::NONE, Key::Enter);
+            if enter || pressed(Modifiers::NONE, Key::Tab) {
+                accept(ui.ctx(), id, text, config, view);
+                return true;
+            }
         }
     }
     if pair(ui, id, text, config) {
@@ -2575,13 +2583,17 @@ mod tests {
         assert_eq!(harness.text, "let counter = 0;\ncounter");
         assert!(harness.view.completion.is_none());
 
-        // Without the arrows, Enter breaks the line instead of picking.
+        // Enter picks too, as in other editors.
         harness.type_text(" ");
         for ch in ["c", "o", "u"] {
             harness.type_text(ch);
         }
         harness.key(Key::Enter, Modifiers::NONE);
-        assert_eq!(harness.text, "let counter = 0;\ncounter cou\n");
+        assert_eq!(harness.text, "let counter = 0;\ncounter counter");
+        assert!(harness.view.completion.is_none());
+        // With nothing on offer it breaks the line, as ever.
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "let counter = 0;\ncounter counter\n");
     }
 
     #[test]
