@@ -206,7 +206,9 @@ mode Zen (`Ctrl+Alt+Z`). `Editor Font…` choisit le fichier de police (.ttf, .o
 Thèmes de l'utilisateur : `Edit My Themes` ouvre `themes.json` (exemple commenté écrit la première fois) ;
 chaque thème y donne son nom, sombre ou clair, les couleurs qu'il change (le reste vient de GodCode
 Dark/Light) ; enregistré, il est relu, listé dans `Color Theme…` et appliqué s'il est en cours.
-Reste : dispositions enregistrables,
+Dispositions : `Save Layout…` garde sous un nom ce qui se montre (panneau de côté, panneau du bas,
+minimap, sticky scroll, zen), `Layout…` en remet une ; gardées d'une session à l'autre.
+Reste :
 langues d'interface ;
 API de plugins (WASM isolé) une fois le cœur stable.
 

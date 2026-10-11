@@ -166,6 +166,8 @@ enum Cmd {
     Font,
     FontReset,
     Zen,
+    SaveLayout,
+    Layouts,
     CaretAbove,
     CaretBelow,
     Tasks,
@@ -561,6 +563,8 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::Font, icon::PALETTE, "Editor Font…", ""),
     spec(Cmd::FontReset, icon::PALETTE, "Reset Editor Font", ""),
     spec(Cmd::Zen, icon::EYE, "Toggle Zen Mode", "Ctrl+Alt+Z"),
+    spec(Cmd::SaveLayout, icon::ROWS, "Save Layout…", ""),
+    spec(Cmd::Layouts, icon::ROWS, "Layout…", ""),
     spec(
         Cmd::CaretAbove,
         icon::ARROW_UP,
@@ -758,6 +762,8 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::SplitDown),
             Some(Cmd::SplitSame),
             Some(Cmd::Zen),
+            Some(Cmd::Layouts),
+            Some(Cmd::SaveLayout),
             Some(Cmd::Themes),
             Some(Cmd::Font),
             Some(Cmd::FontReset),
@@ -1086,7 +1092,7 @@ impl Tab {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
     Explorer,
     Search,
@@ -1095,7 +1101,7 @@ enum Side {
 }
 
 /// What the panel under the editor shows.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bottom {
     Problems,
     Todo,
@@ -1172,6 +1178,8 @@ enum PromptKind {
     /// The value to give the variable of this name of the program being debugged: a part
     /// of the variable with this reference, or a variable of the call looked at.
     Value(Option<u64>, String),
+    /// The name to keep the layout on show under.
+    Layout,
 }
 
 /// A question about a file of the tree.
@@ -1517,6 +1525,9 @@ pub struct GodApp {
     diff: Option<(String, Vec<git::Row>)>,
     /// The file whose conflicts are being settled side by side.
     merging: Option<Merging>,
+    /// The layouts kept under a name; and the one chosen while they are picked from.
+    layouts: Vec<Arrangement>,
+    layout_pick: Option<usize>,
     /// The database being looked into.
     database: Option<Browsing>,
     /// Who last changed each line shows after the line of the caret.
@@ -1738,6 +1749,8 @@ impl GodApp {
             zen: false,
             tasks: None,
             merging: None,
+            layouts: layouts_of(&get("layouts").unwrap_or_default()),
+            layout_pick: None,
             database: None,
             last_task: None,
             log: None,
@@ -4014,6 +4027,49 @@ impl GodApp {
         }
     }
 
+    /// Keep the layout on show under `name`, in place of the one that had that name.
+    fn save_layout(&mut self, name: &str) {
+        if name.is_empty() || name.contains(['\t', '\n']) {
+            self.toasts.error("A layout needs a name on one line");
+            return;
+        }
+        let layout = Arrangement {
+            name: name.to_owned(),
+            side: self.side,
+            sidebar: self.sidebar,
+            bottom: self.bottom,
+            minimap: self.minimap,
+            sticky: self.sticky,
+            zen: self.zen,
+        };
+        self.layouts.retain(|kept| kept.name != name);
+        self.layouts.push(layout);
+        self.toasts.success(format!("Layout kept: {name}"));
+    }
+
+    /// The layouts kept: the one picked is put on show.
+    fn layouts_dialog(&mut self, ctx: &Context) {
+        let Some(mut selected) = self.layout_pick.take() else {
+            return;
+        };
+        let rows: Vec<String> = self.layouts.iter().map(|kept| kept.name.clone()).collect();
+        let answer = list_dialog(ctx, "Layout", &rows, &mut selected, None);
+        let Some(picked) = answer else {
+            self.layout_pick = Some(selected);
+            return;
+        };
+        let Some(layout) = picked.and_then(|row| self.layouts.get(row)).cloned() else {
+            return;
+        };
+        (self.side, self.sidebar) = (layout.side, layout.sidebar);
+        (self.minimap, self.sticky, self.zen) = (layout.minimap, layout.sticky, layout.zen);
+        match layout.bottom {
+            // A terminal is started when none runs.
+            Some(Bottom::Terminal) => self.show_terminal(ctx),
+            bottom => self.bottom = bottom,
+        }
+    }
+
     /// The environments to fill the requests with: pick one, or none.
     fn environments_dialog(&mut self, ctx: &Context) {
         let Some((rows, mut selected)) = self.environments.take() else {
@@ -5748,6 +5804,19 @@ impl GodApp {
                 self.toasts.success("Code is drawn with the built-in font");
             }
             Cmd::Zen => self.zen = !self.zen,
+            Cmd::SaveLayout => {
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Layout,
+                    name: String::new(),
+                    focus: true,
+                });
+            }
+            Cmd::Layouts => match self.layouts.is_empty() {
+                true => self
+                    .toasts
+                    .error("No layout kept yet: Save Layout… keeps the one on show"),
+                false => self.layout_pick = Some(0),
+            },
             Cmd::CaretAbove => self.add_caret(false),
             Cmd::CaretBelow => self.add_caret(true),
             Cmd::Tasks => {
@@ -7846,6 +7915,7 @@ impl GodApp {
             PromptKind::Word(_) => ("Rename all occurrences", "Rename"),
             PromptKind::Condition(_) => ("Stop here when… (empty: always)", "Set"),
             PromptKind::Value(..) => ("New value", "Set"),
+            PromptKind::Layout => ("Save this layout as", "Save"),
             PromptKind::Delete(_) => ("Delete", "Move to recycle bin"),
         };
         let mut confirmed = false;
@@ -7883,6 +7953,8 @@ impl GodApp {
             if let Some(session) = &mut self.debug {
                 session.set(*inside, name, prompt.name.trim());
             }
+        } else if confirmed && matches!(prompt.kind, PromptKind::Layout) {
+            self.save_layout(prompt.name.trim());
         } else if confirmed {
             match self.file_operation(ctx, &prompt) {
                 Ok(created) => {
@@ -7913,7 +7985,10 @@ impl GodApp {
                 .all(|part| matches!(part, Component::Normal(_)));
         match &prompt.kind {
             // Nothing on disk: the caller renames in the text, or tells the debugger.
-            PromptKind::Word(_) | PromptKind::Condition(_) | PromptKind::Value(..) => Ok(None),
+            PromptKind::Word(_)
+            | PromptKind::Condition(_)
+            | PromptKind::Value(..)
+            | PromptKind::Layout => Ok(None),
             PromptKind::Delete(path) => {
                 trash::delete(path).map_err(|err| format!("Cannot delete {name}: {err}"))?;
                 // Unchanged editors of what is gone close; edited ones keep their text.
@@ -8227,6 +8302,7 @@ impl eframe::App for GodApp {
         self.themes_dialog(&ctx);
         self.tasks_dialog(&ctx);
         self.environments_dialog(&ctx);
+        self.layouts_dialog(&ctx);
         self.merge_window(&ctx);
         self.database_window(&ctx);
         self.log_dialog(&ctx);
@@ -8243,6 +8319,7 @@ impl eframe::App for GodApp {
         storage.set_string("minimap", flag(self.minimap));
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
+        storage.set_string("layouts", layouts_text(&self.layouts));
         storage.set_string("environment", self.environment.clone().unwrap_or_default());
         let watched: Vec<&str> = self
             .watches
@@ -8360,6 +8437,74 @@ struct Merging {
     parts: Vec<godcode_core::merge::Part>,
     /// What was chosen for each conflict, in their order.
     choices: Vec<Option<godcode_core::merge::Choice>>,
+}
+
+/// What can show beside the editor and under it, in the order layouts are written with.
+const SIDES: [Side; 4] = [Side::Explorer, Side::Search, Side::Git, Side::Structure];
+const BOTTOMS: [Bottom; 6] = [
+    Bottom::Problems,
+    Bottom::Todo,
+    Bottom::Response,
+    Bottom::Debug,
+    Bottom::Tests,
+    Bottom::Terminal,
+];
+
+/// How the window is laid out, kept under a name: what shows beside the editor and under
+/// it, and what is drawn over the code.
+#[derive(Clone, Debug, PartialEq)]
+struct Arrangement {
+    name: String,
+    side: Side,
+    sidebar: bool,
+    bottom: Option<Bottom>,
+    minimap: bool,
+    sticky: bool,
+    zen: bool,
+}
+
+/// The layouts as they are kept between sessions: one per line, its name then what it
+/// shows, tabs between them.
+fn layouts_text(layouts: &[Arrangement]) -> String {
+    let place = |wanted: Bottom| BOTTOMS.iter().position(|bottom| *bottom == wanted);
+    let lines = layouts.iter().map(|layout| {
+        let side = SIDES.iter().position(|side| *side == layout.side);
+        let bottom = layout.bottom.and_then(place);
+        let bottom = bottom.map_or_else(|| "-".to_owned(), |bottom| bottom.to_string());
+        let flags = [layout.sidebar, layout.minimap, layout.sticky, layout.zen].map(u8::from);
+        let [sidebar, minimap, sticky, zen] = flags;
+        let side = side.unwrap_or(0);
+        format!(
+            "{}\t{side}\t{sidebar}\t{bottom}\t{minimap}\t{sticky}\t{zen}",
+            layout.name
+        )
+    });
+    lines.collect::<Vec<_>>().join("\n")
+}
+
+/// The reverse of [`layouts_text`]. What cannot be read is left out.
+fn layouts_of(text: &str) -> Vec<Arrangement> {
+    let read = |line: &str| {
+        let mut parts = line.split('\t');
+        let name = parts.next().filter(|name| !name.is_empty())?.to_owned();
+        let side = *SIDES.get(parts.next()?.parse::<usize>().ok()?)?;
+        let sidebar = parts.next()? == "1";
+        let bottom = match parts.next()? {
+            "-" => None,
+            place => Some(*BOTTOMS.get(place.parse::<usize>().ok()?)?),
+        };
+        let mut on = || Some(parts.next()? == "1");
+        Some(Arrangement {
+            name,
+            side,
+            sidebar,
+            bottom,
+            minimap: on()?,
+            sticky: on()?,
+            zen: on()?,
+        })
+    };
+    text.lines().filter_map(read).collect()
 }
 
 /// How many requests are kept with what they answered.
@@ -8840,6 +8985,29 @@ mod tests {
 
     #[test]
     fn folded_blocks_are_written_and_read_back() {
+        let layouts = vec![
+            Arrangement {
+                name: "Debugging".to_owned(),
+                side: Side::Structure,
+                sidebar: true,
+                bottom: Some(Bottom::Debug),
+                minimap: false,
+                sticky: true,
+                zen: false,
+            },
+            Arrangement {
+                name: "Writing".to_owned(),
+                side: Side::Explorer,
+                sidebar: false,
+                bottom: None,
+                minimap: true,
+                sticky: false,
+                zen: true,
+            },
+        ];
+        assert_eq!(layouts_of(&layouts_text(&layouts)), layouts);
+        // A line that is not a layout is left out.
+        assert!(layouts_of("only a name\nx\t9\t1\t-\t1\t1\t1\n").is_empty());
         let mut folds = std::collections::HashMap::new();
         folds.insert(PathBuf::from("C:/code/a b.rs"), vec![3, 12]);
         let text = folds_text(&folds);
