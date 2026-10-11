@@ -10616,9 +10616,13 @@ fn doc_tab(
         .put(close_rect, widgets::icon_widget(glyph, 13.0))
         .on_hover_text(tip);
     let response = response.on_hover_text(title);
+    // The wheel pressed on a tab closes it: seen as it is let go over the tab, whatever
+    // else took the press for itself.
+    let wheel = ui.input(|input| input.pointer.button_released(egui::PointerButton::Middle));
+    let wheel = wheel && ui.rect_contains_pointer(rect);
     (
         response.clicked(),
-        close.clicked() || response.middle_clicked(),
+        close.clicked() || response.middle_clicked() || wheel,
         response,
     )
 }

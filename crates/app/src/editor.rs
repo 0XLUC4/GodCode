@@ -150,14 +150,20 @@ impl View {
 
     /// Show `items` as the completions at `caret`: what a language server answered.
     pub fn offer(&mut self, caret: usize, items: Vec<Completion>) {
-        if !items.is_empty() {
-            self.completion = Some(Popup {
-                items,
-                selected: 0,
-                caret,
-                navigated: false,
-            });
+        if items.is_empty() {
+            return;
         }
+        // The snippets on offer there stay, first: the server knows names, not structures.
+        let shown = self.completion.take().filter(|popup| popup.caret == caret);
+        let kept = shown.into_iter().flat_map(|popup| popup.items);
+        let mut all: Vec<Completion> = kept.filter(|item| item.kind == Kind::Snippet).collect();
+        all.extend(items);
+        self.completion = Some(Popup {
+            items: all,
+            selected: 0,
+            caret,
+            navigated: false,
+        });
     }
 
     /// A view that takes the keyboard as soon as it shows.
@@ -1922,6 +1928,31 @@ mod tests {
         harness.frame(Vec::new());
         harness.key(Key::Tab, Modifiers::NONE);
         assert!(!harness.text.contains('<'), "{}", harness.text);
+    }
+
+    #[test]
+    fn a_word_typed_whole_then_tab_writes_the_structure_it_names() {
+        // In Rust, the file of `Harness::new`.
+        let mut harness = Harness::new("");
+        harness.frame(Vec::new());
+        for letter in ["m", "a", "i", "n"] {
+            harness.type_text(letter);
+        }
+        assert_eq!(harness.text, "main");
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert!(harness.text.starts_with("fn main() {"), "{}", harness.text);
+        assert!(harness.text.ends_with('}'), "{}", harness.text);
+        // The caret waits inside the function, on its own indented line.
+        let caret = out.selection.map(|selection| selection.start);
+        assert_eq!(
+            caret,
+            Some(
+                "fn main() {
+    "
+                .chars()
+                .count()
+            )
+        );
     }
 
     #[test]

@@ -32,7 +32,20 @@ type Snippets = &'static [(&'static str, &'static str)];
 const C_LIKE: Snippets = &[
     ("for", "for (int i = 0; i < $0; i++) {\n\t\n}"),
     ("if", "if ($0) {\n\t\n}"),
+    ("ifelse", "if ($0) {\n\t\n} else {\n\t\n}"),
     ("while", "while ($0) {\n\t\n}"),
+    ("dowhile", "do {\n\t\n} while ($0);"),
+    (
+        "switch",
+        "switch ($0) {\n\tcase :\n\t\tbreak;\n\tdefault:\n\t\tbreak;\n}",
+    ),
+];
+
+/// What TypeScript has that JavaScript has not.
+const TYPED: Snippets = &[
+    ("interface", "interface $0 {\n\t\n}"),
+    ("type", "type $0 = ;"),
+    ("enum", "enum $0 {\n\t\n}"),
 ];
 
 const SCRIPT: Snippets = &[
@@ -43,6 +56,25 @@ const SCRIPT: Snippets = &[
     ("class", "class $0 {\n\tconstructor() {\n\t\t\n\t}\n}"),
     ("log", "console.log($0);"),
     ("try", "try {\n\t$0\n} catch (error) {\n\t\n}"),
+    ("main", "function main() {\n\t$0\n}\n\nmain();"),
+    ("arrow", "const $0 = () => {\n\t\n};"),
+    ("async", "async function $0() {\n\t\n}"),
+    ("ifelse", "if ($0) {\n\t\n} else {\n\t\n}"),
+    ("while", "while ($0) {\n\t\n}"),
+    (
+        "switch",
+        "switch ($0) {\n\tcase :\n\t\tbreak;\n\tdefault:\n\t\tbreak;\n}",
+    ),
+    ("forin", "for (const key in $0) {\n\t\n}"),
+    ("foreach", "$0.forEach((item) => {\n\t\n});"),
+    ("import", "import { $0 } from \"\";"),
+    ("export", "export function $0() {\n\t\n}"),
+    ("promise", "new Promise((resolve, reject) => {\n\t$0\n});"),
+    (
+        "fetch",
+        "const response = await fetch($0);\nconst data = await response.json();",
+    ),
+    ("timeout", "setTimeout(() => {\n\t$0\n}, 1000);"),
 ];
 
 /// Snippets by language name.
@@ -59,6 +91,24 @@ const SNIPPETS: &[(&str, Snippets)] = &[
             ("match", "match $0 {\n\t_ => {}\n}"),
             ("println", "println!(\"$0\");"),
             ("test", "#[test]\nfn $0() {\n\t\n}"),
+            ("main", "fn main() {\n\t$0\n}"),
+            ("pubfn", "pub fn $0() {\n\t\n}"),
+            ("while", "while $0 {\n\t\n}"),
+            ("loop", "loop {\n\t$0\n}"),
+            ("iflet", "if let Some($0) =  {\n\t\n}"),
+            ("ifelse", "if $0 {\n\t\n} else {\n\t\n}"),
+            ("trait", "trait $0 {\n\t\n}"),
+            ("mod", "mod $0 {\n\t\n}"),
+            (
+                "tests",
+                "#[cfg(test)]\nmod tests {\n\tuse super::*;\n\n\t#[test]\n\tfn $0() {\n\t\t\n\t}\n}",
+            ),
+            (
+                "derive",
+                "#[derive(Debug, Clone, PartialEq)]\nstruct $0 {\n\t\n}",
+            ),
+            ("vec", "vec![$0]"),
+            ("dbg", "dbg!($0);"),
         ],
     ),
     (
@@ -71,10 +121,22 @@ const SNIPPETS: &[(&str, Snippets)] = &[
             ("ifmain", "if __name__ == \"__main__\":\n\t$0"),
             ("print", "print($0)"),
             ("try", "try:\n\t$0\nexcept Exception as error:\n\tpass"),
+            (
+                "main",
+                "def main():\n\t$0\n\n\nif __name__ == \"__main__\":\n\tmain()",
+            ),
+            ("while", "while $0:\n\tpass"),
+            ("ifelse", "if $0:\n\tpass\nelse:\n\tpass"),
+            ("with", "with $0 as :\n\tpass"),
+            ("async", "async def $0():\n\tpass"),
+            ("init", "def __init__(self$0):\n\tpass"),
+            ("dataclass", "@dataclass\nclass $0:\n\tpass"),
+            ("lambda", "lambda $0: "),
         ],
     ),
     ("JavaScript", SCRIPT),
     ("TypeScript", SCRIPT),
+    ("TypeScript", TYPED),
     (
         "Go",
         &[
@@ -82,6 +144,17 @@ const SNIPPETS: &[(&str, Snippets)] = &[
             ("for", "for $0 {\n\t\n}"),
             ("if", "if $0 {\n\t\n}"),
             ("iferr", "if err != nil {\n\treturn $0\n}"),
+            (
+                "main",
+                "package main\n\nimport \"fmt\"\n\nfunc main() {\n\t$0\n}",
+            ),
+            ("struct", "type $0 struct {\n\t\n}"),
+            ("interface", "type $0 interface {\n\t\n}"),
+            ("method", "func (r *Receiver) $0() {\n\t\n}"),
+            ("forrange", "for i, item := range $0 {\n\t\n}"),
+            ("switch", "switch $0 {\ncase :\n\t\ndefault:\n\t\n}"),
+            ("println", "fmt.Println($0)"),
+            ("test", "func Test$0(t *testing.T) {\n\t\n}"),
         ],
     ),
     (
@@ -92,10 +165,123 @@ const SNIPPETS: &[(&str, Snippets)] = &[
         )],
     ),
     ("C", C_LIKE),
+    (
+        "C",
+        &[
+            (
+                "main",
+                "int main(int argc, char *argv[]) {\n\t$0\n\treturn 0;\n}",
+            ),
+            ("include", "#include <$0>"),
+            ("struct", "struct $0 {\n\t\n};"),
+            ("printf", "printf(\"$0\\n\");"),
+        ],
+    ),
     ("C++", C_LIKE),
+    (
+        "C++",
+        &[
+            ("main", "int main() {\n\t$0\n\treturn 0;\n}"),
+            ("include", "#include <$0>"),
+            ("class", "class $0 {\npublic:\n\t\n};"),
+            ("struct", "struct $0 {\n\t\n};"),
+            ("forrange", "for (const auto& item : $0) {\n\t\n}"),
+            ("cout", "std::cout << $0 << std::endl;"),
+        ],
+    ),
     ("Java", C_LIKE),
+    (
+        "Java",
+        &[
+            ("main", "public static void main(String[] args) {\n\t$0\n}"),
+            ("class", "public class $0 {\n\t\n}"),
+            ("foreach", "for (var item : $0) {\n\t\n}"),
+            ("sout", "System.out.println($0);"),
+            ("try", "try {\n\t$0\n} catch (Exception e) {\n\t\n}"),
+        ],
+    ),
     ("C#", C_LIKE),
+    (
+        "C#",
+        &[
+            ("main", "static void Main(string[] args)\n{\n\t$0\n}"),
+            ("class", "public class $0\n{\n\t\n}"),
+            ("foreach", "foreach (var item in $0)\n{\n\t\n}"),
+            ("prop", "public string $0 { get; set; }"),
+            ("cw", "Console.WriteLine($0);"),
+            ("try", "try\n{\n\t$0\n}\ncatch (Exception e)\n{\n\t\n}"),
+        ],
+    ),
+    (
+        "Kotlin",
+        &[
+            ("main", "fun main() {\n\t$0\n}"),
+            ("fun", "fun $0() {\n\t\n}"),
+            ("class", "class $0 {\n\t\n}"),
+            ("for", "for (item in $0) {\n\t\n}"),
+            ("if", "if ($0) {\n\t\n}"),
+            ("when", "when ($0) {\n\telse -> {}\n}"),
+            ("println", "println($0)"),
+        ],
+    ),
+    (
+        "Swift",
+        &[
+            ("func", "func $0() {\n\t\n}"),
+            ("struct", "struct $0 {\n\t\n}"),
+            ("class", "class $0 {\n\t\n}"),
+            ("for", "for item in $0 {\n\t\n}"),
+            ("if", "if $0 {\n\t\n}"),
+            ("guard", "guard $0 else {\n\treturn\n}"),
+            ("print", "print($0)"),
+        ],
+    ),
+    (
+        "PHP",
+        &[
+            ("function", "function $0() {\n\t\n}"),
+            ("class", "class $0 {\n\t\n}"),
+            ("foreach", "foreach ($0 as $item) {\n\t\n}"),
+            ("if", "if ($0) {\n\t\n}"),
+            ("echo", "echo $0;"),
+        ],
+    ),
+    (
+        "Ruby",
+        &[
+            ("def", "def $0\n\t\nend"),
+            ("class", "class $0\n\t\nend"),
+            ("each", "$0.each do |item|\n\t\nend"),
+            ("if", "if $0\n\t\nend"),
+            ("puts", "puts $0"),
+        ],
+    ),
+    (
+        "Shell",
+        &[
+            ("if", "if [ $0 ]; then\n\t\nfi"),
+            ("for", "for item in $0; do\n\t\ndone"),
+            ("while", "while $0; do\n\t\ndone"),
+            ("function", "$0() {\n\t\n}"),
+            ("case", "case $0 in\n\t*)\n\t\t;;\nesac"),
+        ],
+    ),
+    (
+        "SQL",
+        &[
+            ("select", "SELECT $0 FROM ;"),
+            ("insert", "INSERT INTO $0 () VALUES ();"),
+            ("update", "UPDATE $0 SET  WHERE ;"),
+            ("create", "CREATE TABLE $0 (\n\tid INTEGER PRIMARY KEY\n);"),
+        ],
+    ),
 ];
+
+/// The snippets that come with `language`.
+fn snippets_of(language: &str) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let own = SNIPPETS.iter().filter(move |(name, _)| *name == language);
+    own.flat_map(|(_, snippets)| snippets.iter())
+}
 
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
@@ -185,15 +371,12 @@ pub fn complete(text: &str, caret: usize, language: &Language) -> Vec<Completion
         return found;
     }
 
-    let snippets = SNIPPETS
-        .iter()
-        .find(|(name, _)| *name == language.name)
-        .map_or(&[][..], |(_, snippets)| snippets);
-    let mut found: Vec<Completion> = snippets
-        .iter()
+    let mut found: Vec<Completion> = snippets_of(language.name)
         .filter(|(label, _)| fits(label))
         .map(|(label, body)| completion(label, body, Kind::Snippet))
         .collect();
+    // The one named by what is typed comes first: Tab then writes it.
+    found.sort_by_key(|snippet| !snippet.label.eq_ignore_ascii_case(prefix));
 
     // A word typed in full has nothing left to complete.
     let mut seen: HashSet<&str> = HashSet::from([prefix]);
@@ -672,8 +855,7 @@ pub fn apply(text: &mut String, caret: usize, completion: &Completion, unit: &st
 
 /// The body of the snippet `label` that comes with `language`.
 pub(crate) fn builtin(language: &str, label: &str) -> Option<&'static str> {
-    let (_, snippets) = SNIPPETS.iter().find(|(name, _)| *name == language)?;
-    let (_, body) = snippets.iter().find(|(found, _)| *found == label)?;
+    let (_, body) = snippets_of(language).find(|(found, _)| *found == label)?;
     Some(body)
 }
 
@@ -718,10 +900,51 @@ mod tests {
             found,
             [
                 ("match".to_owned(), Kind::Snippet),
+                ("main".to_owned(), Kind::Snippet),
                 ("match".to_owned(), Kind::Keyword),
                 ("mate".to_owned(), Kind::Word),
                 ("matcher".to_owned(), Kind::Word),
             ]
+        );
+    }
+
+    #[test]
+    fn a_word_typed_in_full_still_offers_the_structure_it_names() {
+        // `main` typed whole: its snippet is the first, and writes the function.
+        for (file, opening) in [
+            ("a.rs", "fn main() {"),
+            ("a.py", "def main():"),
+            ("a.go", "func main() {"),
+            ("a.c", "int main("),
+            ("a.java", "public static void main("),
+            ("a.js", "function main() {"),
+        ] {
+            let language = Language::of(Path::new(file));
+            let found = complete("main", 4, language);
+            let first = found.first().expect(file);
+            assert_eq!(
+                (first.label.as_str(), first.kind),
+                ("main", Kind::Snippet),
+                "{file}"
+            );
+            assert!(first.body.contains(opening), "{file}: {}", first.body);
+            let mut text = "main".to_owned();
+            let caret = apply(&mut text, 4, first, "    ");
+            assert!(
+                text.contains(opening) && !text.contains("$0"),
+                "{file}: {text}"
+            );
+            assert!(caret <= text.chars().count(), "{file}");
+        }
+        // Of two that fit, the one typed whole is first.
+        let found = complete("if", 2, Language::of(Path::new("a.rs")));
+        let labels: Vec<&str> = found.iter().map(|found| found.label.as_str()).collect();
+        assert_eq!(labels[..3], ["if", "iflet", "ifelse"]);
+        // TypeScript has what JavaScript has, and its own.
+        let typed = complete("inter", 5, Language::of(Path::new("a.ts")));
+        assert_eq!(
+            typed.first().map(|found| found.label.as_str()),
+            Some("interface")
         );
     }
 
