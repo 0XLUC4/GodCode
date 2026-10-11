@@ -29,7 +29,6 @@ const PING: u8 = 0x9;
 const PONG: u8 = 0xA;
 
 /// What a socket says.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The server took the connection: messages can be sent.
@@ -45,7 +44,6 @@ pub enum Event {
 }
 
 /// A WebSocket and the thread that listens to it.
-#[allow(dead_code)]
 pub struct Socket {
     incoming: Receiver<Event>,
     link: Arc<Mutex<Link>>,
@@ -84,7 +82,6 @@ fn lock(link: &Mutex<Link>) -> MutexGuard<'_, Link> {
     link.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[allow(dead_code)]
 impl Socket {
     /// Open `url` (`ws://host[:port]/path?query`), with the extra `headers` written
     /// `Name: value`. Returns at once; `Event::Opened` or `Event::Failed` follows. `wake`

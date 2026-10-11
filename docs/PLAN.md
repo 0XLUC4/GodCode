@@ -182,7 +182,10 @@ valeur du fichier, `{{nom}}` la reprend dans l'adresse, les en-têtes et le corp
 Environnements : `http-client.env.json` à côté du fichier ou à la racine, `HTTP: Choose
 Environment…` choisit le jeu de valeurs, qui l'emporte sur les `@nom` du fichier.
 Historique : les 20 dernières requêtes de la session sont listées à gauche de la réponse, un clic
-remontre ce que l'une a répondu. Reste : WebSocket.
+remontre ce que l'une a répondu.
+WebSocket : une ligne `WEBSOCKET ws://localhost:8080/chat` (avec ses en-têtes) ouvre une connexion ; le
+panneau Response montre ce qui passe, un champ envoie un message, `Close` raccroche. Client écrit à la
+main, `ws://` seulement : pas de `wss://`, faute de TLS.
 
 Fait : **aperçu web en direct** — le dossier est servi sur 127.0.0.1 uniquement, la page se
 recharge seule à chaque sauvegarde. `Live Preview` l'affiche dans la fenêtre, à droite de

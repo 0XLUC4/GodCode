@@ -1641,6 +1641,11 @@ pub struct GodApp {
     requested: String,
     responses: Vec<(String, String)>,
     response_at: usize,
+    /// A WebSocket held open from a `.http` file; what was said over it, and what is
+    /// being written to send.
+    socket: Option<crate::websocket::Socket>,
+    socket_said: String,
+    socket_typed: String,
     /// The program being debugged, and whether it is stopped.
     debug: Option<godcode_lsp::dap::Session>,
     debug_stopped: bool,
@@ -1858,6 +1863,9 @@ impl GodApp {
             requested: String::new(),
             responses: Vec::new(),
             response_at: 0,
+            socket: None,
+            socket_said: String::new(),
+            socket_typed: String::new(),
             debug: None,
             debug_stopped: false,
             frames: Vec::new(),
@@ -2387,6 +2395,29 @@ impl GodApp {
 
     /// Collect what the background threads produced.
     fn poll(&mut self) {
+        if let Some(socket) = &mut self.socket {
+            use crate::websocket::Event;
+            let heard = socket.poll();
+            let over = heard
+                .iter()
+                .any(|event| matches!(event, Event::Closed(_) | Event::Failed(_)));
+            for event in heard {
+                let line = match event {
+                    Event::Opened => "opened".to_owned(),
+                    Event::Text(text) => format!("← {text}"),
+                    Event::Binary(bytes) => format!("← ({bytes} bytes that are no text)"),
+                    Event::Closed(why) => format!("closed: {why}"),
+                    Event::Failed(why) => format!("failed: {why}"),
+                };
+                self.socket_said.push_str(&line);
+                self.socket_said.push('\n');
+            }
+            // Over, what was said stays on show as an answer does.
+            if over {
+                self.socket = None;
+                self.response.clone_from(&self.socket_said);
+            }
+        }
         if let Some((receiver, tab, revision, at)) = &self.suggesting
             && let Ok(written) = receiver.try_recv()
         {
@@ -5804,6 +5835,22 @@ impl GodApp {
                 .error("No request here: write a line such as GET https://example.com");
             return;
         };
+        // A socket stays open to be talked over: it is no request with one answer.
+        if request.method == "WEBSOCKET" {
+            let waking = ctx.clone();
+            let wake = move || waking.request_repaint();
+            self.socket_said = format!("WEBSOCKET {}\n", request.url);
+            match crate::websocket::Socket::open(&request.url, &request.headers, wake) {
+                Ok(socket) => self.socket = Some(socket),
+                Err(why) => {
+                    self.socket = None;
+                    self.socket_said.push_str(&why);
+                }
+            }
+            self.response.clone_from(&self.socket_said);
+            self.bottom = Some(Bottom::Response);
+            return;
+        }
         self.requested = format!("{} {}", request.method, request.url);
         let (sender, receiver) = channel();
         let ctx = ctx.clone();
@@ -8202,6 +8249,50 @@ impl GodApp {
             Bottom::Debug => self.debug_panel(ui),
             Bottom::Tests => self.tests_list(ui),
             Bottom::Assistant => self.assistant_panel(ui),
+            Bottom::Response if self.socket.is_some() => {
+                let (mut send, mut close) = (false, false);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let field = TextEdit::singleline(&mut self.socket_typed)
+                        .margin(crate::widgets::FIELD_MARGIN)
+                        .hint_text("A message to send")
+                        .desired_width(ui.available_width() - 150.0);
+                    let field = ui.add(field);
+                    let entered =
+                        field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                    if entered {
+                        field.request_focus();
+                    }
+                    // Nothing is sent before the server has answered the call.
+                    let open = self.socket.as_ref().is_some_and(|socket| socket.is_open());
+                    let button = ui.add_enabled(open, Button::new("Send"));
+                    send = (button.clicked() || entered) && open;
+                    close = ui.button("Close").clicked();
+                });
+                let said = ScrollArea::both().id_salt("socket-said");
+                said.auto_shrink(false)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        Frame::new()
+                            .inner_margin(Margin::symmetric(12, 0))
+                            .show(ui, |ui| {
+                                let text = RichText::new(&self.socket_said).monospace().size(13.0);
+                                ui.add(egui::Label::new(text).selectable(true).extend());
+                            });
+                    });
+                if let Some(socket) = self.socket.as_mut().filter(|_| send) {
+                    let message = std::mem::take(&mut self.socket_typed);
+                    let line = match socket.send(&message) {
+                        Ok(()) => format!("→ {message}\n"),
+                        Err(why) => format!("not sent: {why}\n"),
+                    };
+                    self.socket_said.push_str(&line);
+                }
+                if let Some(socket) = self.socket.as_mut().filter(|_| close) {
+                    // What it answers to that is heard at the next turn, and ends it.
+                    socket.close();
+                }
+            }
             Bottom::Response => {
                 let shown = if self.requesting.is_some() {
                     "Waiting for the answer…"
