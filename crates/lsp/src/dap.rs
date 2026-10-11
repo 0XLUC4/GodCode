@@ -56,6 +56,8 @@ pub enum Event {
     Watched {
         expression: String,
         value: String,
+        /// It could not be worked out: `value` says why.
+        failed: bool,
     },
     Ended,
     /// The debugger refused: why.
@@ -287,6 +289,7 @@ impl Session {
                     Some(Asked::Evaluate(expression)) => events.push(Event::Watched {
                         expression,
                         value: worth(message),
+                        failed,
                     }),
                     Some(Asked::Variables) => events.push(Event::Variables(variables(body))),
                     Some(Asked::Children(reference)) => events.push(Event::Children {

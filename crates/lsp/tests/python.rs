@@ -92,7 +92,13 @@ fn a_real_debugger_stops_and_tells_what_expressions_are_worth() {
     session.watch(&watched);
     let mut worth = std::collections::HashMap::new();
     until(&mut session, |event| {
-        if let Event::Watched { expression, value } = event {
+        if let Event::Watched {
+            expression,
+            value,
+            failed,
+        } = event
+        {
+            assert_eq!(failed, expression.starts_with("missing"), "{expression}");
             worth.insert(expression, value);
         }
         (worth.len() == 3).then_some(())

@@ -86,6 +86,8 @@ pub struct Config<'a> {
     pub snippets: &'a [(String, String)],
     /// The lines (from 0) the debugger stops on.
     pub breakpoints: &'a [usize],
+    /// Those of them it stops on only under a condition.
+    pub conditional: &'a [usize],
     /// The line the debugged program is stopped at.
     pub stopped: Option<usize>,
     /// A number that changes whenever the text may have changed since the editor last
@@ -1438,7 +1440,12 @@ pub fn show(
             }
         }
         if config.breakpoints.contains(&index) {
-            painter.circle_filled(pos2(gutter.min.x + 7.0, middle), 4.5, ERROR_COLOR);
+            let centre = pos2(gutter.min.x + 7.0, middle);
+            painter.circle_filled(centre, 4.5, ERROR_COLOR);
+            // One with a condition is hollow: it does not always stop.
+            if config.conditional.contains(&index) {
+                painter.circle_filled(centre, 2.0, palette.bg);
+            }
         }
         painter.text(
             pos2(gutter.max.x - GUTTER_PAD, middle),
@@ -1736,6 +1743,7 @@ mod tests {
                 note: None,
                 snippets: &[],
                 breakpoints: &[],
+                conditional: &[],
                 stopped: None,
                 hints: &self.hints,
                 block_caret: false,

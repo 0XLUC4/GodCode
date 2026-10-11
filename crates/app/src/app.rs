@@ -1395,6 +1395,9 @@ pub struct GodApp {
     pointer: egui::Pos2,
     /// The documentation shown at the pointer, for the name starting at this char.
     tip: Option<(usize, egui::Pos2, Vec<markdown::Placed>)>,
+    /// The name the debugger was asked the worth of, the pointer resting on it: where it
+    /// starts, and the name.
+    hovered: Option<(usize, String)>,
     /// The fixes offered for the line of the caret, and the one chosen.
     fixes: Option<(Vec<godcode_lsp::Action>, usize)>,
     /// The call being written: its line, its signature, the chars of the argument typed.
@@ -1582,6 +1585,7 @@ impl GodApp {
             rest: None,
             pointer: egui::Pos2::ZERO,
             tip: None,
+            hovered: None,
             fixes: None,
             signature: None,
             caret_place: ((0, u64::MAX, 0..0), (1, 1), (1, 1)),
@@ -3273,7 +3277,19 @@ impl GodApp {
                         session.watch(&watched);
                     }
                 }
-                Event::Watched { expression, value } => {
+                Event::Watched {
+                    expression,
+                    value,
+                    failed,
+                } => {
+                    // The name the pointer rests on: what it is worth shows next to it.
+                    let resting = self.hovered.as_ref().filter(|(start, name)| {
+                        *name == expression && self.rest.is_some_and(|(at, ..)| at == *start)
+                    });
+                    if let (Some((start, _)), false) = (resting, failed) {
+                        let said = format!("`{expression}` = `{value}`");
+                        self.tip = Some((*start, self.pointer, markdown::blocks(&said)));
+                    }
                     let same = self
                         .watches
                         .iter_mut()
@@ -4123,6 +4139,16 @@ impl GodApp {
         match self.rest {
             Some((name, since, false)) if name == start && now - since >= HOVER_DELAY => {
                 self.rest = Some((start, since, true));
+                // Stopped in the debugger, a name is worth something: it is asked.
+                if let (Some(session), true, Some(tab)) = (
+                    &mut self.debug,
+                    self.debug_stopped,
+                    self.tabs.get(self.active),
+                ) {
+                    let name: String = tab.text.chars().skip(start).take_while(is_word).collect();
+                    session.watch(std::slice::from_ref(&name));
+                    self.hovered = Some((start, name));
+                }
                 self.sync_server(ctx);
                 let asked = self.tabs.get(self.active).and_then(|tab| {
                     let (line, column) = servers::position(&tab.text, start);
