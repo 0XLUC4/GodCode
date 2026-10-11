@@ -46,7 +46,7 @@ thèmes sombre/clair, zoom.
 | Search Everywhere, fichiers récents, Go to Declaration, Find Usages, Back/Forward | ✅ |
 | Structure, TODO, fil d'Ariane, guides d'indentation, occurrences du mot | ✅ |
 | Fermeture auto des crochets et des balises, Extend Selection, Join Lines, casse | ✅ |
-| Icônes de fichiers par langage | ✅ |
+| Icônes de fichiers par langage : le logo du langage dans sa couleur pour une cinquantaine de types (police devicon, licence MIT, embarquée : +1,2 Mo), des lettres pour ceux qui n'en ont pas | ✅ |
 | Aperçu Markdown avec défilement synchronisé | ✅ |
 | ~75 langages colorés, langages imbriqués (JS/CSS dans HTML, blocs de code Markdown) | ✅ |
 | Recherche par expression régulière et mot entier | ✅ |

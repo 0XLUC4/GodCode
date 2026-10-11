@@ -12,6 +12,10 @@ pub use egui_phosphor::regular as icon;
 
 /// Font family of the solid Phosphor glyphs: the code points of [`icon`], filled shapes.
 const FILLED: &str = "phosphor-fill";
+/// The font of the logos of languages and tools: devicon, under the MIT licence
+/// (`assets/devicon-LICENSE.txt`).
+const LOGOS: &str = "devicon";
+const LOGOS_FONT: &[u8] = include_bytes!("../../../assets/devicon.ttf");
 
 /// Side of a standard icon-only button.
 pub const ICON_BUTTON: Vec2 = vec2(28.0, 28.0);
@@ -46,6 +50,12 @@ pub fn install_fonts(ctx: &Context, code: Option<Vec<u8>>) {
     fonts
         .families
         .insert(FontFamily::Name(FILLED.into()), vec![FILLED.into()]);
+    fonts
+        .font_data
+        .insert(LOGOS.into(), egui::FontData::from_static(LOGOS_FONT).into());
+    fonts
+        .families
+        .insert(FontFamily::Name(LOGOS.into()), vec![LOGOS.into()]);
     ctx.set_fonts(fonts);
 }
 
@@ -108,9 +118,15 @@ pub fn after_icon(ui: &Ui, label: &str) -> egui::text::LayoutJob {
     job
 }
 
-/// Draw the icon of a file around `center`: a letter badge in the colour of its language,
-/// or a solid glyph.
+/// Draw the icon of a file around `center`: the logo of its language in its colour, a
+/// letter badge for a language without one, or a solid glyph.
 pub fn paint_file_icon(painter: &Painter, center: Pos2, icon: &FileIcon) {
+    // The logo of the language, when it has one.
+    if let Some(logo) = icon.logo {
+        let font = FontId::new(15.0, FontFamily::Name(LOGOS.into()));
+        painter.text(center, Align2::CENTER_CENTER, logo, font, icon.color);
+        return;
+    }
     let Some(label) = icon.badge else {
         painter.text(
             center,

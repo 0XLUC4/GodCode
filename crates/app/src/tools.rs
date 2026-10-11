@@ -429,6 +429,8 @@ pub struct FileIcon {
     pub color: Color32,
     /// One or two letters on a square of `color`, for the languages known by their initials.
     pub badge: Option<&'static str>,
+    /// The logo of the language, a glyph of the font of logos, when it has one there.
+    pub logo: Option<char>,
 }
 
 fn rgb(hex: u32) -> Color32 {
@@ -442,47 +444,59 @@ pub fn file_icon(name: &str) -> FileIcon {
     let extension = lower
         .rsplit_once('.')
         .map_or("", |(_, extension)| extension);
-    let badge = |label, hex| (icon::FILE_CODE, hex, Some(label));
-    let glyph = |glyph, hex| (glyph, hex, None);
-    let (glyph, hex, badge) = match (lower.as_str(), extension) {
+    let badge = |label, hex| (icon::FILE_CODE, hex, Some(label), None);
+    let glyph = |glyph, hex| (glyph, hex, None, None);
+    // The logo of a language, in its colour, lightened where it would not show on dark.
+    let logo = |logo: char, hex| (icon::FILE_CODE, hex, None, Some(logo));
+    let (glyph, hex, badge, logo) = match (lower.as_str(), extension) {
         ("cargo.toml" | "package.json" | "go.mod" | "pyproject.toml", _) => {
             glyph(icon::PACKAGE, 0xC9_8A_4B)
         }
         ("package-lock.json" | "cargo.lock" | "pnpm-lock.yaml" | "yarn.lock", _) => {
             glyph(icon::LOCK_SIMPLE, GREY)
         }
-        (".gitignore" | ".gitattributes" | ".gitmodules", _) => glyph(icon::GIT_BRANCH, 0xF0_50_33),
-        ("dockerfile" | "makefile", _) => glyph(icon::TERMINAL_WINDOW, 0x4E_AA_25),
+        (".gitignore" | ".gitattributes" | ".gitmodules", _) => logo('\u{ea2d}', 0xF0_50_33),
+        ("dockerfile" | ".dockerignore", _) => logo('\u{e9c3}', 0x24_96_ED),
+        ("cmakelists.txt", _) | (_, "cmake") => logo('\u{e97a}', 0x5B_9B_D5),
+        ("makefile", _) => glyph(icon::TERMINAL_WINDOW, 0x4E_AA_25),
+        (_, "gradle") => logo('\u{ea3e}', 0x4F_B0_8A),
+        (_, "pl" | "pm") => logo('\u{eb5f}', 0x6F_8F_C0),
+        (_, "clj" | "cljs" | "edn") => logo('\u{e974}', 0x63_B1_33),
+        (_, "erl" | "hrl") => logo('\u{e9e6}', 0xD0_3A_5A),
+        (_, "ml" | "mli") => logo('\u{eb3c}', 0xEC_68_13),
+        (_, "fs" | "fsx") => logo('\u{ea0e}', 0x37_8B_BA),
+        (_, "nim") => logo('\u{eb1e}', 0xFF_E9_53),
+        (_, "ps1" | "psm1") => logo('\u{eb7d}', 0x53_91_FE),
+        (_, "sh" | "bash" | "zsh") => logo('\u{e946}', 0x4E_AA_25),
+        (_, "yml" | "yaml") => logo('\u{ecb5}', 0xE0_5A_5A),
         ("license" | "license.md" | "license.txt", _) => glyph(icon::SCALES, 0xD0_A8_3F),
         ("readme.md" | "readme" | "lisezmoi.txt", _) => glyph(icon::INFO, 0x51_9A_BA),
-        (_, "rs") => badge("RS", 0xDE_A5_84),
-        (_, "py" | "pyw" | "pyi") => badge("PY", 0x37_76_AB),
-        (_, "js" | "mjs" | "cjs") => badge("JS", 0xF1_D9_3A),
-        (_, "ts" | "mts" | "cts") => badge("TS", 0x31_78_C6),
-        (_, "jsx" | "tsx") => glyph(icon::ATOM, 0x61_DA_FB),
-        (_, "vue") => badge("V", 0x41_B8_83),
-        (_, "svelte") => badge("S", 0xFF_3E_00),
-        (_, "html" | "htm") => badge("<>", 0xE4_4D_26),
-        (_, "xml" | "xaml" | "plist" | "csproj") => badge("<>", GREY),
-        (_, "css") => badge("#", 0x26_4D_E4),
-        (_, "scss" | "less") => badge("#", 0xCF_64_9A),
-        (_, "c" | "h") => badge("C", 0x5C_6B_C0),
-        (_, "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx") => badge("C+", 0xF3_4B_7D),
-        (_, "cs") => badge("C#", 0x9B_4F_96),
-        (_, "go") => badge("GO", 0x00_AD_D8),
-        (_, "java") => badge("J", 0xE7_6F_00),
-        (_, "kt" | "kts") => badge("K", 0x7F_52_FF),
-        (_, "swift") => badge("S", 0xF0_51_38),
-        (_, "php") => badge("P", 0x77_7B_B4),
-        (_, "rb") => badge("RB", 0xCC_34_2D),
-        (_, "lua") => badge("L", 0x2C_2D_72),
+        (_, "rs") => logo('\u{ebe6}', 0xDE_A5_84),
+        (_, "py" | "pyw" | "pyi") => logo('\u{eb9c}', 0x4B_8B_BE),
+        (_, "js" | "mjs" | "cjs") => logo('\u{ea81}', 0xF1_D9_3A),
+        (_, "ts" | "mts" | "cts") => logo('\u{ec63}', 0x3D_8F_E0),
+        (_, "jsx" | "tsx") => logo('\u{ebbc}', 0x61_DA_FB),
+        (_, "vue") => logo('\u{ec96}', 0x41_B8_83),
+        (_, "svelte") => logo('\u{ec30}', 0xFF_3E_00),
+        (_, "html" | "htm") => logo('\u{ea67}', 0xE4_4D_26),
+        (_, "xml" | "xaml" | "plist" | "csproj") => logo('\u{ecb4}', GREY),
+        (_, "css") => logo('\u{e9a1}', 0x33_A9_DC),
+        (_, "scss" | "less") => logo('\u{ebee}', 0xCF_64_9A),
+        (_, "c" | "h") => logo('\u{e998}', 0x7A_8B_E0),
+        (_, "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx") => logo('\u{e99a}', 0xF3_4B_7D),
+        (_, "cs") => logo('\u{e9a0}', 0xB0_6A_C0),
+        (_, "go") => logo('\u{ea3d}', 0x00_AD_D8),
+        (_, "java") => logo('\u{ea7f}', 0xE7_6F_00),
+        (_, "kt" | "kts") => logo('\u{eab5}', 0x9B_7B_FF),
+        (_, "swift") => logo('\u{ec34}', 0xF0_51_38),
+        (_, "php") => logo('\u{eb68}', 0x8F_93_D0),
+        (_, "rb") => logo('\u{ebe3}', 0xE0_4A_42),
+        (_, "lua") => logo('\u{ead3}', 0x6C_6F_E0),
         (_, "sql") => glyph(icon::DATABASE, 0xE3_8C_00),
-        (_, "md" | "markdown") => badge("M", 0x51_9A_BA),
-        (_, "json" | "jsonc" | "webmanifest") => badge("{}", 0xCB_CB_41),
-        (_, "toml" | "yml" | "yaml" | "ini" | "cfg" | "conf" | "env") => glyph(icon::GEAR, GREY),
-        (_, "sh" | "bash" | "zsh" | "fish" | "ps1" | "psm1" | "bat" | "cmd") => {
-            glyph(icon::TERMINAL_WINDOW, 0x4E_AA_25)
-        }
+        (_, "md" | "markdown") => logo('\u{eadb}', 0x51_9A_BA),
+        (_, "json" | "jsonc" | "webmanifest") => logo('\u{ea94}', 0xCB_CB_41),
+        (_, "toml" | "ini" | "cfg" | "conf" | "env") => glyph(icon::GEAR, GREY),
+        (_, "fish" | "bat" | "cmd") => glyph(icon::TERMINAL_WINDOW, 0x4E_AA_25),
         (_, "png" | "gif" | "bmp" | "ico" | "webp" | "jpg" | "jpeg") => {
             glyph(icon::IMAGE, 0xA0_74_C4)
         }
@@ -492,20 +506,20 @@ pub fn file_icon(name: &str) -> FileIcon {
         (_, "csv") => glyph(icon::FILE_CSV, 0x4E_AA_25),
         (_, "lock") => glyph(icon::LOCK_SIMPLE, GREY),
         (_, "txt" | "log") => glyph(icon::FILE_TEXT, GREY),
-        (_, "dart") => badge("D", 0x02_75_9A),
-        (_, "scala" | "sc") => badge("SC", 0xDC_32_2F),
-        (_, "zig") => badge("Z", 0xF7_A4_1D),
-        (_, "hs") => badge("HS", 0x5E_50_86),
-        (_, "ex" | "exs") => badge("EX", 0x6E_4A_7E),
-        (_, "jl") => badge("JL", 0x95_58_B2),
-        (_, "r") => badge("R", 0x27_6D_C3),
-        (_, "sol") => badge("S", 0x62_7E_EA),
-        (_, "tf" | "hcl" | "tfvars") => badge("TF", 0x7B_42_BC),
-        (_, "tex" | "bib") => badge("TX", 0x3D_61_17),
-        (_, "graphql" | "gql") => badge("GQ", 0xE1_00_98),
+        (_, "dart") => logo('\u{e9aa}', 0x13_B9_FD),
+        (_, "scala" | "sc") => logo('\u{ebef}', 0xDC_32_2F),
+        (_, "zig") => logo('\u{ecc3}', 0xF7_A4_1D),
+        (_, "hs") => logo('\u{ea58}', 0x9A_8A_D0),
+        (_, "ex" | "exs") => logo('\u{e9db}', 0xA0_78_B8),
+        (_, "jl") => logo('\u{ea97}', 0xAA_70_C8),
+        (_, "r") => logo('\u{ebdb}', 0x4A_8D_E0),
+        (_, "sol") => logo('\u{ec0b}', 0x62_7E_EA),
+        (_, "tf" | "hcl" | "tfvars") => logo('\u{ec41}', 0x9A_6A_E0),
+        (_, "tex" | "bib") => logo('\u{eac5}', 0x7F_B8_3A),
+        (_, "graphql" | "gql") => logo('\u{ea45}', 0xE1_00_98),
         (_, "proto") => badge("PB", 0x4F_9C_E8),
-        (_, "mm" | "m") => badge("M", 0x43_8E_FF),
-        (_, "gd") => badge("GD", 0x47_8C_BF),
+        (_, "mm" | "m") => logo('\u{eb3b}', 0x43_8E_FF),
+        (_, "gd") => logo('\u{ea33}', 0x47_8C_BF),
         (_, "glsl" | "hlsl" | "wgsl" | "vert" | "frag" | "shader") => glyph(icon::CUBE, 0x5B_8D_EF),
         // Any other file whose language is known is code.
         _ if Language::of(Path::new(name)).name != "Plain Text" => {
@@ -517,6 +531,7 @@ pub fn file_icon(name: &str) -> FileIcon {
         glyph,
         color: rgb(hex),
         badge,
+        logo,
     }
 }
 
@@ -602,7 +617,13 @@ mod tests {
             Some("node")
         );
         assert!(checker("Markdown", script).is_none());
-        assert_eq!(file_icon("Main.RS").badge, Some("RS"));
+        // A language shows by its logo; one that has none, by its letters.
+        assert_eq!(file_icon("Main.RS").logo, Some('\u{ebe6}'));
+        assert_eq!(file_icon("index.html").logo, Some('\u{ea67}'));
+        assert_eq!(file_icon("Dockerfile").logo, Some('\u{e9c3}'));
+        assert_eq!(file_icon("build.yml").logo, Some('\u{ecb5}'));
+        assert_eq!(file_icon("a.proto").badge, Some("PB"));
+        assert!(file_icon("a.proto").logo.is_none());
         assert_eq!(file_icon("Cargo.toml").glyph, icon::PACKAGE);
         assert_eq!(file_icon("notes").glyph, icon::FILE);
         assert!(file_icon("notes").badge.is_none());
