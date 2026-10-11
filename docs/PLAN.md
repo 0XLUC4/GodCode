@@ -163,8 +163,10 @@ modèle (page web, Node/TypeScript, Python, Rust).
 ### Phase 6 — outils (⏳)
 
 Fait : client HTTP — fichiers `.http`, `F5` envoie la requête sous le curseur, réponse
-(JSON mis en forme) dans le panneau Response ; passe par `curl`. Reste : GraphQL,
-WebSocket, collections.
+(JSON mis en forme) dans le panneau Response ; passe par `curl`. `@nom = valeur` nomme une
+valeur du fichier, `{{nom}}` la reprend dans l'adresse, les en-têtes et le corps ; la méthode
+`GRAPHQL` poste son corps comme requête, avec ses variables en JSON après une ligne vide.
+Reste : WebSocket, environnements (plusieurs jeux de valeurs), historique des réponses.
 
 Fait : **aperçu web en direct** — le dossier est servi sur 127.0.0.1 uniquement, la page se
 recharge seule à chaque sauvegarde. `Live Preview` l'affiche dans la fenêtre, à droite de
