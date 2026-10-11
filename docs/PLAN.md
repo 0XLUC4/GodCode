@@ -66,7 +66,7 @@ thèmes sombre/clair, zoom.
 | Balises : `>` écrit la balise fermante sauf si une fermante l'attend déjà plus bas ; `</` écrit le nom de l'élément encore ouvert, sous sa balise ouvrante ; renommer une balise renomme sa jumelle (ouvrante ou fermante) au fil de la frappe | ✅ |
 | Une couleur écrite dans une page, une feuille de style ou un script (`#rgb`, `#rrggbb`, avec ou sans opacité, `rgb()` / `rgba()`) est soulignée de sa propre couleur. Pas encore : couleurs nommées, `hsl()`, sélecteur de couleur | ✅ |
 | Complétion web : attributs dans une balise (ceux de l'élément puis les communs, `class=""` avec le curseur entre les guillemets) et valeurs de `type`, `target`, `rel`, `method`… ; propriétés CSS et leurs valeurs courantes, dans un fichier `.css`, dans `<style>` et dans l'attribut `style` ; les noms à tiret (`font-size`, `aria-label`) sont suivis d'un bout à l'autre | ✅ |
-| Abréviations à la Emmet, avec Tab. HTML : `ul>li.item$*3`, `#id`, `.classe`, `[attributs]`, `{texte}`, `>` `+` `*n`, `!` pour une page entière. CSS, dans un bloc : `m10-20` → `margin: 10px 20px;`, `w100p`, `fz1.5r`, `c#333`, `df`, `jcsb`, `posa`… (`crates/core/src/emmet.rs`). Les abréviations CSS marchent aussi dans `<style>`. Pas encore : groupes `( )`, remontée `^` | ✅ |
+| Abréviations à la Emmet, avec Tab. HTML : `ul>li.item$*3`, `#id`, `.classe`, `[attributs]`, `{texte}`, `>` `+` `*n`, groupes `( )`, remontée `^`, `!` pour une page entière. CSS, dans un bloc : `m10-20` → `margin: 10px 20px;`, `w100p`, `fz1.5r`, `c#333`, `df`, `jcsb`, `posa`… (`crates/core/src/emmet.rs`). Les abréviations CSS marchent aussi dans `<style>` | ✅ |
 
 ### Phase 2 — moteur de langages (🔨)
 

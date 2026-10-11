@@ -9,6 +9,7 @@ const VOID: [&str; 14] = [
     "track", "wbr",
 ];
 
+#[derive(Clone)]
 struct Element {
     name: String,
     id: Option<String>,
@@ -23,6 +24,8 @@ struct Element {
 /// What is left of an abbreviation being read.
 struct Reader<'a> {
     rest: &'a str,
+    /// How many levels a `^` just read still has to climb.
+    climb: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -93,10 +96,7 @@ fn element(reader: &mut Reader<'_>, parent: Option<&str>) -> Option<Element> {
         }
         described = true;
     }
-    if reader.eat('*') {
-        let times = reader.word(|ch| ch.is_ascii_digit()).parse().ok();
-        element.times = times.filter(|times| (1..=200).contains(times))?;
-    }
+    element.times = times(reader)?;
     if element.name.is_empty() {
         // Nothing at all is no element.
         if !described {
@@ -110,21 +110,56 @@ fn element(reader: &mut Reader<'_>, parent: Option<&str>) -> Option<Element> {
         .then_some(element)
 }
 
-/// Elements side by side; the last one may hold others.
+/// How many times what was just read is written: the number after a `*`, once without.
+fn times(reader: &mut Reader<'_>) -> Option<usize> {
+    if !reader.eat('*') {
+        return Some(1);
+    }
+    let times = reader.word(|ch| ch.is_ascii_digit()).parse().ok();
+    times.filter(|times| (1..=200).contains(times))
+}
+
+/// Elements side by side. One may hold others (`>`); a group between brackets counts as
+/// one, to put things beside it or to write it several times; `^` ends what an element
+/// holds and goes on beside it, one level up for each.
 fn siblings(reader: &mut Reader<'_>, parent: Option<&str>) -> Option<Vec<Element>> {
     let mut found = Vec::new();
     loop {
-        let mut next = element(reader, parent)?;
-        if reader.eat('>') {
-            let name = next.name.clone();
-            next.children = siblings(reader, Some(&name))?;
+        if reader.eat('(') {
+            let group = siblings(reader, parent)?;
+            if !reader.eat(')') {
+                return None;
+            }
+            for _ in 0..times(reader)? {
+                found.extend(group.iter().cloned());
+            }
+        } else {
+            let mut next = element(reader, parent)?;
+            if reader.eat('>') {
+                let name = next.name.clone();
+                next.children = siblings(reader, Some(&name))?;
+                found.push(next);
+                // Back from inside it: by a `^` that stops here, further up, or by the end.
+                match reader.climb {
+                    0 => return Some(found),
+                    1 => {
+                        reader.climb = 0;
+                        continue;
+                    }
+                    _ => {
+                        reader.climb -= 1;
+                        return Some(found);
+                    }
+                }
+            }
             found.push(next);
-            return Some(found);
         }
-        found.push(next);
-        if !reader.eat('+') {
-            return Some(found);
+        if reader.eat('+') {
+            continue;
         }
+        let climbs = reader.word(|ch| ch == '^').len();
+        reader.climb = climbs;
+        return Some(found);
     }
 }
 
@@ -198,8 +233,15 @@ pub fn expand(abbreviation: &str, tags: &[&str]) -> Option<String> {
     if abbreviation == "!" {
         return crate::complete::builtin("HTML", "html5").map(str::to_owned);
     }
-    let mut reader = Reader { rest: abbreviation };
-    let elements = siblings(&mut reader, None)?;
+    let mut reader = Reader {
+        rest: abbreviation,
+        climb: 0,
+    };
+    let mut elements = siblings(&mut reader, None)?;
+    // A `^` at the top has nowhere to climb: what follows it goes beside the rest.
+    while std::mem::take(&mut reader.climb) > 0 {
+        elements.extend(siblings(&mut reader, None)?);
+    }
     if !reader.rest.is_empty() {
         return None;
     }
@@ -413,13 +455,36 @@ mod tests {
             Some("<div>\n\t<p>$0</p>\n\t<ul>\n\t\t<li></li>\n\t</ul>\n</div>")
         );
         assert!(expanded("!").is_some_and(|page| page.starts_with("<!doctype html>")));
+        // A group counts as one element: things go beside it, or it is written again.
+        assert_eq!(
+            expanded("div>(ul>li)+p").as_deref(),
+            Some("<div>\n\t<ul>\n\t\t<li>$0</li>\n\t</ul>\n\t<p></p>\n</div>")
+        );
+        assert_eq!(
+            expanded("(p>a)*2").as_deref(),
+            Some("<p>\n\t<a href=\"$0\"></a>\n</p>\n<p>\n\t<a href=\"\"></a>\n</p>")
+        );
+        // `^` comes out of an element, once for each.
+        assert_eq!(
+            expanded("ul>li>a^li").as_deref(),
+            Some("<ul>\n\t<li>\n\t\t<a href=\"$0\"></a>\n\t</li>\n\t<li></li>\n</ul>")
+        );
+        assert_eq!(
+            expanded("div>p>a^^ul").as_deref(),
+            Some("<div>\n\t<p>\n\t\t<a href=\"$0\"></a>\n\t</p>\n</div>\n<ul></ul>")
+        );
+        assert_eq!(
+            expanded("p^a").as_deref(),
+            Some("<p>$0</p>\n<a href=\"\"></a>")
+        );
     }
 
     #[test]
     fn what_is_no_abbreviation_is_left_alone() {
         // A word that names no element is a word; so are numbers and signs.
         for not in [
-            "hello", "div>", ">p", "p*0", "p*", "a..b", "#", "p[a", "1", "a>>b", "x=1",
+            "hello", "div>", ">p", "p*0", "p*", "a..b", "#", "p[a", "1", "a>>b", "x=1", "(p", "p)",
+            "()", "p^",
         ] {
             assert_eq!(expanded(not), None, "{not}");
         }
