@@ -788,27 +788,30 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::ToggleTerminal),
             None,
             Some(Cmd::ToggleWrap),
+            Some(Cmd::Minimap),
+            Some(Cmd::Hints),
+            Some(Cmd::StickyScroll),
+            Some(Cmd::Preview),
+            Some(Cmd::Fold),
+            Some(Cmd::UnfoldAll),
+            None,
             Some(Cmd::Split),
             Some(Cmd::SplitDown),
             Some(Cmd::SplitSame),
+            None,
             Some(Cmd::Zen),
             Some(Cmd::Layouts),
             Some(Cmd::SaveLayout),
+            None,
             Some(Cmd::Themes),
+            Some(Cmd::ToggleTheme),
             Some(Cmd::Font),
             Some(Cmd::FontReset),
-            Some(Cmd::Preview),
-            Some(Cmd::Minimap),
             Some(Cmd::Keys),
-            Some(Cmd::Hints),
-            Some(Cmd::Fold),
-            Some(Cmd::UnfoldAll),
-            Some(Cmd::StickyScroll),
+            None,
             Some(Cmd::ZoomIn),
             Some(Cmd::ZoomOut),
             Some(Cmd::ZoomReset),
-            None,
-            Some(Cmd::ToggleTheme),
         ],
     ),
     (
@@ -825,6 +828,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Callers),
             Some(Cmd::Callees),
             Some(Cmd::Documentation),
+            None,
             Some(Cmd::Back),
             Some(Cmd::Forward),
             Some(Cmd::Reveal),
@@ -841,6 +845,11 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
         "Run",
         &[
             Some(Cmd::Run),
+            Some(Cmd::RunLast),
+            Some(Cmd::Tasks),
+            Some(Cmd::RunSettings),
+            Some(Cmd::EnvFile),
+            None,
             Some(Cmd::Debug),
             Some(Cmd::Breakpoint),
             Some(Cmd::BreakpointCondition),
@@ -855,29 +864,33 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::TestResults),
             Some(Cmd::TestAtCaret),
             Some(Cmd::RunCoverage),
-            Some(Cmd::EnvFile),
-            Some(Cmd::Docker),
-            Some(Cmd::Postgres),
             Some(Cmd::Coverage),
-            Some(Cmd::Tasks),
-            Some(Cmd::RunLast),
-            Some(Cmd::RunSettings),
-            Some(Cmd::LivePreview),
-            Some(Cmd::LivePreviewBrowser),
-            Some(Cmd::Response),
-            Some(Cmd::Assistant),
-            Some(Cmd::Suggest),
-            Some(Cmd::AutoSuggest),
-            Some(Cmd::EditMcp),
             None,
-            Some(Cmd::Plugins),
-            Some(Cmd::PluginsFolder),
-            Some(Cmd::PluginsReload),
             Some(Cmd::Check),
             None,
             Some(Cmd::ToggleTerminal),
             Some(Cmd::RestartTerminal),
             Some(Cmd::ClearTerminal),
+        ],
+    ),
+    (
+        "Tools",
+        &[
+            Some(Cmd::Assistant),
+            Some(Cmd::Suggest),
+            Some(Cmd::AutoSuggest),
+            Some(Cmd::EditMcp),
+            None,
+            Some(Cmd::LivePreview),
+            Some(Cmd::LivePreviewBrowser),
+            Some(Cmd::Response),
+            None,
+            Some(Cmd::Docker),
+            Some(Cmd::Postgres),
+            None,
+            Some(Cmd::Plugins),
+            Some(Cmd::PluginsFolder),
+            Some(Cmd::PluginsReload),
         ],
     ),
     (
@@ -889,14 +902,14 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Diff),
             Some(Cmd::Blame),
             Some(Cmd::History),
-            None,
             Some(Cmd::GitLog),
             Some(Cmd::GitGraph),
+            None,
             Some(Cmd::Stash),
             Some(Cmd::StashPop),
-            None,
             Some(Cmd::Merge),
             Some(Cmd::Rebase),
+            None,
             Some(Cmd::MergeView),
             Some(Cmd::AcceptOurs),
             Some(Cmd::AcceptTheirs),
@@ -906,6 +919,127 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
     (
         "Help",
         &[Some(Cmd::Shortcuts), Some(Cmd::Keymap), Some(Cmd::Commands)],
+    ),
+];
+
+/// The commands of a menu that are put away together under a name: the menu it is
+/// in, the name, the commands. They stand side by side in [`MENUS`].
+const SUBMENUS: &[(&str, &str, &[Cmd])] = &[
+    (
+        "Code",
+        "Lines",
+        &[
+            Cmd::DuplicateLine,
+            Cmd::DeleteLine,
+            Cmd::MoveLineUp,
+            Cmd::MoveLineDown,
+            Cmd::JoinLines,
+            Cmd::ToggleCase,
+        ],
+    ),
+    (
+        "View",
+        "Editor",
+        &[
+            Cmd::ToggleWrap,
+            Cmd::Minimap,
+            Cmd::Hints,
+            Cmd::StickyScroll,
+            Cmd::Preview,
+            Cmd::Fold,
+            Cmd::UnfoldAll,
+        ],
+    ),
+    (
+        "View",
+        "Split",
+        &[Cmd::Split, Cmd::SplitDown, Cmd::SplitSame],
+    ),
+    ("View", "Layout", &[Cmd::Zen, Cmd::Layouts, Cmd::SaveLayout]),
+    (
+        "View",
+        "Appearance",
+        &[
+            Cmd::Themes,
+            Cmd::ToggleTheme,
+            Cmd::Font,
+            Cmd::FontReset,
+            Cmd::Keys,
+        ],
+    ),
+    ("View", "Zoom", &[Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset]),
+    (
+        "Navigate",
+        "Code",
+        &[
+            Cmd::Declaration,
+            Cmd::Implementation,
+            Cmd::FindUsages,
+            Cmd::Callers,
+            Cmd::Callees,
+            Cmd::Documentation,
+        ],
+    ),
+    (
+        "Run",
+        "Debug",
+        &[
+            Cmd::Debug,
+            Cmd::Breakpoint,
+            Cmd::BreakpointCondition,
+            Cmd::StepOver,
+            Cmd::StepInto,
+            Cmd::StepOut,
+            Cmd::StopDebug,
+            Cmd::DebugSettings,
+        ],
+    ),
+    (
+        "Run",
+        "Tests",
+        &[
+            Cmd::TestsPanel,
+            Cmd::RunTests,
+            Cmd::TestResults,
+            Cmd::TestAtCaret,
+            Cmd::RunCoverage,
+            Cmd::Coverage,
+        ],
+    ),
+    (
+        "Run",
+        "Terminal",
+        &[
+            Cmd::ToggleTerminal,
+            Cmd::RestartTerminal,
+            Cmd::ClearTerminal,
+        ],
+    ),
+    (
+        "Tools",
+        "Assistant",
+        &[Cmd::Assistant, Cmd::Suggest, Cmd::AutoSuggest, Cmd::EditMcp],
+    ),
+    (
+        "Tools",
+        "Web",
+        &[Cmd::LivePreview, Cmd::LivePreviewBrowser, Cmd::Response],
+    ),
+    ("Tools", "Data", &[Cmd::Docker, Cmd::Postgres]),
+    (
+        "Tools",
+        "Plugins",
+        &[Cmd::Plugins, Cmd::PluginsFolder, Cmd::PluginsReload],
+    ),
+    (
+        "Git",
+        "Conflict",
+        &[
+            Cmd::MergeView,
+            Cmd::AcceptOurs,
+            Cmd::AcceptTheirs,
+            Cmd::AcceptBoth,
+        ],
     ),
 ];
 
@@ -7639,7 +7773,7 @@ impl GodApp {
             for (title, items) in MENUS {
                 ui.menu_button(*title, |ui| {
                     ui.set_min_width(260.0);
-                    menu_items(ui, clicked, items);
+                    menu_items(ui, clicked, title, items);
                 });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -8663,7 +8797,7 @@ impl GodApp {
         let id = tab.editor_id();
         let mut menu = |ui: &mut Ui| {
             ui.set_min_width(260.0);
-            menu_items(ui, clicked, EDITOR_MENU);
+            menu_items(ui, clicked, "", EDITOR_MENU);
         };
         let output = editor::show(ui, id, &mut tab.text, &config, &mut tab.view, &mut menu);
         if output.changed {
@@ -10366,8 +10500,23 @@ fn symbol_icon(kind: &str) -> (&'static str, Color32) {
 }
 
 /// The entries of a menu: commands with their icon and shortcut, `None` being a separator.
-fn menu_items(ui: &mut Ui, clicked: &mut Vec<Cmd>, items: &[Option<Cmd>]) {
+fn menu_items(ui: &mut Ui, clicked: &mut Vec<Cmd>, menu: &str, items: &[Option<Cmd>]) {
     for item in items {
+        // Commands put away together show as one entry that opens on them: it stands
+        // where the first of them would.
+        let inside = |(of, _, held): &&(&str, &str, &[Cmd])| {
+            *of == menu && item.is_some_and(|cmd| held.contains(&cmd))
+        };
+        if let Some((_, name, held)) = SUBMENUS.iter().find(inside) {
+            if held.first() == item.as_ref() {
+                let held: Vec<Option<Cmd>> = held.iter().copied().map(Some).collect();
+                ui.menu_button(*name, |ui| {
+                    ui.set_min_width(260.0);
+                    menu_items(ui, clicked, "", &held);
+                });
+            }
+            continue;
+        }
         match item.and_then(spec_of) {
             Some(spec) => {
                 let label = with_icon(spec.glyph, spec.label);
@@ -10610,6 +10759,15 @@ mod tests {
         ];
         assert_eq!(shown, expected);
         assert_eq!(rows[4].new.as_ref().map(|line| line.0), Some(5));
+        // What is put away under a name in a menu stands side by side in that menu.
+        for (menu, name, held) in SUBMENUS {
+            let items = MENUS.iter().find(|(title, _)| title == menu);
+            let items = items.map(|(_, items)| *items).unwrap_or_default();
+            let first = items.iter().position(|item| *item == held.first().copied());
+            let there = first.and_then(|first| items.get(first..first + held.len()));
+            let wanted: Vec<Option<Cmd>> = held.iter().copied().map(Some).collect();
+            assert_eq!(there, Some(&wanted[..]), "{menu} > {name}");
+        }
         let mut folds = std::collections::HashMap::new();
         folds.insert(PathBuf::from("C:/code/a b.rs"), vec![3, 12]);
         let text = folds_text(&folds);
