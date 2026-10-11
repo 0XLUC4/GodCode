@@ -796,23 +796,27 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
         let caret = caret.start;
         let at = godcode_core::byte_index(text, caret);
         let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
-        let written = if markup {
-            let abbreviation = godcode_core::emmet::abbreviation(&text[line..at]);
-            abbreviation.and_then(|abbreviation| {
-                let tags = config.language.keywords();
-                Some((
-                    abbreviation,
-                    godcode_core::emmet::expand(abbreviation, tags)?,
-                ))
-            })
-        } else {
-            // Alone on its line, in a block: outside one, a short word is a selector.
-            let alone = text[line..at].trim_start();
-            let before = &text[..line];
-            let in_block = before.matches('{').count() > before.matches('}').count();
-            let abbreviation = Some(alone).filter(|_| in_block);
-            abbreviation.and_then(|alone| Some((alone, godcode_core::emmet::expand_css(alone)?)))
+        // The style sheet the line is in: the file itself, or a `style` element of a page.
+        let sheet = match styles {
+            true => Some(&text[..line]),
+            false => complete::style_sheet(&text[..line]),
         };
+        // Alone on its line, in a block: outside one, a short word is a selector.
+        let declared = sheet.and_then(|sheet| {
+            let alone = text[line..at].trim_start();
+            let in_block = sheet.matches('{').count() > sheet.matches('}').count();
+            let body = godcode_core::emmet::expand_css(alone).filter(|_| in_block)?;
+            Some((alone, body))
+        });
+        let written = declared.or_else(|| {
+            let abbreviation = godcode_core::emmet::abbreviation(&text[line..at]);
+            let abbreviation = abbreviation.filter(|_| markup && sheet.is_none())?;
+            let tags = config.language.keywords();
+            Some((
+                abbreviation,
+                godcode_core::emmet::expand(abbreviation, tags)?,
+            ))
+        });
         if let Some((abbreviation, body)) = written {
             let start = caret - abbreviation.chars().count();
             pressed(Modifiers::NONE, Key::Tab);
@@ -1898,6 +1902,17 @@ mod tests {
         harness.type_text("m10-20");
         harness.key(Key::Tab, Modifiers::NONE);
         assert_eq!(harness.text, "a {\n    margin: 10px 20px;\n}");
+        // In the style element of a page too; and there, elements are not written.
+        let page = "<style>\nbody {\n    \n}\n</style>";
+        let mut harness = Harness::of("index.html", page, false);
+        set_selection(&harness.ctx, editor_id(), &(19..19));
+        harness.frame(Vec::new());
+        harness.type_text("df");
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(
+            harness.text,
+            "<style>\nbody {\n    display: flex;\n}\n</style>"
+        );
         // Outside a block the same letters are a selector: Tab indents.
         let mut harness = Harness::of("style.css", "p", false);
         set_selection(&harness.ctx, editor_id(), &(1..1));

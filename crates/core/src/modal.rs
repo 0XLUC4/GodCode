@@ -530,6 +530,23 @@ impl Vim {
                 let range = at..(at + times).min(end);
                 return self.operate(chars, ('d', at), range, false, done);
             }
+            '~' => {
+                // The case of the letters under the caret, which then goes on past them.
+                let to = (at + times).min(end);
+                for ch in &mut chars[at..to] {
+                    let other: String = match ch.is_uppercase() {
+                        true => ch.to_lowercase().collect(),
+                        false => ch.to_uppercase().collect(),
+                    };
+                    let mut other = other.chars();
+                    // A letter whose other case is several letters is left as it is.
+                    if let (Some(one), None) = (other.next(), other.next()) {
+                        *ch = one;
+                    }
+                }
+                done.changed = to > at;
+                return to;
+            }
             'D' => return self.operate(chars, ('d', at), at..end, false, done),
             'C' => return self.operate(chars, ('c', at), at..end, false, done),
             'i' => self.mode = Mode::Insert,
@@ -707,6 +724,65 @@ fn object(chars: &[char], at: usize, named: char, around: bool) -> Option<Range<
     })
 }
 
+/// The bracket that goes with the first one at or after `at` on its line.
+fn partner(chars: &[char], at: usize) -> Option<usize> {
+    const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+    let bracket = |ch: &char| PAIRS.iter().any(|(open, close)| ch == open || ch == close);
+    let from = at + chars[at..line_end(chars, at)].iter().position(bracket)?;
+    let (open, close) = *PAIRS
+        .iter()
+        .find(|(open, close)| chars[from] == *open || chars[from] == *close)?;
+    let forward = chars[from] == open;
+    let mut depth = 0_usize;
+    // Out from it, past the pairs that open and close on the way.
+    let mut pairs = |index: &usize| {
+        let ch = chars[*index];
+        if ch == chars[from] {
+            depth += 1;
+        } else if ch == open || ch == close {
+            if depth == 0 {
+                return true;
+            }
+            depth -= 1;
+        }
+        false
+    };
+    match forward {
+        true => (from + 1..chars.len()).find(&mut pairs),
+        false => (0..from).rev().find(&mut pairs),
+    }
+}
+
+/// Where the word under the caret is written next (`forward`) or before, as a whole word;
+/// the search goes round the ends of the text.
+fn occurrence(chars: &[char], at: usize, forward: bool) -> Option<usize> {
+    let wordy = |index: usize| chars.get(index).is_some_and(|ch| kind(*ch) == 0);
+    if !wordy(at) {
+        return None;
+    }
+    let start = (0..=at).rev().take_while(|index| wordy(*index)).last()?;
+    let end = (at..chars.len()).take_while(|index| wordy(*index)).last()? + 1;
+    let word = &chars[start..end];
+    let whole = |from: &usize| {
+        let before = from.checked_sub(1).is_some_and(wordy);
+        chars[*from..].starts_with(word) && !before && !wordy(from + word.len())
+    };
+    let starts = 0..chars.len().saturating_sub(word.len() - 1);
+    match forward {
+        true => starts
+            .clone()
+            .skip(start + 1)
+            .chain(starts.take(start))
+            .find(whole),
+        false => starts
+            .clone()
+            .take(start)
+            .rev()
+            .chain(starts.skip(start + 1).rev())
+            .find(whole),
+    }
+}
+
 /// Where a key that moves the caret takes it, `count` times, and what the move covers.
 fn motion(chars: &[char], at: usize, key: Stroke, count: Option<usize>) -> Option<(usize, Span)> {
     let repeat = |step: &dyn Fn(usize) -> usize| (0..count.unwrap_or(1)).fold(at, |at, _| step(at));
@@ -728,6 +804,9 @@ fn motion(chars: &[char], at: usize, key: Stroke, count: Option<usize>) -> Optio
         Stroke::Char('0') => (line_start(chars, at), Span::Upto),
         Stroke::Char('^') => (first_text(chars, at), Span::Upto),
         Stroke::Char('$') => (line_end(chars, at), Span::Upto),
+        Stroke::Char('%') => (partner(chars, at)?, Span::With),
+        Stroke::Char('*') => (occurrence(chars, at, true)?, Span::Upto),
+        Stroke::Char('#') => (occurrence(chars, at, false)?, Span::Upto),
         Stroke::Char('G') => (
             line_numbered(chars, count.unwrap_or(usize::MAX)),
             Span::Lines,
@@ -971,6 +1050,25 @@ mod tests {
             ("say \"X\" now".to_owned(), 5)
         );
         assert_eq!(vim("a [1] b", 0, "di["), ("a [1] b".to_owned(), 0));
+    }
+
+    #[test]
+    fn vim_goes_to_partners_and_to_the_same_word() {
+        let text = "if (a[1] + f(b)) { one(); }\nlet one = one + done;";
+        // From before a bracket to it, then to its partner; and back.
+        assert_eq!((vim(text, 0, "%").1, vim(text, 15, "%").1), (15, 3));
+        assert_eq!((vim(text, 5, "%").1, vim(text, 17, "%").1), (7, 26));
+        assert_eq!(vim("a (b", 0, "%").1, 0);
+        // The word under the caret, whole: `done` is not `one`.
+        assert_eq!(vim(text, 19, "*").1, 32);
+        assert_eq!(vim(text, 32, "*").1, 38);
+        assert_eq!(vim(text, 38, "*").1, 19);
+        assert_eq!(vim(text, 19, "#").1, 38);
+        assert_eq!(vim("alone here", 2, "*").1, 2);
+        // With an operator, to the partner and with it.
+        assert_eq!(vim("f(a, b) + c", 1, "d%"), ("f + c".to_owned(), 1));
+        assert_eq!(vim("aBc é", 0, "~~~"), ("AbC é".to_owned(), 3));
+        assert_eq!(vim("ab", 0, "3~"), ("AB".to_owned(), 1));
     }
 
     #[test]

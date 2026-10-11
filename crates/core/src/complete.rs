@@ -460,11 +460,17 @@ fn place_in_markup(before: &str) -> Option<Place<'_>> {
             attribute => Place::Value(attribute),
         });
     }
+    Some(Place::Style(style_sheet(before)?, false))
+}
+
+/// The style sheet `before`, a page up to some place, ends in: what its `style` element
+/// holds so far. `None` outside such an element.
+pub fn style_sheet(before: &str) -> Option<&str> {
     let sheet = &before[before.rfind("<style")?..];
     if sheet.contains("</style") {
         return None;
     }
-    Some(Place::Style(&sheet[sheet.find('>')? + 1..], false))
+    Some(&sheet[sheet.find('>')? + 1..])
 }
 
 /// What is being written at the end of `sheet`, a style sheet up to a name: a property
