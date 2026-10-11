@@ -14,6 +14,7 @@ mod terminal;
 mod theme;
 mod toasts;
 mod tools;
+mod webview;
 mod widgets;
 
 pub const APP_NAME: &str = "GodCode";

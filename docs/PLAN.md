@@ -154,10 +154,21 @@ Fait : client HTTP — fichiers `.http`, `F5` envoie la requête sous le curseur
 (JSON mis en forme) dans le panneau Response ; passe par `curl`. Reste : GraphQL,
 WebSocket, collections.
 
-Fait : **aperçu web en direct** (`Live Preview in Browser`) — le dossier est servi sur
-127.0.0.1 uniquement, la page se recharge seule à chaque sauvegarde. Reste : aperçu
-intégré à la fenêtre, inspecteur, bases de données (SQLite et
-PostgreSQL d'abord), Docker.
+Fait : **aperçu web en direct** — le dossier est servi sur 127.0.0.1 uniquement, la page se
+recharge seule à chaque sauvegarde. `Live Preview` l'affiche dans la fenêtre, à droite de
+l'éditeur ; `Live Preview in Browser` l'ouvre dans le navigateur. Le panneau a une barre
+d'adresse (n'importe quelle page, un serveur de développement comme `localhost:5173`),
+recharger, ouvrir dans le navigateur, et **inspecter** : les outils de développement de la
+page (éléments, console, réseau).
+
+L'aperçu intégré passe par la vue web du système (WebView2, par la bibliothèque `wry`) :
+écrire un moteur web n'est pas à notre portée, c'est la seule dépendance de ce genre.
+Windows seulement pour l'instant ; ailleurs la page s'ouvre dans le navigateur. La vue web
+est une fenêtre posée sur la nôtre : elle s'efface quand un menu ou une boîte de dialogue
+a besoin de la place.
+
+Reste : précédent / suivant dans l'aperçu, aperçu qui suit le fichier en avant, bases de
+données (SQLite et PostgreSQL d'abord), Docker.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 

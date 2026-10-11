@@ -174,6 +174,7 @@ enum Cmd {
     Breakpoint,
     DebugPanel,
     LivePreview,
+    LivePreviewBrowser,
     TestAtCaret,
     NewProject,
     Keymap,
@@ -550,8 +551,9 @@ const COMMANDS: &[Spec] = &[
         "F9",
     ),
     spec(Cmd::DebugPanel, icon::BUG, "Toggle Debug Panel", ""),
+    spec(Cmd::LivePreview, icon::BROWSER, "Live Preview", ""),
     spec(
-        Cmd::LivePreview,
+        Cmd::LivePreviewBrowser,
         icon::BROWSER,
         "Live Preview in Browser",
         "",
@@ -751,6 +753,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::TestAtCaret),
             Some(Cmd::Tasks),
             Some(Cmd::LivePreview),
+            Some(Cmd::LivePreviewBrowser),
             Some(Cmd::Response),
             Some(Cmd::Check),
             None,
@@ -1189,6 +1192,17 @@ fn folds_of(text: &str) -> std::collections::HashMap<PathBuf, Vec<usize>> {
 /// for: a tab, its revision, its selection.
 type CaretPlace = ((u64, u64, Range<usize>), (usize, usize), (usize, usize));
 
+/// An address as it was typed, made whole: without a scheme it is a page served over HTTP,
+/// as the development servers of this computer do.
+fn whole_address(typed: &str) -> Option<String> {
+    let typed = typed.trim();
+    match typed {
+        "" => None,
+        typed if typed.contains("://") => Some(typed.to_owned()),
+        typed => Some(format!("http://{typed}")),
+    }
+}
+
 /// Whose keys the editor obeys.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keys {
@@ -1415,6 +1429,13 @@ pub struct GodApp {
     debug_output: String,
     /// The folder served to the browser, pages reloading at each save.
     live: Option<crate::live::Live>,
+    /// The page shown inside the window, once one was; whether its panel shows; and the
+    /// address it is to show next, taken up when the window can be reached.
+    web: Option<crate::webview::Web>,
+    web_open: bool,
+    web_wanted: Option<String>,
+    /// The address of that page, as it shows and as it is typed.
+    web_address: String,
     /// The project templates are shown, and the one chosen.
     templates: Option<usize>,
     /// The shortcuts of the user: they win over the built-in ones.
@@ -1553,6 +1574,10 @@ impl GodApp {
             debug_at: None,
             debug_output: String::new(),
             live: None,
+            web: None,
+            web_open: false,
+            web_wanted: None,
+            web_address: String::new(),
             templates: None,
             keymap: load_keymap(),
             split_down: false,
@@ -3322,41 +3347,132 @@ impl GodApp {
 
     /// Show the file in front in the browser, served from this computer: it reloads by
     /// itself at each save.
-    fn live_preview(&mut self, ctx: &Context) {
+    /// The address the file in front is served at: it is saved first, and its folder
+    /// served when it is not yet.
+    fn live_url(&mut self, ctx: &Context) -> Option<String> {
         let index = self.active;
         let unsaved = self
             .tabs
             .get(index)
             .is_some_and(|tab| tab.dirty || tab.path.is_none());
         if unsaved && !self.save_tab(ctx, index, false) {
-            return;
+            return None;
         }
-        let Some(path) = self.tabs.get(index).and_then(|tab| tab.path.clone()) else {
-            return;
-        };
+        let path = self.tabs.get(index).and_then(|tab| tab.path.clone())?;
         let beside = path.parent().map(Path::to_path_buf);
         let root = self
             .folder()
             .filter(|root| path.starts_with(root))
-            .or(beside);
-        let Some(root) = root else {
-            return;
-        };
+            .or(beside)?;
         // One folder is served at a time: another one replaces it.
         if self.live.as_ref().is_none_or(|live| live.root != root) {
             match crate::live::Live::start(root) {
                 Ok(live) => self.live = Some(live),
                 Err(err) => {
                     self.toasts.error(format!("Cannot serve the folder: {err}"));
-                    return;
+                    return None;
                 }
             }
         }
-        let url = self.live.as_ref().and_then(|live| live.url_of(&path));
-        match url.map(|url| tools::open_in_browser(&url).map(|()| url)) {
-            Some(Ok(url)) => self.toasts.success(format!("Live preview at {url}")),
-            Some(Err(err)) => self.toasts.error(err),
-            None => {}
+        self.live.as_ref().and_then(|live| live.url_of(&path))
+    }
+
+    /// Show the file in front as a page, inside the window or in the browser.
+    fn live_preview(&mut self, ctx: &Context, in_browser: bool) {
+        let Some(url) = self.live_url(ctx) else {
+            return;
+        };
+        if !in_browser {
+            self.web_wanted = Some(url);
+            return;
+        }
+        match tools::open_in_browser(&url) {
+            Ok(()) => self.toasts.success(format!("Live preview at {url}")),
+            Err(err) => self.toasts.error(err),
+        }
+    }
+
+    /// The panel of the page shown inside the window: its address and what can be done
+    /// with it. Returns the place left for the page itself.
+    fn web_panel(&mut self, ui: &mut Ui) -> Option<Rect> {
+        let web = self.web.as_ref()?;
+        let url = web.url().to_owned();
+        let mut close = false;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(6.0);
+                let button = |ui: &mut Ui, glyph: &str, tip: &str| {
+                    let button = Button::new(glyph).frame_when_inactive(false);
+                    ui.add(button).on_hover_text(tip).clicked()
+                };
+                close = button(ui, icon::X, "Close the preview");
+                if button(
+                    ui,
+                    icon::BUG,
+                    "Inspect the page: elements, console, network",
+                ) {
+                    web.inspect();
+                }
+                if button(ui, icon::ARROW_SQUARE_OUT, "Open in the browser")
+                    && let Err(err) = tools::open_in_browser(&url)
+                {
+                    self.toasts.error(err);
+                }
+                if button(ui, icon::ARROW_CLOCKWISE, "Reload") {
+                    web.reload();
+                }
+                // The address takes what is left: any page can be typed there, a
+                // development server of this computer to begin with.
+                let address = TextEdit::singleline(&mut self.web_address)
+                    .desired_width(ui.available_width() - 10.0)
+                    .hint_text("localhost:5173");
+                let typed = ui.add(address);
+                let entered = ui.input(|input| input.key_pressed(Key::Enter));
+                if typed.lost_focus() && entered {
+                    self.web_wanted = whole_address(&self.web_address);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        if close {
+            self.web_open = false;
+            return None;
+        }
+        // The edge of the panel stays ours, to drag it wider or narrower.
+        let rect = ui.available_rect_before_wrap().shrink2(vec2(4.0, 0.0));
+        ui.allocate_rect(rect, Sense::hover());
+        Some(rect)
+    }
+
+    /// Put the page shown inside the window where its panel is, or hide it: it is a
+    /// window of its own, over anything drawn there.
+    fn place_web(&mut self, ctx: &Context, frame: &eframe::Frame, rect: Option<Rect>) {
+        if let Some(url) = self.web_wanted.take() {
+            self.web_address.clone_from(&url);
+            match &mut self.web {
+                Some(web) => web.go(&url),
+                None => match crate::webview::Web::open(frame, &url) {
+                    Ok(web) => self.web = Some(web),
+                    // No web view to show it in: the browser has one.
+                    Err(err) => {
+                        self.toasts.error(err);
+                        let _ = tools::open_in_browser(&url);
+                    }
+                },
+            }
+            self.web_open = self.web.is_some();
+            ctx.request_repaint();
+        }
+        // A menu or a dialog would be drawn under the page: the page gives way.
+        let covered =
+            ctx.any_popup_open() || ctx.memory(|memory| memory.top_modal_layer().is_some());
+        if let Some(web) = &mut self.web {
+            // A press seen here was not in the page: the keyboard comes back with it.
+            if ctx.input(|input| input.pointer.any_pressed()) {
+                web.release_keyboard();
+            }
+            web.place(rect.filter(|_| !covered), ctx.pixels_per_point());
         }
     }
 
@@ -4357,7 +4473,8 @@ impl GodApp {
                 let line = self.caret_line;
                 self.toggle_breakpoint(self.active, line);
             }
-            Cmd::LivePreview => self.live_preview(ctx),
+            Cmd::LivePreview => self.live_preview(ctx, false),
+            Cmd::LivePreviewBrowser => self.live_preview(ctx, true),
             Cmd::Keymap => {
                 let example = "{\n  \"Reformat Code\": \"Ctrl+Alt+L\",\n  \"Toggle Terminal\": \"Ctrl+J\"\n}\n";
                 self.open_settings(ctx, "keymap.json", example);
@@ -6765,7 +6882,7 @@ impl GodApp {
 }
 
 impl eframe::App for GodApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut clicked = std::mem::take(&mut self.pending);
         self.poll();
@@ -6807,6 +6924,8 @@ impl eframe::App for GodApp {
         }
         let palette = Palette::of(ui);
         let plain = |fill, margin: Margin| Frame::new().fill(fill).inner_margin(margin);
+        // Where the page shown inside the window goes, when its panel shows.
+        let mut web_rect = None;
 
         Panel::top("menu-bar")
             .frame(plain(palette.surface, Margin::symmetric(8, 3)))
@@ -6871,6 +6990,14 @@ impl eframe::App for GodApp {
                     .frame(plain(palette.surface, Margin::symmetric(12, 5)))
                     .show(ui, |ui| self.find_bar(ui, &mut clicked));
             }
+            if self.web_open && !zen {
+                Panel::right("web-preview")
+                    .resizable(true)
+                    .default_size(560.0)
+                    .size_range(240.0..=1600.0)
+                    .frame(plain(palette.bg, Margin::ZERO))
+                    .show(ui, |ui| web_rect = self.web_panel(ui));
+            }
             if self.preview && self.is_markdown() {
                 Panel::right("markdown-preview")
                     .resizable(true)
@@ -6898,6 +7025,7 @@ impl eframe::App for GodApp {
                 .frame(Frame::new().fill(palette.bg))
                 .show(ui, |ui| self.editor_area(ui, &mut clicked));
         }
+        self.place_web(&ctx, frame, web_rect);
         for cmd in clicked {
             self.run(&ctx, cmd);
         }
@@ -7327,6 +7455,24 @@ fn text_on_disk(path: &Path) -> Option<Decoded> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_address_is_made_whole() {
+        let whole = |typed: &str| whole_address(typed);
+        assert_eq!(
+            whole(" localhost:5173 ").as_deref(),
+            Some("http://localhost:5173")
+        );
+        assert_eq!(
+            whole("https://example.org/a").as_deref(),
+            Some("https://example.org/a")
+        );
+        assert_eq!(
+            whole("file:///C:/site/index.html").as_deref(),
+            Some("file:///C:/site/index.html")
+        );
+        assert_eq!(whole("  "), None);
+    }
 
     #[test]
     fn folded_blocks_are_written_and_read_back() {
