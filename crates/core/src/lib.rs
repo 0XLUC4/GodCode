@@ -124,26 +124,12 @@ pub fn encode(text: &str, ending: LineEnding, bom: bool) -> Vec<u8> {
 
 /// Byte offset of the char at `index` (the end of the text when past it).
 pub fn byte_index(text: &str, index: usize) -> usize {
-    // A char starts at every byte that does not continue one: whole blocks of them are
-    // counted at once, which is many times faster than going char by char.
-    const BLOCK: usize = 4096;
-    let starts_char = |byte: &u8| (*byte as i8) >= -0x40;
-    let bytes = text.as_bytes();
-    let (mut at, mut left) = (0, index);
-    while let Some(block) = bytes.get(at..at + BLOCK) {
-        let starts = block.iter().filter(|byte| starts_char(byte)).count();
-        if starts > left {
-            break;
-        }
-        left -= starts;
-        at += BLOCK;
+    // The standard library steps over chars many bytes at a time: nothing here is faster.
+    let mut rest = text.chars();
+    if index > 0 {
+        rest.nth(index - 1);
     }
-    // From here the `left`-th char that starts is the one.
-    let rest = bytes[at..].iter().enumerate();
-    let mut starting = rest.filter(|(_, byte)| starts_char(byte));
-    starting
-        .nth(left)
-        .map_or(text.len(), |(found, _)| at + found)
+    text.len() - rest.as_str().len()
 }
 
 /// Line and column of the char at `index`, both counted from 1.
@@ -226,6 +212,52 @@ mod tests {
         }
         for index in (0..chars).step_by(617) {
             assert_eq!(byte_index(&long, index), slow(index), "char {index}");
+        }
+    }
+
+    /// `byte_index` as it was: blocks of bytes counted by hand.
+    fn old_byte_index(text: &str, index: usize) -> usize {
+        const BLOCK: usize = 4096;
+        let starts_char = |byte: &u8| (*byte as i8) >= -0x40;
+        let bytes = text.as_bytes();
+        let (mut at, mut left) = (0, index);
+        while let Some(block) = bytes.get(at..at + BLOCK) {
+            let starts = block.iter().filter(|byte| starts_char(byte)).count();
+            if starts > left {
+                break;
+            }
+            left -= starts;
+            at += BLOCK;
+        }
+        let rest = bytes[at..].iter().enumerate();
+        let mut starting = rest.filter(|(_, byte)| starts_char(byte));
+        starting
+            .nth(left)
+            .map_or(text.len(), |(found, _)| at + found)
+    }
+
+    #[test]
+    fn the_byte_of_a_char_is_found_as_it_was_before() {
+        let pieces = ["a", "é", "😀", "€", "\n", "\r\n", "\t", "  ", "word "];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for round in 0..300 {
+            // Short texts and ones longer than the blocks the old one counted by.
+            let length = if round % 10 == 0 { 9000 } else { next(60) };
+            let text: String = (0..length).map(|_| pieces[next(pieces.len())]).collect();
+            let chars = text.chars().count();
+            for index in (0..40).map(|_| next(chars + 3)).chain([0, chars]) {
+                assert_eq!(
+                    byte_index(&text, index),
+                    old_byte_index(&text, index),
+                    "char {index} of {text:?}"
+                );
+            }
         }
     }
 }

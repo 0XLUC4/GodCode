@@ -8,8 +8,17 @@ use crate::byte_index;
 use crate::check;
 use crate::syntax::Language;
 
-fn char_index(text: &str, byte: usize) -> usize {
-    text[..byte].chars().count()
+/// The selection in bytes: the text is read once, up to where the selection ends.
+fn bytes_of(text: &str, selection: &Range<usize>) -> Range<usize> {
+    let start = byte_index(text, selection.start);
+    let chars = selection.end.saturating_sub(selection.start);
+    start..start + byte_index(&text[start..], chars)
+}
+
+/// Char index of `byte`, a place at or before the start of the selection, whose bytes are
+/// `selected`: counted back from the selection, not from the start of the text.
+fn char_index(text: &str, byte: usize, selection: &Range<usize>, selected: &Range<usize>) -> usize {
+    selection.start - text[byte..selected.start].chars().count()
 }
 
 fn line_start(text: &str, byte: usize) -> usize {
@@ -51,8 +60,7 @@ pub fn newline(
     language: &Language,
 ) -> usize {
     let markup = language.is_markup();
-    let start = byte_index(text, selection.start);
-    let end = byte_index(text, selection.end);
+    let Range { start, end } = bytes_of(text, &selection);
     let line = &text[line_start(text, start)..start];
     let lead: String = line
         .chars()
@@ -96,20 +104,19 @@ pub fn newline(
     caret
 }
 
-/// Byte range of the whole lines the selection touches, without the last line end.
-fn whole_lines(text: &str, selection: &Range<usize>) -> Range<usize> {
-    let start = byte_index(text, selection.start);
-    let mut end = byte_index(text, selection.end);
+/// Byte range of the whole lines the bytes `selected` touch, without the last line end.
+fn whole_lines(text: &str, selected: &Range<usize>) -> Range<usize> {
+    let mut end = selected.end;
     // A selection ending at the start of a line does not take that line.
-    if end > start && text[..end].ends_with('\n') {
+    if end > selected.start && text[..end].ends_with('\n') {
         end -= 1;
     }
-    line_start(text, start)..line_end(text, end)
+    line_start(text, selected.start)..line_end(text, end)
 }
 
 /// Copy the touched lines below themselves; the selection moves to the copy.
 pub fn duplicate_lines(text: &mut String, selection: Range<usize>) -> Range<usize> {
-    let block = whole_lines(text, &selection);
+    let block = whole_lines(text, &bytes_of(text, &selection));
     let copy = format!("\n{}", &text[block.clone()]);
     let shift = copy.chars().count();
     text.insert_str(block.end, &copy);
@@ -118,21 +125,24 @@ pub fn duplicate_lines(text: &mut String, selection: Range<usize>) -> Range<usiz
 
 /// Remove the touched lines; the caret goes to the start of the line that takes their place.
 pub fn delete_lines(text: &mut String, selection: Range<usize>) -> Range<usize> {
-    let block = whole_lines(text, &selection);
+    let selected = bytes_of(text, &selection);
+    let block = whole_lines(text, &selected);
     // Take a line end too: the one after, or on the last line the one before.
     let removed = if block.end < text.len() {
         block.start..block.end + 1
     } else {
         block.start.saturating_sub(1)..block.end
     };
+    let first = char_index(text, removed.start, &selection, &selected);
     text.replace_range(removed.clone(), "");
-    let caret = char_index(text, line_start(text, removed.start));
+    let line = line_start(text, removed.start)..removed.start;
+    let caret = first - text[line].chars().count();
     caret..caret
 }
 
 /// Swap the touched lines with the line above or below; `None` at the edge of the text.
 pub fn move_lines(text: &mut String, selection: Range<usize>, up: bool) -> Option<Range<usize>> {
-    let block = whole_lines(text, &selection);
+    let block = whole_lines(text, &bytes_of(text, &selection));
     if up {
         let above_end = block.start.checked_sub(1)?;
         let above = line_start(text, above_end)..above_end;
@@ -158,8 +168,9 @@ fn rewrite(
     selection: Range<usize>,
     change: impl FnOnce(&str) -> String,
 ) -> Range<usize> {
-    let block = whole_lines(text, &selection);
-    let first = char_index(text, block.start);
+    let selected = bytes_of(text, &selection);
+    let block = whole_lines(text, &selected);
+    let first = char_index(text, block.start, &selection, &selected);
     let old = &text[block.clone()];
     let old_len = old.chars().count();
     let new = change(old);
@@ -181,7 +192,7 @@ fn map_lines(block: &str, change: impl Fn(&str) -> String) -> String {
 
 /// Tab: insert one indent at the caret, or indent every line of a multi-line selection.
 pub fn indent(text: &mut String, selection: Range<usize>, unit: &str) -> Range<usize> {
-    let bytes = byte_index(text, selection.start)..byte_index(text, selection.end);
+    let bytes = bytes_of(text, &selection);
     if !text[bytes.clone()].contains('\n') {
         text.replace_range(bytes, unit);
         let caret = selection.start + unit.chars().count();
@@ -247,14 +258,15 @@ pub fn toggle_comment(text: &mut String, selection: Range<usize>, prefix: &str) 
 /// Join the touched lines into one, or the caret's line with the next: the indent of the
 /// joined lines becomes one space.
 pub fn join_lines(text: &mut String, selection: Range<usize>) -> Range<usize> {
-    let mut block = whole_lines(text, &selection);
+    let selected = bytes_of(text, &selection);
+    let mut block = whole_lines(text, &selected);
     if !text[block.clone()].contains('\n') {
         if block.end >= text.len() {
             return selection;
         }
         block.end = line_end(text, block.end + 1);
     }
-    let first = char_index(text, block.start);
+    let first = char_index(text, block.start, &selection, &selected);
     let mut lines = text[block.clone()].split('\n');
     let mut joined = lines.next().unwrap_or("").trim_end().to_owned();
     // The caret ends where the first join was made.
@@ -269,7 +281,7 @@ pub fn join_lines(text: &mut String, selection: Range<usize>) -> Range<usize> {
 
 /// Upper-case the selection, or lower-case it when it already is upper-case.
 pub fn toggle_case(text: &mut String, selection: Range<usize>) -> Range<usize> {
-    let bytes = byte_index(text, selection.start)..byte_index(text, selection.end);
+    let bytes = bytes_of(text, &selection);
     let selected = &text[bytes.clone()];
     let changed = if selected.chars().any(char::is_lowercase) {
         selected.to_uppercase()
@@ -284,16 +296,12 @@ pub fn toggle_case(text: &mut String, selection: Range<usize>) -> Range<usize> {
 /// The next larger thing around the selection: the word, what the nearest brackets hold,
 /// those with their brackets, the lines, then the whole text.
 pub fn expand_selection(text: &str, language: &Language, selection: &Range<usize>) -> Range<usize> {
-    let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
-    let chars: Vec<char> = text.chars().collect();
-    let mut word = selection.clone();
-    while word.start > 0 && is_word(chars[word.start - 1]) {
-        word.start -= 1;
-    }
-    while word.end < chars.len() && is_word(chars[word.end]) {
-        word.end += 1;
-    }
-    if word != *selection && chars[word.clone()].iter().all(|ch| is_word(*ch)) {
+    let is_word = |ch: &char| ch.is_alphanumeric() || *ch == '_';
+    let selected = bytes_of(text, selection);
+    let before = text[..selected.start].chars().rev().take_while(is_word);
+    let after = text[selected.end..].chars().take_while(is_word);
+    let word = selection.start - before.count()..selection.end + after.count();
+    if word != *selection && text[selected.clone()].chars().all(|ch| is_word(&ch)) {
         return word;
     }
     if let Some((open, close)) =
@@ -306,12 +314,13 @@ pub fn expand_selection(text: &str, language: &Language, selection: &Range<usize
             inside
         };
     }
-    let block = whole_lines(text, selection);
-    let lines = char_index(text, block.start)..char_index(text, block.end);
+    let block = whole_lines(text, &selected);
+    let start = char_index(text, block.start, selection, &selected);
+    let lines = start..start + text[block].chars().count();
     if lines != *selection && lines.start <= selection.start && lines.end >= selection.end {
         return lines;
     }
-    0..chars.len()
+    0..text.chars().count()
 }
 
 #[cfg(test)]
@@ -492,5 +501,461 @@ mod tests {
         assert_eq!(text, "# x = 1");
         assert_eq!(toggle_comment(&mut text, 4..4, "#"), 2..2);
         assert_eq!(text, "x = 1");
+    }
+
+    /// The edits as they were when each read the text from its start: what the ones above
+    /// are held to.
+    mod old {
+        use super::super::{is_blank, line_end, line_start, map_lines, opened_tag};
+        use crate::syntax::Language;
+        use crate::{byte_index, check};
+        use std::ops::Range;
+
+        fn char_index(text: &str, byte: usize) -> usize {
+            text[..byte].chars().count()
+        }
+
+        pub fn newline(
+            text: &mut String,
+            selection: Range<usize>,
+            unit: &str,
+            language: &Language,
+        ) -> usize {
+            let markup = language.is_markup();
+            let start = byte_index(text, selection.start);
+            let end = byte_index(text, selection.end);
+            let line = &text[line_start(text, start)..start];
+            let lead: String = line
+                .chars()
+                .take_while(|ch| *ch == ' ' || *ch == '\t')
+                .collect();
+            let code = [" //", " #", "\t//", "\t#"]
+                .iter()
+                .filter_map(|marker| Some(line[..line.rfind(marker)?].trim_end()))
+                .find(|code| code.ends_with(['{', '[', '(', ':']))
+                .unwrap_or(line.trim_end());
+            let before = code.chars().next_back();
+            let after = text[end..].chars().next();
+            let element = markup.then(|| opened_tag(line)).flatten();
+            let mut inserted = format!("\n{lead}");
+            let worded = language.opens_block(line);
+            if matches!(before, Some('{' | '[' | '(' | ':')) || element.is_some() || worded {
+                inserted.push_str(unit);
+            }
+            let caret = selection.start + inserted.chars().count();
+            let closed_here = element.is_some_and(|name| {
+                let closing = text[end..].strip_prefix("</");
+                closing.is_some_and(|rest| {
+                    rest.get(..name.len())
+                        .is_some_and(|found| found.eq_ignore_ascii_case(name))
+                        && rest[name.len()..].starts_with('>')
+                })
+            });
+            if closed_here
+                || matches!(
+                    (before, after),
+                    (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+                )
+            {
+                inserted.push('\n');
+                inserted.push_str(&lead);
+            }
+            text.replace_range(start..end, &inserted);
+            caret
+        }
+
+        fn whole_lines(text: &str, selection: &Range<usize>) -> Range<usize> {
+            let start = byte_index(text, selection.start);
+            let mut end = byte_index(text, selection.end);
+            if end > start && text[..end].ends_with('\n') {
+                end -= 1;
+            }
+            line_start(text, start)..line_end(text, end)
+        }
+
+        pub fn duplicate_lines(text: &mut String, selection: Range<usize>) -> Range<usize> {
+            let block = whole_lines(text, &selection);
+            let copy = format!("\n{}", &text[block.clone()]);
+            let shift = copy.chars().count();
+            text.insert_str(block.end, &copy);
+            selection.start + shift..selection.end + shift
+        }
+
+        pub fn delete_lines(text: &mut String, selection: Range<usize>) -> Range<usize> {
+            let block = whole_lines(text, &selection);
+            let removed = if block.end < text.len() {
+                block.start..block.end + 1
+            } else {
+                block.start.saturating_sub(1)..block.end
+            };
+            text.replace_range(removed.clone(), "");
+            let caret = char_index(text, line_start(text, removed.start));
+            caret..caret
+        }
+
+        pub fn move_lines(
+            text: &mut String,
+            selection: Range<usize>,
+            up: bool,
+        ) -> Option<Range<usize>> {
+            let block = whole_lines(text, &selection);
+            if up {
+                let above_end = block.start.checked_sub(1)?;
+                let above = line_start(text, above_end)..above_end;
+                let shift = text[above.clone()].chars().count() + 1;
+                let moved = format!("{}\n{}", &text[block.clone()], &text[above.clone()]);
+                text.replace_range(above.start..block.end, &moved);
+                Some(selection.start - shift..selection.end - shift)
+            } else {
+                if block.end >= text.len() {
+                    return None;
+                }
+                let below = block.end + 1..line_end(text, block.end + 1);
+                let shift = text[below.clone()].chars().count() + 1;
+                let moved = format!("{}\n{}", &text[below.clone()], &text[block.clone()]);
+                text.replace_range(block.start..below.end, &moved);
+                Some(selection.start + shift..selection.end + shift)
+            }
+        }
+
+        fn rewrite(
+            text: &mut String,
+            selection: Range<usize>,
+            change: impl FnOnce(&str) -> String,
+        ) -> Range<usize> {
+            let block = whole_lines(text, &selection);
+            let first = char_index(text, block.start);
+            let old = &text[block.clone()];
+            let old_len = old.chars().count();
+            let new = change(old);
+            let new_len = new.chars().count();
+            text.replace_range(block, &new);
+            if selection.is_empty() {
+                let caret = (selection.start + new_len)
+                    .saturating_sub(old_len)
+                    .max(first);
+                caret..caret
+            } else {
+                first..first + new_len
+            }
+        }
+
+        pub fn indent(text: &mut String, selection: Range<usize>, unit: &str) -> Range<usize> {
+            let bytes = byte_index(text, selection.start)..byte_index(text, selection.end);
+            if !text[bytes.clone()].contains('\n') {
+                text.replace_range(bytes, unit);
+                let caret = selection.start + unit.chars().count();
+                return caret..caret;
+            }
+            rewrite(text, selection, |block| {
+                map_lines(block, |line| {
+                    if is_blank(line) {
+                        line.to_owned()
+                    } else {
+                        format!("{unit}{line}")
+                    }
+                })
+            })
+        }
+
+        pub fn outdent(text: &mut String, selection: Range<usize>, unit: &str) -> Range<usize> {
+            let width = if unit.starts_with(' ') { unit.len() } else { 4 };
+            rewrite(text, selection, |block| {
+                map_lines(block, |line| {
+                    if let Some(rest) = line.strip_prefix('\t') {
+                        return rest.to_owned();
+                    }
+                    let spaces = line.len() - line.trim_start_matches(' ').len();
+                    line[spaces.min(width)..].to_owned()
+                })
+            })
+        }
+
+        pub fn toggle_comment(
+            text: &mut String,
+            selection: Range<usize>,
+            prefix: &str,
+        ) -> Range<usize> {
+            rewrite(text, selection, |block| {
+                let code = || block.split('\n').filter(|line| !is_blank(line));
+                let commented = code().next().is_some()
+                    && code().all(|line| line.trim_start().starts_with(prefix));
+                if commented {
+                    return map_lines(block, |line| {
+                        let Some(at) = line.find(prefix) else {
+                            return line.to_owned();
+                        };
+                        let rest = &line[at + prefix.len()..];
+                        format!("{}{}", &line[..at], rest.strip_prefix(' ').unwrap_or(rest))
+                    });
+                }
+                let column = code()
+                    .map(|line| line.len() - line.trim_start().len())
+                    .min()
+                    .unwrap_or(0);
+                let every_line = code().next().is_none();
+                map_lines(block, |line| {
+                    if is_blank(line) && !every_line {
+                        line.to_owned()
+                    } else {
+                        let column = column.min(line.len());
+                        format!("{}{prefix} {}", &line[..column], &line[column..])
+                    }
+                })
+            })
+        }
+
+        pub fn join_lines(text: &mut String, selection: Range<usize>) -> Range<usize> {
+            let mut block = whole_lines(text, &selection);
+            if !text[block.clone()].contains('\n') {
+                if block.end >= text.len() {
+                    return selection;
+                }
+                block.end = line_end(text, block.end + 1);
+            }
+            let first = char_index(text, block.start);
+            let mut lines = text[block.clone()].split('\n');
+            let mut joined = lines.next().unwrap_or("").trim_end().to_owned();
+            let caret = first + joined.chars().count();
+            for line in lines.map(str::trim).filter(|line| !line.is_empty()) {
+                joined.push(' ');
+                joined.push_str(line);
+            }
+            text.replace_range(block, &joined);
+            caret..caret
+        }
+
+        pub fn toggle_case(text: &mut String, selection: Range<usize>) -> Range<usize> {
+            let bytes = byte_index(text, selection.start)..byte_index(text, selection.end);
+            let selected = &text[bytes.clone()];
+            let changed = if selected.chars().any(char::is_lowercase) {
+                selected.to_uppercase()
+            } else {
+                selected.to_lowercase()
+            };
+            let end = selection.start + changed.chars().count();
+            text.replace_range(bytes, &changed);
+            selection.start..end
+        }
+
+        pub fn expand_selection(
+            text: &str,
+            language: &Language,
+            selection: &Range<usize>,
+        ) -> Range<usize> {
+            let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+            let chars: Vec<char> = text.chars().collect();
+            let mut word = selection.clone();
+            while word.start > 0 && is_word(chars[word.start - 1]) {
+                word.start -= 1;
+            }
+            while word.end < chars.len() && is_word(chars[word.end]) {
+                word.end += 1;
+            }
+            if word != *selection && chars[word.clone()].iter().all(|ch| is_word(*ch)) {
+                return word;
+            }
+            if let Some((open, close)) =
+                check::enclosing_brackets(text, language, selection.start, selection.end)
+            {
+                let inside = open + 1..close;
+                return if inside == *selection {
+                    open..close + 1
+                } else {
+                    inside
+                };
+            }
+            let block = whole_lines(text, selection);
+            let lines = char_index(text, block.start)..char_index(text, block.end);
+            if lines != *selection && lines.start <= selection.start && lines.end >= selection.end {
+                return lines;
+            }
+            0..chars.len()
+        }
+    }
+
+    /// Numbers that look random and are the same at every run.
+    struct Dice(u64);
+
+    impl Dice {
+        fn below(&mut self, limit: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % limit as u64) as usize
+        }
+    }
+
+    /// Many texts made of what the edits look at, each with a selection in it: carets and
+    /// spans, at the start, at the end, on empty lines, between chars of every width.
+    fn cases() -> Vec<(String, Range<usize>)> {
+        const PIECES: [&str; 40] = [
+            "\n",
+            "\n",
+            "\n",
+            "\r\n",
+            "\t",
+            "    ",
+            "  ",
+            " ",
+            "a",
+            "B",
+            "é",
+            "😀",
+            "€",
+            "word",
+            "let x = 1;",
+            "{",
+            "}",
+            "(",
+            ")",
+            "[",
+            "]",
+            ":",
+            "// ",
+            " // why",
+            "# ",
+            " # so",
+            "<div>",
+            "</div>",
+            "<br>",
+            "<p class=\"a\">",
+            "</p>",
+            "if x then",
+            "end",
+            "do",
+            "def name",
+            "\"",
+            ";",
+            "_",
+            "//",
+            "#",
+        ];
+        let mut dice = Dice(0x2545_F491_4F6C_DD1D);
+        let mut cases = Vec::new();
+        for round in 0..4000 {
+            let pieces = dice.below(if round % 7 == 0 { 4 } else { 30 });
+            let text: String = (0..pieces)
+                .map(|_| PIECES[dice.below(PIECES.len())])
+                .collect();
+            let chars = text.chars().count();
+            let start = match dice.below(8) {
+                0 => 0,
+                1 => chars,
+                _ => dice.below(chars + 1),
+            };
+            let end = match dice.below(4) {
+                0 | 1 => start,
+                2 => (start + dice.below(6)).min(chars),
+                _ => start + dice.below(chars - start + 1),
+            };
+            cases.push((text, start..end));
+        }
+        cases
+    }
+
+    const UNITS: [&str; 3] = ["    ", "  ", "\t"];
+
+    /// `new` and `old` leave the same text and give the same answer, on every case.
+    fn same<T: PartialEq + std::fmt::Debug>(
+        new: impl Fn(&mut String, Range<usize>, usize) -> T,
+        old: impl Fn(&mut String, Range<usize>, usize) -> T,
+    ) {
+        for (round, (text, selection)) in cases().into_iter().enumerate() {
+            let (mut now, mut then) = (text.clone(), text.clone());
+            let answers = (
+                new(&mut now, selection.clone(), round),
+                old(&mut then, selection.clone(), round),
+            );
+            assert_eq!(answers.0, answers.1, "{selection:?} in {text:?}");
+            assert_eq!(now, then, "{selection:?} in {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_line_is_broken_as_it_was_when_the_whole_text_was_read() {
+        let files = ["a.txt", "a.rs", "a.html", "a.lua", "a.rb", "a.py"];
+        let language = |round: usize| Language::of(std::path::Path::new(files[round % 6]));
+        same(
+            |text, selection, round| newline(text, selection, UNITS[round % 3], language(round)),
+            |text, selection, round| {
+                old::newline(text, selection, UNITS[round % 3], language(round))
+            },
+        );
+    }
+
+    #[test]
+    fn lines_are_duplicated_as_they_were_when_the_whole_text_was_read() {
+        same(
+            |text, selection, _| duplicate_lines(text, selection),
+            |text, selection, _| old::duplicate_lines(text, selection),
+        );
+    }
+
+    #[test]
+    fn lines_are_deleted_as_they_were_when_the_whole_text_was_read() {
+        same(
+            |text, selection, _| delete_lines(text, selection),
+            |text, selection, _| old::delete_lines(text, selection),
+        );
+    }
+
+    #[test]
+    fn lines_are_moved_as_they_were_when_the_whole_text_was_read() {
+        same(
+            |text, selection, round| move_lines(text, selection, round % 2 == 0),
+            |text, selection, round| old::move_lines(text, selection, round % 2 == 0),
+        );
+    }
+
+    #[test]
+    fn lines_are_indented_as_they_were_when_the_whole_text_was_read() {
+        same(
+            |text, selection, round| indent(text, selection, UNITS[round % 3]),
+            |text, selection, round| old::indent(text, selection, UNITS[round % 3]),
+        );
+    }
+
+    #[test]
+    fn lines_are_outdented_as_they_were_when_the_whole_text_was_read() {
+        same(
+            |text, selection, round| outdent(text, selection, UNITS[round % 3]),
+            |text, selection, round| old::outdent(text, selection, UNITS[round % 3]),
+        );
+    }
+
+    #[test]
+    fn comments_are_toggled_as_they_were_when_the_whole_text_was_read() {
+        let prefixes = ["//", "#", "--"];
+        same(
+            |text, selection, round| toggle_comment(text, selection, prefixes[round % 3]),
+            |text, selection, round| old::toggle_comment(text, selection, prefixes[round % 3]),
+        );
+    }
+
+    #[test]
+    fn lines_are_joined_as_they_were_when_the_whole_text_was_read() {
+        same(
+            |text, selection, _| join_lines(text, selection),
+            |text, selection, _| old::join_lines(text, selection),
+        );
+    }
+
+    #[test]
+    fn the_case_is_toggled_as_it_was_when_the_whole_text_was_read() {
+        same(
+            |text, selection, _| toggle_case(text, selection),
+            |text, selection, _| old::toggle_case(text, selection),
+        );
+    }
+
+    #[test]
+    fn the_selection_grows_as_it_did_when_the_whole_text_was_read() {
+        let files = ["a.txt", "a.rs", "a.html"];
+        let language = |round: usize| Language::of(std::path::Path::new(files[round % 3]));
+        same(
+            |text, selection, round| expand_selection(text, language(round), &selection),
+            |text, selection, round| old::expand_selection(text, language(round), &selection),
+        );
     }
 }
