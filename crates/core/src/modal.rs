@@ -309,7 +309,11 @@ impl Vim {
             Mode::Normal => {
                 // The caret is on a char, never after the last one of a line.
                 let (start, end) = (line_start(&chars, at), line_end(&chars, at));
-                let at = if at >= end && end > start { end - 1 } else { at };
+                let at = if at >= end && end > start {
+                    end - 1
+                } else {
+                    at
+                };
                 at..at
             }
         };
@@ -504,7 +508,10 @@ fn motion(chars: &[char], at: usize, key: Stroke, count: Option<usize>) -> Optio
         Stroke::Char('0') => (line_start(chars, at), Span::Upto),
         Stroke::Char('^') => (first_text(chars, at), Span::Upto),
         Stroke::Char('$') => (line_end(chars, at), Span::Upto),
-        Stroke::Char('G') => (line_numbered(chars, count.unwrap_or(usize::MAX)), Span::Lines),
+        Stroke::Char('G') => (
+            line_numbered(chars, count.unwrap_or(usize::MAX)),
+            Span::Lines,
+        ),
         _ => return None,
     })
 }
@@ -668,7 +675,10 @@ mod tests {
     #[test]
     fn vim_deletes_changes_and_pastes() {
         assert_eq!(vim("one two three", 4, "dw"), ("one three".to_owned(), 4));
-        assert_eq!(vim("one two three", 4, "cwX\u{1b}"), ("one X three".to_owned(), 4));
+        assert_eq!(
+            vim("one two three", 4, "cwX\u{1b}"),
+            ("one X three".to_owned(), 4)
+        );
         assert_eq!(vim("one two", 0, "x"), ("ne two".to_owned(), 0));
         assert_eq!(vim("one two", 4, "D"), ("one ".to_owned(), 3));
         assert_eq!(vim("a\nb\nc", 2, "dd"), ("a\nc".to_owned(), 2));
@@ -700,7 +710,9 @@ mod tests {
         let mut text = "one two".to_owned();
         let done = vim.key(&mut text, &(0..0), Stroke::Char('v')).expect("vim");
         assert_eq!((vim.mode, done.selection.clone()), (Mode::Visual, 0..1));
-        let done = vim.key(&mut text, &done.selection, Stroke::Char('e')).expect("vim");
+        let done = vim
+            .key(&mut text, &done.selection, Stroke::Char('e'))
+            .expect("vim");
         assert_eq!(done.selection, 0..3);
         // A click moved the caret: the selection is over.
         let done = vim.key(&mut text, &(5..5), Stroke::Char('l')).expect("vim");
@@ -727,10 +739,16 @@ mod tests {
         assert_eq!(key(&mut text, 7..7, Stroke::Alt('b')).selection, 4..4);
         // The rest of the line is killed, then put back twice.
         let done = key(&mut text, 4..4, Stroke::Ctrl('k'));
-        assert_eq!((text.as_str(), done.copied.as_deref()), ("one \nthree", Some("two")));
+        assert_eq!(
+            (text.as_str(), done.copied.as_deref()),
+            ("one \nthree", Some("two"))
+        );
         key(&mut text, 4..4, Stroke::Ctrl('y'));
         let done = key(&mut text, 7..7, Stroke::Ctrl('y'));
-        assert_eq!((text.as_str(), done.selection), ("one twotwo\nthree", 10..10));
+        assert_eq!(
+            (text.as_str(), done.selection),
+            ("one twotwo\nthree", 10..10)
+        );
         // From the mark to the caret is the region.
         key(&mut text, 0..0, Stroke::Ctrl(' '));
         let done = key(&mut text, 0..0, Stroke::Ctrl('f'));

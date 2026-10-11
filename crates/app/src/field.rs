@@ -106,8 +106,22 @@ impl Index {
     }
 
     /// `line` as coloured sections.
+    #[cfg(test)]
     fn job(&self, text: &str, line: usize, font: &FontId, dark: bool, plain: Color32) -> LayoutJob {
-        let (from, to) = (self.starts[line], self.starts[line + 1] - 1);
+        let bytes = self.starts[line]..self.starts[line + 1] - 1;
+        self.job_of(text, bytes, font, dark, plain)
+    }
+
+    /// The bytes `bytes` of the text, all of one line, as coloured sections.
+    fn job_of(
+        &self,
+        text: &str,
+        bytes: Range<usize>,
+        font: &FontId,
+        dark: bool,
+        plain: Color32,
+    ) -> LayoutJob {
+        let (from, to) = (bytes.start, bytes.end);
         let content = text.get(from..to).unwrap_or("");
         let section = |range: Range<usize>, color: Color32| LayoutSection {
             leading_space: 0.0,
@@ -187,7 +201,8 @@ fn annotate(job: &mut LayoutJob, hints: &[Hint], format: &TextFormat) -> Vec<(us
         });
         placed.push((column, hint.label.chars().count()));
     }
-    job.sections.sort_by_key(|section| section.byte_range.start.0);
+    job.sections
+        .sort_by_key(|section| section.byte_range.start.0);
     placed.reverse();
     placed
 }
@@ -215,19 +230,155 @@ fn pulled(hints: &[(usize, usize)], shown: usize) -> usize {
     shown - pushed
 }
 
-/// A line in view, laid out.
+/// The columns a char takes in a row: what a row holds is counted in them.
+fn columns_of(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        // The scripts of East Asia are twice as wide.
+        ch if ch as u32 >= 0x2E80 => 2,
+        _ => 1,
+    }
+}
+
+/// The chars at which the rows of `line` start when a row holds `columns`: after a space
+/// when there is one to cut at, anywhere otherwise. The first is 0.
+fn breaks(line: &str, columns: usize) -> Vec<usize> {
+    let mut starts = vec![0];
+    // The width of the row so far; the char after its last space, and the width up to it.
+    let (mut width, mut space, mut space_width) = (0, None, 0);
+    for (at, ch) in line.chars().enumerate() {
+        let wide = columns_of(ch);
+        if width + wide > columns && width > 0 {
+            let (start, carried) = match space {
+                Some(after) => (after, width - space_width),
+                None => (at, 0),
+            };
+            starts.push(start);
+            (width, space) = (carried, None);
+        }
+        width += wide;
+        if ch == ' ' || ch == '\t' {
+            (space, space_width) = (Some(at + 1), width);
+        }
+    }
+    starts
+}
+
+/// The row each line starts on, then how many rows there are; `None` when every line takes
+/// one row. A line folded away takes none; with `wrap`, the columns a row holds, a long
+/// line takes several.
+fn row_starts(
+    index: &Index,
+    text: &str,
+    folded: &[usize],
+    wrap: Option<usize>,
+) -> Option<Vec<usize>> {
+    if folded.is_empty() && wrap.is_none() {
+        return None;
+    }
+    let mut hidden = vec![false; index.lines()];
+    for block in folded.iter().filter_map(|header| index.block(*header)) {
+        hidden[block].fill(true);
+    }
+    let mut starts = Vec::with_capacity(index.lines() + 1);
+    let mut row = 0;
+    for (line, hidden) in hidden.iter().enumerate() {
+        starts.push(row);
+        if *hidden {
+            continue;
+        }
+        let content = text
+            .get(index.starts[line]..index.starts[line + 1] - 1)
+            .unwrap_or("");
+        row += match wrap {
+            // Most lines fit: only a long one, or one with tabs, is measured.
+            Some(columns) if content.len() > columns || content.contains('\t') => {
+                breaks(content, columns).len()
+            }
+            _ => 1,
+        };
+    }
+    starts.push(row);
+    Some(starts)
+}
+
+/// The row `line` shows on: for a line folded away, the row of the line it is under.
+fn first_row(starts: &[usize], line: usize) -> usize {
+    let line = line.min(starts.len() - 2);
+    let row = starts[line];
+    if starts[line + 1] == row {
+        row.saturating_sub(1)
+    } else {
+        row
+    }
+}
+
+/// The line that shows on `row`.
+fn line_on(starts: &[usize], row: usize) -> usize {
+    let lines = &starts[..starts.len() - 1];
+    let row = row.min(starts[lines.len()].saturating_sub(1));
+    lines
+        .partition_point(|start| *start <= row)
+        .saturating_sub(1)
+}
+
+/// What was worked out of a text the last time it showed.
+#[derive(Default)]
+pub struct Cache {
+    index: Option<Arc<Index>>,
+    /// The rows of the lines (see [`row_starts`]), and the key of what they were counted for.
+    rows: Option<(u64, Option<Arc<Vec<usize>>>)>,
+}
+
+impl Cache {
+    /// The row `line` showed on the last time, keeping its fraction.
+    pub fn row_of(&self, line: f32) -> f32 {
+        match self.rows.as_ref().and_then(|(_, rows)| rows.as_ref()) {
+            Some(starts) => first_row(starts, line as usize) as f32 + line.fract(),
+            None => line,
+        }
+    }
+}
+
+/// A row in view, laid out: a line, or the part of a line that fits the width.
 struct Row {
     line: usize,
+    /// Which row of its line it is, and whether it is the last one.
+    part: usize,
+    last: bool,
+    /// The chars of the line it shows.
+    chars: Range<usize>,
     galley: Arc<Galley>,
-    /// The hints written in it: the char each one is before, and the chars it takes.
+    /// The hints written in it: the char of the row each one is before, and the chars it
+    /// takes.
     hints: Vec<(usize, usize)>,
+}
+
+impl Row {
+    /// Where the char `column` of the line is in the row.
+    fn x(&self, column: usize) -> f32 {
+        let within = column.clamp(self.chars.start, self.chars.end) - self.chars.start;
+        let shown = CCursor::new(pushed(&self.hints, within));
+        self.galley.pos_from_cursor(shown).min.x
+    }
+
+    /// The char of the line at `x`.
+    fn column(&self, x: f32) -> usize {
+        let shown = self.galley.cursor_from_pos(vec2(x, 0.0)).index.0;
+        let column = self.chars.start + pulled(&self.hints, shown);
+        // The end of a row that goes on below is the start of the next one.
+        let end = self.chars.end - usize::from(!self.last);
+        column.min(end.max(self.chars.start))
+    }
 }
 
 /// Where the chars of the text are, measured for the lines in view only.
 pub struct Lines {
     index: Arc<Index>,
-    /// The lines that show, in order, when blocks are folded.
-    rows: Option<Vec<usize>>,
+    /// The row each line starts on (see [`row_starts`]); `None` when it is its own number.
+    rows: Option<Arc<Vec<usize>>>,
+    /// The columns a row holds, when lines are cut to fit.
+    wrap: Option<usize>,
     /// The lines whose block is folded.
     folded: Vec<usize>,
     row_height: f32,
@@ -237,8 +388,22 @@ pub struct Lines {
 }
 
 impl Lines {
-    fn row(&self, line: usize) -> Option<&Row> {
-        self.shown.iter().find(|row| row.line == line)
+    /// The row in view that shows the char `column` of `line`.
+    fn row(&self, line: usize, column: usize) -> Option<&Row> {
+        let holds = |row: &&Row| {
+            row.line == line
+                && row.chars.start <= column
+                && (column < row.chars.end || (row.last && column == row.chars.end))
+        };
+        self.shown.iter().find(holds)
+    }
+
+    /// How many rows `line` takes.
+    fn rows_of(&self, line: usize) -> usize {
+        match &self.rows {
+            None => 1,
+            Some(starts) => starts[line + 1] - starts[line],
+        }
     }
 
     /// Where the char `index` is, from the top left of the text: a rectangle without
@@ -246,24 +411,25 @@ impl Lines {
     pub fn pos(&self, index: usize) -> Rect {
         let line = self.index.line_of(index);
         let column = (index - self.index.chars[line]).min(self.index.length(line));
-        let x = match self.row(line) {
-            Some(row) => {
-                let shown = CCursor::new(pushed(&row.hints, column));
-                row.galley.pos_from_cursor(shown).min.x
+        let (part, x) = match (self.row(line, column), self.wrap) {
+            (Some(row), _) => (row.part, row.x(column)),
+            // Not laid out: a column is as wide as a digit, a row is cut where it is full.
+            (None, Some(columns)) if self.rows_of(line) > 1 => {
+                let part = (column / columns).min(self.rows_of(line) - 1);
+                (part, (column - part * columns) as f32 * self.digit)
             }
-            None => column as f32 * self.digit,
+            (None, _) => (0, column as f32 * self.digit),
         };
-        let top = self.row_of(line) as f32 * self.row_height;
+        let top = (self.row_of(line) + part) as f32 * self.row_height;
         Rect::from_min_size(pos2(x, top), vec2(0.0, self.row_height))
     }
 
-    /// The row `line` shows on: for a line folded away, the row of the line it is under.
+    /// The first row `line` shows on: for a line folded away, the row of the line it is
+    /// under.
     fn row_of(&self, line: usize) -> usize {
         match &self.rows {
             None => line,
-            Some(rows) => rows
-                .partition_point(|shown| *shown <= line)
-                .saturating_sub(1),
+            Some(starts) => first_row(starts, line),
         }
     }
 
@@ -271,14 +437,19 @@ impl Lines {
     fn line_on(&self, row: usize) -> usize {
         match &self.rows {
             None => row.min(self.index.lines() - 1),
-            Some(rows) => rows[row.min(rows.len() - 1)],
+            Some(starts) => line_on(starts, row),
         }
+    }
+
+    /// How many rows there are.
+    fn total(&self) -> usize {
+        let rows = self.rows.as_ref().map(|starts| starts[starts.len() - 1]);
+        rows.unwrap_or(self.index.lines()).max(1)
     }
 
     /// The height `line` starts at, or `None` when it is folded away.
     pub fn top(&self, line: usize) -> Option<f32> {
-        let row = self.row_of(line);
-        (self.line_on(row) == line).then_some(row as f32 * self.row_height)
+        (self.rows_of(line) > 0).then(|| self.row_of(line) as f32 * self.row_height)
     }
 
     /// The line that row `row` shows, keeping its fraction.
@@ -296,12 +467,14 @@ impl Lines {
     pub fn at(&self, within: Vec2) -> usize {
         let row = (within.y / self.row_height).floor().max(0.0) as usize;
         let line = self.line_on(row);
-        let column = match self.row(line) {
-            Some(row) => {
-                let shown = row.galley.cursor_from_pos(vec2(within.x, 0.0)).index.0;
-                pulled(&row.hints, shown)
+        let part = row.saturating_sub(self.row_of(line));
+        let laid_out = |shown: &&Row| shown.line == line && shown.part == part;
+        let column = match (self.shown.iter().find(laid_out), self.wrap) {
+            (Some(row), _) => row.column(within.x),
+            (None, wrap) => {
+                let before = wrap.map_or(0, |columns| part * columns);
+                before + (within.x / self.digit).round().max(0.0) as usize
             }
-            None => (within.x / self.digit).round().max(0.0) as usize,
         };
         self.index.chars[line] + column.min(self.index.length(line))
     }
@@ -311,41 +484,18 @@ impl Lines {
         self.line_on((y / self.row_height).floor().max(0.0) as usize)
     }
 
-    /// The lines between two heights, each with the height it starts at.
+    /// The lines that start between two heights, each with the height it starts at.
     pub fn between(&self, top: f32, bottom: f32) -> Vec<(usize, f32)> {
-        let rows = self.rows.as_ref().map_or(self.index.lines(), Vec::len);
-        let row = |y: f32| ((y / self.row_height).floor().max(0.0) as usize).min(rows - 1);
-        (row(top)..=row(bottom))
-            .map(|row| (self.line_on(row), row as f32 * self.row_height))
-            .collect()
+        let row = |y: f32| ((y / self.row_height).floor().max(0.0) as usize).min(self.total() - 1);
+        let starting = (row(top)..=row(bottom)).filter_map(|row| {
+            let line = self.line_on(row);
+            (self.row_of(line) == row).then_some((line, row as f32 * self.row_height))
+        });
+        starting.collect()
     }
 
     pub fn index(&self) -> &Arc<Index> {
         &self.index
-    }
-}
-
-/// The lines that show, in order, once the blocks of `folded` are closed; `None` when
-/// nothing is folded.
-fn rows(index: &Index, folded: &[usize]) -> Option<Vec<usize>> {
-    if folded.is_empty() {
-        return None;
-    }
-    let mut hidden = vec![false; index.lines()];
-    for block in folded.iter().filter_map(|header| index.block(*header)) {
-        hidden[block].fill(true);
-    }
-    Some((0..index.lines()).filter(|line| !hidden[*line]).collect())
-}
-
-/// The row `line` shows on when the blocks of `folded` are closed, keeping its fraction.
-pub fn row_of(index: &Index, folded: &[usize], line: f32) -> f32 {
-    match rows(index, folded) {
-        None => line,
-        Some(rows) => {
-            let above = rows.partition_point(|shown| *shown <= line as usize);
-            above.saturating_sub(1) as f32 + line.fract()
-        }
     }
 }
 
@@ -361,6 +511,8 @@ pub struct Look<'a> {
     pub hints: &'a [Hint],
     /// The caret covers its char instead of standing before it: keys are commands.
     pub block_caret: bool,
+    /// Lines too long for the view go on below instead of running off it.
+    pub wrap: bool,
 }
 
 pub struct Shown {
@@ -433,22 +585,45 @@ fn line_bounds(text: &str, index: usize) -> (usize, usize) {
     (index - before, index + text[at..end].chars().count())
 }
 
-/// One line up or down, keeping the column when the line is long enough.
-fn vertical(text: &str, index: usize, down: bool) -> usize {
+/// One row up or down, keeping the column when the row is long enough. `wrap`: the columns
+/// a row holds when lines are cut to fit; without it a row is a line.
+fn vertical(text: &str, index: usize, down: bool, wrap: Option<usize>) -> usize {
     let (start, end) = line_bounds(text, index);
-    let column = index - start;
+    let parts = |start: usize, end: usize| match wrap {
+        Some(columns) => breaks(&text[byte(text, start)..byte(text, end)], columns),
+        None => vec![0],
+    };
+    // The chars of the row `part` of a line, the last one left to the row that follows.
+    let bounds = |cut: &[usize], part: usize, length: usize| {
+        let to = cut.get(part + 1).map_or(length, |next| next - 1);
+        (cut[part], to)
+    };
+    let cut = parts(start, end);
+    let part = cut.partition_point(|from| *from <= index - start) - 1;
+    let within = index - start - cut[part];
+    let place = |line: usize, (from, to): (usize, usize)| line + (from + within).min(to);
     if down {
+        if part + 1 < cut.len() {
+            return place(start, bounds(&cut, part + 1, end - start));
+        }
         if byte(text, end) == text.len() {
             return end;
         }
         let (next, next_end) = line_bounds(text, end + 1);
-        (next + column).min(next_end)
+        place(next, bounds(&parts(next, next_end), 0, next_end - next))
     } else {
+        if part > 0 {
+            return place(start, bounds(&cut, part - 1, end - start));
+        }
         if start == 0 {
             return 0;
         }
         let (previous, previous_end) = line_bounds(text, start - 1);
-        (previous + column).min(previous_end)
+        let cut = parts(previous, previous_end);
+        place(
+            previous,
+            bounds(&cut, cut.len() - 1, previous_end - previous),
+        )
     }
 }
 
@@ -506,8 +681,9 @@ fn replace(text: &mut String, caret: Caret, written: &str) -> Caret {
     Caret::at(chars.start + written.chars().count())
 }
 
-/// What the keyboard did to the text and the caret this frame. `page`: rows in view.
-fn typed(ui: &Ui, text: &mut String, mut caret: Caret, page: usize) -> Caret {
+/// What the keyboard did to the text and the caret this frame. `page`: rows in view;
+/// `wrap`: the columns a row holds when lines are cut to fit.
+fn typed(ui: &Ui, text: &mut String, mut caret: Caret, page: usize, wrap: Option<usize>) -> Caret {
     let events = ui.input(|input| input.events.clone());
     for event in events {
         let len = text.chars().count();
@@ -518,6 +694,15 @@ fn typed(ui: &Ui, text: &mut String, mut caret: Caret, page: usize) -> Caret {
             }
             Event::Ime(egui::ImeEvent::Commit(written)) => {
                 caret = replace(text, caret, &written);
+            }
+            // What is being composed shows selected: what comes next takes its place.
+            Event::Ime(egui::ImeEvent::Preedit { text: composed, .. }) => {
+                let start = caret.sorted().start;
+                let head = replace(text, caret, &composed).head;
+                caret = Caret {
+                    head,
+                    anchor: start,
+                };
             }
             Event::Copy | Event::Cut => {
                 let chars = caret.sorted();
@@ -553,11 +738,11 @@ fn typed(ui: &Ui, text: &mut String, mut caret: Caret, page: usize) -> Caret {
                     Key::ArrowRight if word => Some(word_stop(text, caret.head, true)),
                     Key::ArrowLeft => Some(caret.head.saturating_sub(1)),
                     Key::ArrowRight => Some((caret.head + 1).min(len)),
-                    Key::ArrowUp => Some(vertical(text, caret.head, false)),
-                    Key::ArrowDown => Some(vertical(text, caret.head, true)),
+                    Key::ArrowUp => Some(vertical(text, caret.head, false, wrap)),
+                    Key::ArrowDown => Some(vertical(text, caret.head, true, wrap)),
                     Key::PageUp | Key::PageDown => {
                         let down = key == Key::PageDown;
-                        let step = |at, _| vertical(text, at, down);
+                        let step = |at, _| vertical(text, at, down, wrap);
                         Some((0..page.max(1)).fold(caret.head, step))
                     }
                     Key::Home if modifiers.command => Some(0),
@@ -620,7 +805,7 @@ pub fn show(
     id: Id,
     text: &mut String,
     look: &Look<'_>,
-    cache: &mut Option<Arc<Index>>,
+    cache: &mut Cache,
     folded: &mut Vec<usize>,
 ) -> Shown {
     let (digit, row_height) = ui.fonts_mut(|fonts| {
@@ -631,6 +816,13 @@ pub fn show(
     });
     let clip = ui.clip_rect();
     let page = ((clip.height() / row_height) as usize).saturating_sub(1);
+    let margin = look.margin;
+    let sides = f32::from(margin.left + margin.right);
+    // Cut to fit, a row holds what the view is wide, less a column kept for the caret.
+    let wrap = look.wrap.then(|| {
+        let columns = ((look.min_size.x - sides) / digit) as usize;
+        columns.saturating_sub(1).max(20)
+    });
 
     let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
     let len = text.chars().count();
@@ -659,7 +851,7 @@ pub fn show(
                 input.consume_key(shifted, Key::Z) || input.consume_key(Modifiers::COMMAND, Key::Y);
             (input.consume_key(Modifiers::COMMAND, Key::Z), redo)
         });
-        let mut new = typed(ui, text, old, page);
+        let mut new = typed(ui, text, old, page, wrap);
         if undo || redo {
             let mut undoer = state.undoer();
             let current = (new.range(), text.clone());
@@ -680,12 +872,12 @@ pub fn show(
 
     // What is known of the text, made again when it changed.
     let key = key_of(text, look);
-    let previous = cache.clone();
-    let index = match cache.as_ref().filter(|index| index.key == key) {
+    let previous = cache.index.clone();
+    let index = match cache.index.as_ref().filter(|index| index.key == key) {
         Some(index) => Arc::clone(index),
         None => {
             let index = Arc::new(Index::new(key, text, look.language));
-            *cache = Some(Arc::clone(&index));
+            cache.index = Some(Arc::clone(&index));
             index
         }
     };
@@ -716,34 +908,50 @@ pub fn show(
     }
     folded.sort_unstable();
     folded.dedup();
-    let visible = rows(&index, folded);
+    // The rows of the lines, counted again when the text, the folds or the width change.
+    let rows_key = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (index.key, &*folded, wrap).hash(&mut hasher);
+        hasher.finish()
+    };
+    let rows = match &cache.rows {
+        Some((key, rows)) if *key == rows_key => rows.clone(),
+        _ => {
+            let rows = row_starts(&index, text, folded, wrap).map(Arc::new);
+            cache.rows = Some((rows_key, rows.clone()));
+            rows
+        }
+    };
 
-    let margin = look.margin;
     // The hints make their lines longer: by no more than the longest of them all.
     let by_line = look.hints.chunk_by(|a, b| a.line == b.line);
     let chars = |line: &[Hint]| line.iter().map(|hint| hint.label.chars().count()).sum();
     let hinted: usize = by_line.map(chars).max().unwrap_or(0);
-    let columns = (index.widest + hinted) as f32;
-    let width = columns * digit + f32::from(margin.left + margin.right) + digit;
-    let rows = visible.as_ref().map_or(index.lines(), Vec::len);
-    let height = rows as f32 * row_height + f32::from(margin.top + margin.bottom);
-    let size = vec2(width, height).max(look.min_size);
-    let (_, rect) = ui.allocate_space(size);
-    let response = ui.interact(rect, id, Sense::click_and_drag());
-    let origin = rect.min + vec2(f32::from(margin.left), f32::from(margin.top));
-
-    // Only the lines in view are laid out.
-    let plain = ui.visuals().text_color();
-    let first = (((clip.min.y - origin.y) / row_height).floor().max(0.0) as usize).min(rows - 1);
-    let last = (((clip.max.y - origin.y) / row_height).ceil().max(0.0) as usize).min(rows - 1);
     let mut lines = Lines {
         index,
-        rows: visible,
+        rows,
+        wrap,
         folded: folded.clone(),
         row_height,
         digit,
         shown: Vec::new(),
     };
+    let total = lines.total();
+    // Cut to fit, the lines are no wider than the view.
+    let width = match wrap {
+        Some(_) => 0.0,
+        None => (lines.index.widest + hinted) as f32 * digit + sides + digit,
+    };
+    let height = total as f32 * row_height + f32::from(margin.top + margin.bottom);
+    let size = vec2(width, height).max(look.min_size);
+    let (_, rect) = ui.allocate_space(size);
+    let response = ui.interact(rect, id, Sense::click_and_drag());
+    let origin = rect.min + vec2(f32::from(margin.left), f32::from(margin.top));
+
+    // Only the rows in view are laid out.
+    let plain = ui.visuals().text_color();
+    let first = (((clip.min.y - origin.y) / row_height).floor().max(0.0) as usize).min(total - 1);
+    let last = (((clip.max.y - origin.y) / row_height).ceil().max(0.0) as usize).min(total - 1);
     let hint_format = TextFormat {
         font_id: FontId::new(look.font.size * 0.9, look.font.family.clone()),
         color: ui.visuals().weak_text_color(),
@@ -751,18 +959,47 @@ pub fn show(
         valign: egui::Align::Center,
         ..Default::default()
     };
-    lines.shown = (first..=last)
-        .map(|row| {
-            let line = lines.line_on(row);
-            let mut job = lines.index.job(text, line, look.font, look.dark, plain);
-            let hints = annotate(&mut job, hints_of(look.hints, line), &hint_format);
-            Row {
+    // The line being laid out, and the chars its rows start at.
+    let mut cut: (usize, Vec<usize>) = (usize::MAX, Vec::new());
+    for row in first..=last {
+        let line = lines.line_on(row);
+        let part = row.saturating_sub(lines.row_of(line));
+        let bytes = lines.index.starts[line]..lines.index.starts[line + 1] - 1;
+        let content = text.get(bytes.clone()).unwrap_or("");
+        if cut.0 != line {
+            let starts = wrap.map_or_else(|| vec![0], |columns| breaks(content, columns));
+            cut = (line, starts);
+        }
+        let length = lines.index.length(line);
+        let from = cut.1.get(part).copied().unwrap_or(length);
+        let to = cut.1.get(part + 1).copied().unwrap_or(length);
+        let last_part = part + 1 >= cut.1.len();
+        let shown = match wrap {
+            Some(_) => bytes.start + byte(content, from)..bytes.start + byte(content, to),
+            None => bytes,
+        };
+        let mut job = lines.index.job_of(text, shown, look.font, look.dark, plain);
+        // The hints of the row, placed from its first char.
+        let hints = hints_of(look.hints, line).iter().filter_map(|hint| {
+            let column = hint.column.min(length);
+            let here = column >= from && (column < to || last_part);
+            here.then(|| Hint {
                 line,
-                galley: ui.fonts_mut(|fonts| fonts.layout_job(job)),
-                hints,
-            }
-        })
-        .collect();
+                column: column - from,
+                label: hint.label.clone(),
+            })
+        });
+        let hints: Vec<Hint> = hints.collect();
+        let hints = annotate(&mut job, &hints, &hint_format);
+        lines.shown.push(Row {
+            line,
+            part,
+            last: last_part,
+            chars: from..to,
+            galley: ui.fonts_mut(|fonts| fonts.layout_job(job)),
+            hints,
+        });
+    }
 
     // The mouse: a press puts the caret, a drag selects, two and three clicks take more.
     if response.hovered() {
@@ -810,28 +1047,30 @@ pub fn show(
     let painter = ui.painter_at(clip);
     let selection = ui.visuals().selection.bg_fill;
     let selected = caret.map(Caret::sorted).filter(|chars| !chars.is_empty());
-    for Row { line, galley, .. } in &lines.shown {
-        let top = origin + vec2(0.0, lines.row_of(*line) as f32 * row_height);
+    for row in &lines.shown {
+        let rows_above = lines.row_of(row.line) + row.part;
+        let top = origin + vec2(0.0, rows_above as f32 * row_height);
         if let Some(chars) = &selected {
-            let (start, end) = (lines.index.chars[*line], lines.index.chars[*line + 1] - 1);
+            let base = lines.index.chars[row.line];
+            let (start, end) = (base + row.chars.start, base + row.chars.end);
             if chars.start <= end && chars.end >= start {
-                let from = lines.pos(chars.start.max(start)).min.x;
-                // A selection that goes on past the line takes its line end too.
+                let from = row.x(chars.start.max(start) - base);
+                // A selection that goes on past the row takes its end too.
                 let past = if chars.end > end { digit * 0.5 } else { 0.0 };
-                let to = lines.pos(chars.end.min(end)).min.x + past;
+                let to = row.x(chars.end.min(end) - base) + past;
                 let band = Rect::from_min_max(pos2(from, 0.0), pos2(to, row_height));
                 painter.rect_filled(band.translate(top.to_vec2()), 0.0, selection);
             }
         }
         // What a folded block hides is told after the line that opens it.
-        if lines.folded.contains(line) {
-            let hidden = lines.index.block(*line).map_or(0, |block| block.len());
+        if row.last && lines.folded.contains(&row.line) {
+            let hidden = lines.index.block(row.line).map_or(0, |block| block.len());
             let note = format!("  ... {hidden} lines");
-            let at = top + vec2(galley.size().x, 0.0);
+            let at = top + vec2(row.galley.size().x, 0.0);
             let dim = ui.visuals().weak_text_color();
             painter.text(at, egui::Align2::LEFT_TOP, note, look.font.clone(), dim);
         }
-        painter.galley(top, Arc::clone(galley), plain);
+        painter.galley(top, Arc::clone(&row.galley), plain);
     }
     if focused && let Some(caret) = caret {
         let bar = lines.pos(caret.head).translate(origin.to_vec2());
@@ -843,12 +1082,24 @@ pub fn show(
             let bar = Rect::from_min_size(bar.min, vec2(1.5, bar.height()));
             painter.rect_filled(bar, 0.0, ink);
         }
+        // Where the window of an input method is to show what is being composed.
+        let to_global = ui
+            .ctx()
+            .layer_transform_to_global(ui.layer_id())
+            .unwrap_or_default();
+        ui.output_mut(|output| {
+            output.ime = Some(egui::output::IMEOutput {
+                rect: to_global * rect,
+                cursor_rect: to_global * bar,
+                should_interrupt_composition: false,
+            });
+        });
     }
 
-    // The caret stays in view when the keyboard moved it.
+    // The caret stays in view when the keyboard moved it, or a drag took it out of view.
     if focused
         && (caret, text.len()) != before
-        && !primary
+        && (!primary || response.dragged())
         && let Some(caret) = caret
     {
         let bar = lines.pos(caret.head).translate(origin.to_vec2());
@@ -883,10 +1134,10 @@ mod tests {
         assert_eq!(line_bounds(text, 6), (0, 14));
         assert_eq!(line_bounds(text, 15), (15, 15));
         // Down a short line the column is given up, and found again further down.
-        assert_eq!(vertical(text, 6, true), 15);
-        assert_eq!(vertical(text, 6, false), 0);
-        assert_eq!(vertical(text, 20, false), 15);
-        assert_eq!(vertical(text, 20, true), 31);
+        assert_eq!(vertical(text, 6, true, None), 15);
+        assert_eq!(vertical(text, 6, false, None), 0);
+        assert_eq!(vertical(text, 20, false, None), 15);
+        assert_eq!(vertical(text, 20, true, None), 31);
         assert_eq!(word_stop(text, 0, true), 3);
         assert_eq!(word_stop(text, 3, true), 9);
         assert_eq!(word_stop(text, 9, false), 4);
@@ -912,14 +1163,16 @@ mod tests {
             (Some(3), Some(0), Some(3))
         );
         assert_eq!(index.header_of(8), None);
-        assert_eq!(rows(&index, &[]), None);
-        assert_eq!(rows(&index, &[0]), Some(vec![0, 6, 7, 8, 9]));
-        assert_eq!(rows(&index, &[3]), Some(vec![0, 1, 2, 3, 5, 6, 7, 8, 9]));
+        assert_eq!(row_starts(&index, text, &[], None), None);
+        let closed = row_starts(&index, text, &[0], None).expect("rows");
+        assert_eq!(closed, [0, 1, 1, 1, 1, 1, 1, 2, 3, 4, 5]);
+        assert_eq!((line_on(&closed, 1), line_on(&closed, 4)), (6, 9));
+        // Past the last row is still the last line.
+        assert_eq!(line_on(&closed, 99), 9);
+        let inner = row_starts(&index, text, &[3], None).expect("rows");
+        assert_eq!((line_on(&inner, 4), inner[10]), (5, 9));
         // A line under a fold is on the row of the line that hides it.
-        assert_eq!(
-            (row_of(&index, &[0], 8.5), row_of(&index, &[0], 4.0)),
-            (3.5, 0.0)
-        );
+        assert_eq!((first_row(&closed, 8), first_row(&closed, 4)), (3, 0));
         assert_eq!(index.start_of(1), 9);
     }
 
@@ -942,7 +1195,10 @@ mod tests {
             hint(2, 0, "other"),
         ];
         assert_eq!(hints_of(&hints, 0).len(), 3);
-        assert_eq!((hints_of(&hints, 1).len(), hints_of(&hints, 2).len()), (0, 1));
+        assert_eq!(
+            (hints_of(&hints, 1).len(), hints_of(&hints, 2).len()),
+            (0, 1)
+        );
         let placed = annotate(&mut job, hints_of(&hints, 0), &TextFormat::default());
         assert_eq!(job.text, "let n: é = f(x: 1); end");
         // One past the end of the line is its end.
@@ -962,6 +1218,29 @@ mod tests {
         }
         assert_eq!((pulled(&placed, 6), pulled(&placed, 7)), (5, 5));
         assert_eq!((pulled(&placed, 8), pulled(&placed, 23)), (5, 13));
+    }
+
+    #[test]
+    fn a_long_line_is_cut_into_rows_at_its_spaces() {
+        assert_eq!(breaks("one two three", 8), [0, 8]);
+        assert_eq!(breaks("abcdefghij", 4), [0, 4, 8]);
+        assert_eq!((breaks("short", 80), breaks("", 80)), (vec![0], vec![0]));
+        // A tab takes four columns.
+        assert_eq!(breaks("\ta\tb", 6), [0, 1]);
+        let text = "one two three\nx\n";
+        let language = Language::of(std::path::Path::new("a.txt"));
+        let index = Index::new(0, text, language);
+        let starts = row_starts(&index, text, &[], Some(8)).expect("rows");
+        assert_eq!(starts, [0, 2, 3, 4]);
+        assert_eq!((line_on(&starts, 1), line_on(&starts, 2)), (0, 1));
+        // Up and down go row by row, inside a line cut in two as between lines.
+        assert_eq!(vertical(text, 2, true, Some(8)), 10);
+        assert_eq!(vertical(text, 10, true, Some(8)), 15);
+        assert_eq!(vertical(text, 10, false, Some(8)), 2);
+        assert_eq!(vertical(text, 14, false, Some(8)), 8);
+        // The end of a row that goes on below belongs to the next row.
+        assert_eq!(vertical(text, 12, false, Some(8)), 4);
+        assert_eq!(vertical(text, 7, true, Some(8)), 13);
     }
 
     #[test]

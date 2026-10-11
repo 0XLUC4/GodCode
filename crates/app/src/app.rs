@@ -16,10 +16,10 @@ use egui::{
 use godcode_core::check::{self, Problem, Severity};
 use godcode_core::git::{self, Change, Hunk};
 use godcode_core::markdown;
+use godcode_core::modal::{self, Ask, Stroke as Typed};
 use godcode_core::outline::{self, Symbol};
 use godcode_core::search::{self, Hit, Match};
 use godcode_core::syntax::Language;
-use godcode_core::modal::{self, Ask, Stroke as Typed};
 use godcode_core::{Decoded, Indent, LineEnding, complete, edit, format, fuzzy};
 use godcode_lsp::Event as ServerEvent;
 
@@ -140,7 +140,6 @@ enum Cmd {
     CopyPath,
     Preview,
     Minimap,
-    LinesOnly,
     Keys,
     Fold,
     UnfoldAll,
@@ -459,12 +458,6 @@ const COMMANDS: &[Spec] = &[
     ),
     spec(Cmd::Minimap, icon::ROWS, "Toggle Minimap", ""),
     spec(
-        Cmd::LinesOnly,
-        icon::ROWS,
-        "Toggle Fast Rendering (Experimental)",
-        "",
-    ),
-    spec(
         Cmd::Keys,
         icon::KEYBOARD,
         "Switch Keys: Default / Vim / Emacs",
@@ -701,7 +694,6 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Themes),
             Some(Cmd::Preview),
             Some(Cmd::Minimap),
-            Some(Cmd::LinesOnly),
             Some(Cmd::Keys),
             Some(Cmd::Fold),
             Some(Cmd::UnfoldAll),
@@ -1288,8 +1280,6 @@ pub struct GodApp {
     top_line: f32,
     /// The whole file shows as a strip right of the editor.
     minimap: bool,
-    /// The editor lays out only the lines in view: the new text field, still being tried.
-    lines_only: bool,
     /// Whose keys the editor obeys, and what Vim and Emacs remember between keys.
     keys: Keys,
     vim: modal::Vim,
@@ -1456,7 +1446,6 @@ impl GodApp {
             preview_starts: Vec::new(),
             top_line: 0.0,
             minimap: get("minimap").is_none_or(|value| value == "1"),
-            lines_only: get("lines_only").is_some_and(|value| value == "1"),
             keys: match get("keys").as_deref() {
                 Some("1") => Keys::Vim,
                 Some("2") => Keys::Emacs,
@@ -2443,9 +2432,9 @@ impl GodApp {
     }
 
     /// Ask the language server what it writes in the lines of the file in front, once for
-    /// each state of its text. Only the field that lays out the lines in view shows it.
+    /// each state of its text.
     fn ask_hints(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active).filter(|_| self.lines_only) else {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
         if tab.hints_at == Some(tab.revision) {
@@ -4097,7 +4086,6 @@ impl GodApp {
             snippets: &[],
             breakpoints: &[],
             stopped: None,
-            lines_only: false,
             hints: &[],
             block_caret: false,
         };
@@ -4387,10 +4375,6 @@ impl GodApp {
             Cmd::CloseAll => self.close_many(ctx, |_| true),
             Cmd::Preview => self.preview = !self.preview,
             Cmd::Minimap => self.minimap = !self.minimap,
-            Cmd::Fold | Cmd::UnfoldAll if !self.lines_only => {
-                self.toasts
-                    .error("Folding needs Fast Rendering: turn it on in the View menu");
-            }
             Cmd::Fold | Cmd::UnfoldAll => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.view.fold_at_caret = cmd == Cmd::Fold;
@@ -4398,14 +4382,6 @@ impl GodApp {
                         tab.view.folded.clear();
                     }
                 }
-            }
-            Cmd::LinesOnly => {
-                self.lines_only = !self.lines_only;
-                self.toasts.success(if self.lines_only {
-                    "Fast rendering on: only the lines in view are laid out"
-                } else {
-                    "Fast rendering off"
-                });
             }
             Cmd::Keys => {
                 self.keys = match self.keys {
@@ -5821,7 +5797,6 @@ impl GodApp {
             snippets,
             breakpoints: &tab.breakpoints,
             stopped,
-            lines_only: self.lines_only,
             hints: &tab.hints,
             block_caret: front && self.keys == Keys::Vim && self.vim.mode != modal::Mode::Insert,
         };
@@ -6819,7 +6794,6 @@ impl eframe::App for GodApp {
         storage.set_string("wrap", flag(self.wrap));
         storage.set_string("preview", flag(self.preview));
         storage.set_string("minimap", flag(self.minimap));
-        storage.set_string("lines_only", flag(self.lines_only));
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("sticky", flag(self.sticky));
         storage.set_string("autosave", flag(self.autosave));

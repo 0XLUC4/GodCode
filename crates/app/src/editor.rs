@@ -1,15 +1,13 @@
 //! The code editor: a text field with syntax colours, line numbers, completion, problem
 //! marks and code-aware keys.
 
-use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob, LayoutSection, TextFormat, TextWrapping};
 use egui::{
-    Align, Align2, Area, Color32, Context, CornerRadius, Event, FontId, Frame, Galley, Id, Key,
-    Margin, Modifiers, Order, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer,
-    TextEdit, Ui, UiBuilder, pos2, vec2,
+    Align, Align2, Area, Color32, Context, CornerRadius, Event, FontId, Frame, Id, Key, Margin,
+    Modifiers, Order, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui,
+    UiBuilder, pos2, vec2,
 };
 use godcode_core::complete::{self, Completion, Kind};
 use godcode_core::git::{Hunk, LineChange};
@@ -87,12 +85,9 @@ pub struct Config<'a> {
     pub breakpoints: &'a [usize],
     /// The line the debugged program is stopped at.
     pub stopped: Option<usize>,
-    /// Lay out only the lines in view (see [`field`]). Not with `wrap`: there a line takes
-    /// as many rows as it needs, and the whole text is measured.
-    pub lines_only: bool,
-    /// What the language server writes in the lines; shown with `lines_only` alone.
+    /// What the language server writes in the lines.
     pub hints: &'a [field::Hint],
-    /// The caret covers its char: keys are commands (Vim). With `lines_only` alone.
+    /// The caret covers its char: keys are commands (Vim).
     pub block_caret: bool,
 }
 
@@ -112,7 +107,7 @@ pub struct View {
     pub scroll_to_line: Option<f32>,
     /// The other carets: what is typed at the caret is typed at each of them too.
     pub extra: Vec<usize>,
-    /// The lines whose block is folded (where only the lines in view are laid out).
+    /// The lines whose block is folded.
     pub folded: Vec<usize>,
     /// Fold or unfold the block the caret is in, on the next frame.
     pub fold_at_caret: bool,
@@ -125,8 +120,8 @@ pub struct View {
     /// Scroll no more than it takes to see the caret, on the next frame.
     pub reveal: bool,
     layout: Option<Layout>,
-    /// What the field that shows only the lines in view worked out of the text.
-    index: Option<Arc<field::Index>>,
+    /// What the text field worked out of the text.
+    index: field::Cache,
     completion: Option<Popup>,
     /// The bracket pair at a caret, for the text of a layout key.
     pair: Option<PairAt>,
@@ -159,23 +154,15 @@ impl View {
     }
 }
 
-/// The laid out text, reused while nothing it depends on changes.
+/// What the guides, the pinned lines and the strip read of the text, kept while it does
+/// not change.
 struct Layout {
     key: u64,
-    /// The whole text laid out; `None` when only the lines in view are.
-    galley: Option<Arc<Galley>>,
     /// Columns of white space leading each line; `None` for a blank line.
     indents: Vec<Option<usize>>,
     /// The byte each line starts at, then one past the end of the text: line `n` is the
     /// bytes `starts[n]..starts[n + 1] - 1`.
     starts: Vec<usize>,
-}
-
-fn starts_of(text: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
-    starts.push(text.len() + 1);
-    starts
 }
 
 pub(crate) fn indents_of(text: &str) -> Vec<Option<usize>> {
@@ -189,81 +176,6 @@ pub(crate) fn indents_of(text: &str) -> Vec<Option<usize>> {
             (lead < line.len()).then_some(columns)
         })
         .collect()
-}
-
-/// Where the chars of the text are on screen, whichever field shows them. Places are
-/// counted from the top left of the text.
-enum Geometry {
-    Whole(Arc<Galley>),
-    Lines(field::Lines),
-}
-
-impl Geometry {
-    /// Where the char `index` is: a rectangle without width, as tall as its row.
-    fn pos(&self, index: usize) -> Rect {
-        match self {
-            Self::Whole(galley) => galley.pos_from_cursor(CCursor::new(index)),
-            Self::Lines(lines) => lines.pos(index),
-        }
-    }
-
-    /// The char at a place.
-    fn at(&self, within: egui::Vec2) -> usize {
-        match self {
-            Self::Whole(galley) => galley.cursor_from_pos(within).index.0,
-            Self::Lines(lines) => lines.at(within),
-        }
-    }
-
-    /// The lines that start between two heights, each with the height it starts at.
-    fn between(&self, top: f32, bottom: f32) -> Vec<(usize, f32)> {
-        match self {
-            Self::Lines(lines) => lines.between(top, bottom),
-            Self::Whole(galley) => {
-                // A wrapped line takes several rows: only the first one starts it.
-                let mut starts = true;
-                let rows = galley.rows.iter();
-                let firsts =
-                    rows.filter(|row| std::mem::replace(&mut starts, row.ends_with_newline));
-                let numbered = firsts.map(|row| row.pos.y).enumerate();
-                numbered
-                    .skip_while(|(_, y)| *y < top)
-                    .take_while(|(_, y)| *y <= bottom)
-                    .collect()
-            }
-        }
-    }
-
-    /// The line the height `y` is in.
-    fn line_at(&self, y: f32) -> usize {
-        match self {
-            Self::Lines(lines) => lines.line_at(y),
-            Self::Whole(galley) => {
-                let above = galley.rows.iter().take_while(|row| row.pos.y <= y + 0.5);
-                let ended = above.filter(|row| row.ends_with_newline).count();
-                // The row at `y` itself is counted when it ends its line: it is still in it.
-                let last = galley.rows.iter().rfind(|row| row.pos.y <= y + 0.5);
-                ended - usize::from(last.is_some_and(|row| row.ends_with_newline))
-            }
-        }
-    }
-
-    /// The height `line` starts at when every line is one row; `None` when it is folded
-    /// away.
-    fn top(&self, line: usize, row_height: f32) -> Option<f32> {
-        match self {
-            Self::Whole(_) => Some(line as f32 * row_height),
-            Self::Lines(lines) => lines.top(line),
-        }
-    }
-
-    /// The line that row `row` belongs to, keeping its fraction.
-    fn line_of_row(&self, row: f32) -> f32 {
-        match self {
-            Self::Lines(lines) => lines.line_of_row(row),
-            Self::Whole(galley) => line_of_row(galley, row),
-        }
-    }
 }
 
 /// The completion list open at the caret.
@@ -911,18 +823,6 @@ fn show_completion(ui: &Ui, id: Id, popup: &Popup, at: Pos2, palette: &Palette) 
     clicked
 }
 
-fn layout_key(text: &str, config: &Config<'_>, dark: bool, width: f32) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    width.to_bits().hash(&mut hasher);
-    // The colours of the code change with the scheme.
-    theme::current().name.hash(&mut hasher);
-    config.language.name.hash(&mut hasher);
-    config.font_size.to_bits().hash(&mut hasher);
-    dark.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// The text as coloured sections, rows being cut at `width` (never, when infinite).
 fn layout_job(text: &str, config: &Config<'_>, dark: bool, width: f32) -> LayoutJob {
     let font = FontId::monospace(config.font_size);
@@ -1006,19 +906,8 @@ pub fn show(
         ScrollArea::both()
     };
     if let Some(line) = view.scroll_to_line.take() {
-        // Wrapped, a line takes several rows: the last layout tells which one it starts on.
-        let whole = view
-            .layout
-            .as_ref()
-            .and_then(|layout| layout.galley.as_ref());
-        let row = match whole {
-            Some(galley) if config.wrap => row_of_line(galley, line),
-            // Folded blocks take no row.
-            _ => match &view.index {
-                Some(index) if config.lines_only => field::row_of(index, &view.folded, line),
-                _ => line,
-            },
-        };
+        // A block folded away takes no row, a line cut to fit takes several.
+        let row = view.index.row_of(line);
         scroll = scroll.vertical_scroll_offset(row * row_height);
     }
     let scrolled = scroll
@@ -1027,87 +916,35 @@ pub fn show(
         .show(&mut child, |ui| {
             // Reserved now so the highlights end up under the text.
             let under = ui.painter().add(Shape::Noop);
-            let lines_only = config.lines_only && !config.wrap;
-            let (response, cursor_range, galley_pos, geometry, typed) = if lines_only {
-                let look = field::Look {
-                    language: config.language,
-                    font: &font,
-                    dark,
-                    margin: MARGIN,
-                    min_size: body.size(),
-                    hints: config.hints,
-                    block_caret: config.block_caret,
-                };
-                let (index, folded) = (&mut view.index, &mut view.folded);
-                let shown = field::show(ui, id, text, &look, index, folded);
-                // What the guides, the pinned lines and the strip read of the text.
-                let index = shown.lines.index();
-                if view
-                    .layout
-                    .as_ref()
-                    .is_none_or(|layout| layout.key != index.key)
-                {
-                    view.layout = Some(Layout {
-                        key: index.key,
-                        galley: None,
-                        indents: index.indents.clone(),
-                        starts: index.starts.clone(),
-                    });
-                }
-                let geometry = Geometry::Lines(shown.lines);
-                (
-                    shown.response,
-                    shown.cursor,
-                    shown.origin,
-                    geometry,
-                    shown.changed,
-                )
-            } else {
-                let layout = &mut view.layout;
-                let mut layouter = |ui: &Ui, buffer: &dyn TextBuffer, wrap_width: f32| {
-                    let width = if config.wrap {
-                        wrap_width
-                    } else {
-                        f32::INFINITY
-                    };
-                    let key = layout_key(buffer.as_str(), config, dark, width);
-                    let known = layout.as_ref().filter(|layout| layout.key == key);
-                    if let Some(galley) = known.and_then(|layout| layout.galley.as_ref()) {
-                        return Arc::clone(galley);
-                    }
-                    let job = layout_job(buffer.as_str(), config, dark, width);
-                    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                    *layout = Some(Layout {
-                        key,
-                        galley: Some(Arc::clone(&galley)),
-                        indents: indents_of(buffer.as_str()),
-                        starts: starts_of(buffer.as_str()),
-                    });
-                    galley
-                };
-                let output = TextEdit::multiline(text)
-                    .id(id)
-                    .frame(Frame::NONE)
-                    .margin(MARGIN)
-                    .desired_width(body.width())
-                    .min_size(vec2(
-                        0.0,
-                        body.height() - f32::from(MARGIN.top + MARGIN.bottom),
-                    ))
-                    .lock_focus(true)
-                    .layouter(&mut layouter)
-                    .show(ui);
-                let typed = output.response.response.changed();
-                let geometry = Geometry::Whole(output.galley);
-                let response = output.response.response;
-                (
-                    response,
-                    output.cursor_range,
-                    output.galley_pos,
-                    geometry,
-                    typed,
-                )
+            let look = field::Look {
+                language: config.language,
+                font: &font,
+                dark,
+                margin: MARGIN,
+                min_size: body.size(),
+                hints: config.hints,
+                block_caret: config.block_caret,
+                wrap: config.wrap,
             };
+            let (index, folded) = (&mut view.index, &mut view.folded);
+            let shown = field::show(ui, id, text, &look, index, folded);
+            // What the guides, the pinned lines and the strip read of the text.
+            let index = shown.lines.index();
+            if view
+                .layout
+                .as_ref()
+                .is_none_or(|layout| layout.key != index.key)
+            {
+                view.layout = Some(Layout {
+                    key: index.key,
+                    indents: index.indents.clone(),
+                    starts: index.starts.clone(),
+                });
+            }
+            let (response, cursor_range, galley_pos, typed) =
+                (shown.response, shown.cursor, shown.origin, shown.changed);
+            // Where the chars of the text are, counted from its top left.
+            let geometry = shown.lines;
             if std::mem::take(&mut view.focus) {
                 response.request_focus();
             }
@@ -1127,7 +964,9 @@ pub fn show(
             // Alt+click leaves a caret where the caret was; a plain click is one caret again.
             if response.clicked() {
                 match &selected_before {
-                    Some(old) if ui.input(|input| input.modifiers.alt && !input.modifiers.shift) => {
+                    Some(old)
+                        if ui.input(|input| input.modifiers.alt && !input.modifiers.shift) =>
+                    {
                         view.extra.push(old.start)
                     }
                     _ => view.extra.clear(),
@@ -1193,7 +1032,7 @@ pub fn show(
             let place = |line: usize, start: usize, len: usize| {
                 // One row per line unless they wrap: lines out of view are skipped unmeasured,
                 // and so are the ones folded away.
-                let top = origin.y + geometry.top(line, row_height)?;
+                let top = origin.y + geometry.top(line)?;
                 if !config.wrap && (top > clip.max.y || top + row_height < clip.min.y) {
                     return None;
                 }
@@ -1218,7 +1057,7 @@ pub fn show(
             }
             // Where the debugged program waits.
             let stopped = config.stopped.filter(|_| !config.wrap);
-            if let Some(top) = stopped.and_then(|line| geometry.top(line, row_height)) {
+            if let Some(top) = stopped.and_then(|line| geometry.top(line)) {
                 let top = origin.y + top;
                 let row = Rect::from_x_y_ranges(clip.x_range(), top..=top + row_height);
                 shapes.push(Shape::rect_filled(row, 0.0, STOPPED_COLOR));
@@ -1336,7 +1175,9 @@ pub fn show(
                 ui.scroll_to_rect(target.expand2(vec2(60.0, 0.0)), Some(Align::Center));
             }
             if let (true, Some(caret)) = (std::mem::take(&mut view.reveal), caret) {
-                let around = caret.translate(origin).expand2(vec2(4.0 * digit, row_height));
+                let around = caret
+                    .translate(origin)
+                    .expand2(vec2(4.0 * digit, row_height));
                 ui.scroll_to_rect(around, None);
             }
             changed |= typed;
@@ -1412,9 +1253,7 @@ pub fn show(
         }
         // A block can be folded from the line that opens it: an arrow by its number, shown
         // while the pointer is over the numbers, and always when the block is closed.
-        if let Geometry::Lines(lines) = &geometry
-            && let Some(closed) = lines.foldable(index)
-        {
+        if let Some(closed) = geometry.foldable(index) {
             let zone = number.with_min_x(gutter.max.x - GUTTER_PAD);
             let arrow = ui
                 .interact(zone, id.with(("fold", index)), Sense::click())
@@ -1485,7 +1324,8 @@ pub fn show(
         }
     }
     // Fold or unfold: the block of the arrow clicked, or the one the caret is in.
-    if let Geometry::Lines(lines) = &geometry {
+    {
+        let lines = &geometry;
         let asked = std::mem::take(&mut view.fold_at_caret);
         let at_caret = caret_line.filter(|_| asked);
         let header =
@@ -1658,26 +1498,6 @@ fn show_minimap(
     Some(((pointer.y - rect.min.y) / step - shown / 2.0).clamp(0.0, lines as f32))
 }
 
-/// The row of `galley` that line `line` starts on, keeping its fraction.
-fn row_of_line(galley: &Galley, line: f32) -> f32 {
-    let mut current = 0.0;
-    for (index, row) in galley.rows.iter().enumerate() {
-        if current >= line.floor() {
-            return index as f32 + line.fract();
-        }
-        if row.ends_with_newline {
-            current += 1.0;
-        }
-    }
-    galley.rows.len() as f32
-}
-
-/// The line that row `row` of `galley` belongs to, keeping its fraction.
-fn line_of_row(galley: &Galley, row: f32) -> f32 {
-    let above = galley.rows.iter().take(row as usize);
-    above.filter(|row| row.ends_with_newline).count() as f32 + row.fract()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,13 +1511,7 @@ mod tests {
         time: f64,
         file: &'static str,
         wrap: bool,
-        lines_only: bool,
         hints: Vec<field::Hint>,
-    }
-
-    thread_local! {
-        /// The tests of this thread run on the field that lays out only the lines in view.
-        static LINES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn editor_id() -> Id {
@@ -1717,7 +1531,6 @@ mod tests {
                 time: 0.0,
                 file,
                 wrap,
-                lines_only: LINES_ONLY.get(),
                 hints: Vec::new(),
             };
             harness.frame(Vec::new());
@@ -1750,7 +1563,6 @@ mod tests {
                 snippets: &[],
                 breakpoints: &[],
                 stopped: None,
-                lines_only: self.lines_only,
                 hints: &self.hints,
                 block_caret: false,
             };
@@ -1844,13 +1656,20 @@ mod tests {
     #[test]
     fn a_long_line_wraps_only_when_asked() {
         let text = format!("{}\nend", "word ".repeat(400));
-        let rows = |wrap: bool| {
-            let harness = Harness::of("page.html", &text, wrap);
-            let layout = harness.view.layout.as_ref().expect("laid out");
-            layout.galley.as_ref().expect("laid out whole").rows.len()
-        };
-        assert_eq!(rows(false), 2, "one row per line");
-        assert!(rows(true) > 4, "the long line takes several rows");
+        // The row the second line shows on: the first line takes one row, or many.
+        let row = |wrap: bool| Harness::of("page.html", &text, wrap).view.index.row_of(1.0);
+        assert_eq!(row(false), 1.0);
+        assert!(row(true) > 4.0, "the long line takes several rows");
+        // Down goes to the next row of the line, not past the line.
+        let mut harness = Harness::of("page.html", &text, true);
+        set_selection(&harness.ctx, editor_id(), &(0..0));
+        harness.frame(Vec::new());
+        let down = harness.key(Key::ArrowDown, Modifiers::NONE);
+        let caret = down.selection.expect("a caret").start;
+        assert!(caret > 0 && caret < 2000, "{caret}");
+        // What is typed there is typed in the long line.
+        harness.type_text("X");
+        assert_eq!(harness.text.find('X'), Some(caret));
     }
 
     #[test]
@@ -1892,21 +1711,8 @@ mod tests {
         assert_eq!(harness.frame(Vec::new()).selection, Some(7..7));
     }
 
-    /// What is asked of the editor is asked of both its text fields.
-    #[test]
-    fn the_field_of_lines_in_view_edits_the_same() {
-        LINES_ONLY.set(true);
-        typing_enter_and_tab_write_indented_code();
-        several_carets_type_and_erase_together();
-        typing_a_tag_closes_it();
-        a_completion_is_offered_and_accepted_with_tab();
-        a_click_puts_the_caret_in_the_text();
-        undo_restores_the_text_through_the_menu();
-    }
-
     #[test]
     fn the_field_of_lines_in_view_moves_selects_and_erases() {
-        LINES_ONLY.set(true);
         let mut harness = Harness::new("one two\nthree\n\nfour");
         set_selection(&harness.ctx, editor_id(), &(0..0));
         harness.frame(Vec::new());
@@ -1940,14 +1746,10 @@ mod tests {
         harness.key(Key::A, Modifiers::COMMAND);
         let out = harness.type_text("x");
         assert_eq!((harness.text.as_str(), out.selection), ("x", Some(1..1)));
-        // Only the lines in view were measured: the text was never laid out whole.
-        let layout = harness.view.layout.as_ref().expect("read");
-        assert!(layout.galley.is_none());
     }
 
     #[test]
     fn a_folded_block_takes_no_row_and_opens_for_the_caret() {
-        LINES_ONLY.set(true);
         let mut harness = Harness::new("fn a() {\n    one();\n    two();\n}\nfn b() {}\n");
         set_selection(&harness.ctx, editor_id(), &(0..0));
         harness.view.fold_at_caret = true;
@@ -1987,7 +1789,6 @@ mod tests {
 
     #[test]
     fn a_rectangle_is_selected_and_written_over_line_by_line() {
-        LINES_ONLY.set(true);
         let mut harness = Harness::new("abcd\nef\nghij\n");
         set_selection(&harness.ctx, editor_id(), &(1..1));
         harness.frame(Vec::new());
@@ -2020,7 +1821,6 @@ mod tests {
 
     #[test]
     fn a_hint_pushes_the_text_along_without_being_in_it() {
-        LINES_ONLY.set(true);
         let mut harness = Harness::new(&"a".repeat(60));
         let pos = pos2(400.0, 10.0);
         let click = |harness: &mut Harness| {
@@ -2055,7 +1855,6 @@ mod tests {
 
     #[test]
     fn the_field_of_lines_in_view_measures_only_what_shows() {
-        LINES_ONLY.set(true);
         let text: String = (0..5000).map(|line| format!("line {line}\n")).collect();
         let mut harness = Harness::new(&text);
         let out = harness.frame(Vec::new());

@@ -218,7 +218,8 @@ fn a_real_server_writes_types_and_argument_names() {
         "includeInlayVariableTypeHints": true,
         "includeInlayFunctionLikeReturnTypeHints": true
     } }"#;
-    let mut server = Server::start(&program(), &["--stdio"], &root, options, || {}).expect("server");
+    let mut server =
+        Server::start(&program(), &["--stdio"], &root, options, || {}).expect("server");
     server.open(&file, "typescript", text);
     let hints = until(
         &mut server,
