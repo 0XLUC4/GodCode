@@ -5,6 +5,8 @@
 pub mod check;
 pub mod complete;
 pub mod coverage;
+pub mod docker;
+pub mod dotenv;
 pub mod edit;
 pub mod emmet;
 pub mod format;
