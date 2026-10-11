@@ -280,9 +280,38 @@ pub fn side_by_side(diff: &str, titles: bool) -> Vec<Row> {
     rows
 }
 
+/// The commit a line of `git log` is about, with or without the drawing of the branches
+/// before it: its abbreviated hash. A line that only draws has none.
+pub fn hash_in(line: &str) -> Option<&str> {
+    let hash = |word: &&str| {
+        (7..=40).contains(&word.len()) && word.chars().all(|ch| ch.is_ascii_hexdigit())
+    };
+    line.split_whitespace().find(hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_commit_of_a_line_of_the_log_is_found() {
+        assert_eq!(
+            hash_in("a1b2c3d  2026-10-11  Luca  fix: a thing"),
+            Some("a1b2c3d")
+        );
+        assert_eq!(
+            hash_in("| * 0f9e8d7  2026-10-10  Luca (main)  merge"),
+            Some("0f9e8d7")
+        );
+        assert_eq!(hash_in(r"|\  "), None);
+        assert_eq!(hash_in("* | "), None);
+        // A word of the message is no hash, a short number neither.
+        assert_eq!(
+            hash_in("* deadbeef1  2026-10-09  Ada  add cafe 123"),
+            Some("deadbeef1")
+        );
+        assert_eq!(hash_in("just words here"), None);
+    }
 
     #[test]
     fn a_conflict_is_settled_for_one_side_or_both() {

@@ -165,6 +165,7 @@ enum Cmd {
     RunLast,
     RunSettings,
     GitLog,
+    GitGraph,
     Stash,
     StashPop,
     Snippets,
@@ -542,6 +543,7 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::RunLast, icon::PLAY, "Run Last Task", "Ctrl+Alt+R"),
     spec(Cmd::RunSettings, icon::PLAY, "Edit Run Configurations", ""),
     spec(Cmd::GitLog, icon::GIT_BRANCH, "Git Log…", ""),
+    spec(Cmd::GitGraph, icon::GIT_BRANCH, "Git Graph…", ""),
     spec(Cmd::Stash, icon::PACKAGE, "Git Stash", ""),
     spec(Cmd::StashPop, icon::PACKAGE, "Git Stash Pop", ""),
     spec(Cmd::Snippets, icon::CODE_BLOCK, "Edit Snippets", ""),
@@ -795,6 +797,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::History),
             None,
             Some(Cmd::GitLog),
+            Some(Cmd::GitGraph),
             Some(Cmd::Stash),
             Some(Cmd::StashPop),
             None,
@@ -1445,6 +1448,8 @@ pub struct GodApp {
     last_task: Option<String>,
     /// The commits to pick from, what was typed to narrow them, the one chosen.
     log: Option<(Vec<String>, String, usize)>,
+    /// The commits listed are drawn as a graph of all the branches.
+    log_graph: bool,
     /// The snippets of the user, by language.
     snippets: std::collections::HashMap<String, Vec<(String, String)>>,
     /// What the last HTTP request answered, and the answer still awaited.
@@ -1611,6 +1616,7 @@ impl GodApp {
             tasks: None,
             last_task: None,
             log: None,
+            log_graph: false,
             snippets: load_snippets(),
             response: String::new(),
             requesting: None,
@@ -3950,13 +3956,22 @@ impl GodApp {
         let wanted = typed.to_lowercase();
         let fits = |commit: &&String| commit.to_lowercase().contains(&wanted);
         let rows: Vec<String> = all.iter().filter(fits).cloned().collect();
-        let answer = list_dialog(ctx, "Git log", &rows, &mut selected, Some(&mut typed));
+        let (title, drawn) = match self.log_graph {
+            true => ("Git graph", true),
+            false => ("Git log", false),
+        };
+        let answer = list_dialog_as(ctx, title, &rows, &mut selected, Some(&mut typed), drawn);
         let Some(answer) = answer else {
             self.log = Some((all, typed, selected));
             return;
         };
-        let hash =
-            answer.and_then(|row| Some(rows.get(row)?.split_whitespace().next()?.to_owned()));
+        let picked = answer.and_then(|row| rows.get(row));
+        let hash = picked.and_then(|row| git::hash_in(row)).map(str::to_owned);
+        // A line that only draws the branches is no commit to show: the list stays.
+        if picked.is_some() && hash.is_none() {
+            self.log = Some((all, typed, selected));
+            return;
+        }
         let (Some(hash), Some(root)) = (hash, self.folder()) else {
             return;
         };
@@ -5115,15 +5130,34 @@ impl GodApp {
                 }
                 None => self.toasts.error("Open a folder or a file first"),
             },
-            Cmd::GitLog => {
-                let format = "--pretty=format:%h  %ad  %an  %s";
-                let listed = self
-                    .folder()
-                    .map(|root| tools::git(&root, &["log", format, "--date=short", "-n", "400"]));
-                match listed {
+            Cmd::GitLog | Cmd::GitGraph => {
+                // The graph draws every branch and how they part and join, each commit
+                // with the names that point at it.
+                let graph = cmd == Cmd::GitGraph;
+                let args: &[&str] = if graph {
+                    &[
+                        "log",
+                        "--graph",
+                        "--all",
+                        "--pretty=format:%h  %ad  %an%d  %s",
+                        "--date=short",
+                        "-n",
+                        "600",
+                    ]
+                } else {
+                    &[
+                        "log",
+                        "--pretty=format:%h  %ad  %an  %s",
+                        "--date=short",
+                        "-n",
+                        "400",
+                    ]
+                };
+                match self.folder().map(|root| tools::git(&root, args)) {
                     Some(Ok(printed)) => {
                         let commits = printed.lines().map(str::to_owned).collect();
                         self.log = Some((commits, String::new(), 0));
+                        self.log_graph = graph;
                     }
                     Some(Err(err)) => self.toasts.error(err),
                     None => self.toasts.error("Open a folder to see its commits"),
@@ -7671,6 +7705,19 @@ fn list_dialog(
     selected: &mut usize,
     typed: Option<&mut String>,
 ) -> Option<Option<usize>> {
+    list_dialog_as(ctx, title, rows, selected, typed, false)
+}
+
+/// A list to pick from. `drawn`: its rows are a drawing in letters, shown wide and in
+/// letters of one width so that it lines up.
+fn list_dialog_as(
+    ctx: &Context,
+    title: &str,
+    rows: &[String],
+    selected: &mut usize,
+    typed: Option<&mut String>,
+    drawn: bool,
+) -> Option<Option<usize>> {
     let (up, down, enter) = ctx.input_mut(|input| {
         (
             input.consume_key(Modifiers::NONE, Key::ArrowUp),
@@ -7683,7 +7730,7 @@ fn list_dialog(
     *selected = selected.saturating_sub(usize::from(up));
     let mut chosen = (enter && !rows.is_empty()).then_some(*selected);
     let response = Modal::new(Id::new(title)).show(ctx, |ui| {
-        ui.set_width(520.0);
+        ui.set_width(if drawn { 860.0 } else { 520.0 });
         ui.heading(title);
         ui.add_space(6.0);
         if let Some(typed) = typed {
@@ -7701,7 +7748,11 @@ fn list_dialog(
         }
         ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
             for (index, row) in rows.iter().enumerate() {
-                let button = Button::selectable(index == *selected, row.as_str())
+                let text = match drawn {
+                    true => RichText::new(row.as_str()).monospace().size(12.5),
+                    false => RichText::new(row.as_str()),
+                };
+                let button = Button::selectable(index == *selected, text)
                     .frame_when_inactive(index == *selected)
                     .stroke(Stroke::NONE)
                     .wrap_mode(egui::TextWrapMode::Truncate)

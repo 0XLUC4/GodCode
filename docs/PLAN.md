@@ -154,7 +154,8 @@ reprise jusqu'à la fin.
 
 Fait : branches, blame, diff avec le dernier commit, journal des commits avec le diff de
 chacun, stash et stash pop. merge et rebase d'une branche, conflits réglés au
-curseur (garder le mien, le leur, les deux). Reste : graphe des branches, vue de fusion
+curseur (garder le mien, le leur, les deux). `Git Graph…` dessine toutes les branches et leurs fusions, un clic montre
+le commit. Reste : vue de fusion
 à trois colonnes ; monorepos, variables d'environnement. Fait : `New Project…` crée un projet depuis un
 modèle (page web, Node/TypeScript, Python, Rust).
 
