@@ -160,6 +160,49 @@ pub fn tests(text: &str, language: &Language) -> Vec<(usize, String)> {
     found.collect()
 }
 
+/// The tests a run says it ran, with whether each passed: read from what `cargo test`,
+/// `pytest -v`, `go test -v` and the verbose reporters of Jest and Vitest print. A test is
+/// named alone, without its module or its file.
+pub fn results(output: &str) -> Vec<(String, bool)> {
+    let alone = |path: &str| path.rsplit("::").next().unwrap_or(path).to_owned();
+    let read = |line: &str| {
+        let line = line.trim();
+        // cargo: `test tests::adds ... ok`
+        if let Some((name, verdict)) = line
+            .strip_prefix("test ")
+            .and_then(|rest| rest.rsplit_once(" ... "))
+        {
+            return match verdict.trim() {
+                "ok" => Some((alone(name), true)),
+                "FAILED" => Some((alone(name), false)),
+                _ => None,
+            };
+        }
+        // go: `--- PASS: TestAdds (0.00s)`
+        for (mark, passed) in [("--- PASS: ", true), ("--- FAIL: ", false)] {
+            if let Some(rest) = line.strip_prefix(mark) {
+                return Some((rest.split_whitespace().next()?.to_owned(), passed));
+            }
+        }
+        // pytest: `tests/test_sum.py::test_adds PASSED   [ 50%]`
+        for (mark, passed) in [(" PASSED", true), (" FAILED", false)] {
+            let named = line.split_once(mark).map(|(name, _)| name);
+            if let Some(name) = named.filter(|name| name.contains("::") && !name.contains(' ')) {
+                return Some((alone(name), passed));
+            }
+        }
+        // Jest and Vitest: `✓ adds (2 ms)`
+        for (mark, passed) in [("✓ ", true), ("√ ", true), ("✕ ", false), ("× ", false)] {
+            if let Some(rest) = line.strip_prefix(mark) {
+                let name = rest.rsplit_once(" (").map_or(rest, |(name, _)| name);
+                return Some((name.trim().to_owned(), passed));
+            }
+        }
+        None
+    };
+    output.lines().filter_map(read).collect()
+}
+
 /// Words that introduce a name without being in the outline: variables and constants.
 const BINDERS: [&str; 6] = ["let mut ", "const ", "let ", "var ", "static ", "val "];
 
@@ -188,6 +231,39 @@ pub fn declaration(text: &str, language: &Language, word: &str) -> Option<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_run_is_read_for_what_passed() {
+        let cargo = "running 3 tests\ntest edit::tests::adds ... ok\ntest tests::breaks ... FAILED\n\
+                     test slow ... ignored\n\ntest result: FAILED. 1 passed; 1 failed; 1 ignored";
+        let named = |name: &str, passed| (name.to_owned(), passed);
+        assert_eq!(
+            results(cargo),
+            [named("adds", true), named("breaks", false)]
+        );
+        let pytest = "tests/test_sum.py::test_adds PASSED      [ 50%]\n\
+                      tests/test_sum.py::TestMore::test_breaks FAILED [100%]\n\
+                      FAILED tests/test_sum.py::TestMore::test_breaks - assert 1 == 2";
+        assert_eq!(
+            results(pytest),
+            [named("test_adds", true), named("test_breaks", false)]
+        );
+        let go = "=== RUN   TestAdds\n--- PASS: TestAdds (0.00s)\n    --- FAIL: TestBreaks (0.01s)\nFAIL";
+        assert_eq!(
+            results(go),
+            [named("TestAdds", true), named("TestBreaks", false)]
+        );
+        let jest = " ✓ adds two numbers (2 ms)\n ✕ breaks\n × breaks too 3ms";
+        assert_eq!(
+            results(jest),
+            [
+                named("adds two numbers", true),
+                named("breaks", false),
+                named("breaks too 3ms", false)
+            ]
+        );
+        assert!(results("Compiling a v0.1.0\nnothing here").is_empty());
+    }
     use std::path::Path;
 
     #[test]

@@ -138,7 +138,8 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | **Débogueur** (`crates/lsp/src/dap.rs`, client DAP) : points d'arrêt (clic sur le numéro de ligne ou `F9`), `Ctrl+F5` lance, `F5` continue, `F10` / `F11` / `Shift+F11` pas à pas, `Shift+F5` arrête ; panneau Debug avec pile d'appels, variables et sortie du programme | ✅ |
 | Expressions surveillées (watch) : tapées dans le panneau Debug, recalculées à chaque arrêt et quand on change d'appel dans la pile, gardées d'une session à l'autre ; un clic en retire une | ✅ |
 | Autres langages que Python : `Edit Debug Configurations` (adaptateur + réglages de lancement, `${file}` et `${folder}`) ; mécanisme fait, aucun autre adaptateur vérifié ici | ✅ |
-| Explorateur de tests du projet (tous les fichiers), résultats réussis / échoués lus dans la sortie, couverture | ⏳ |
+| `Run Tests and Show Results` (`Ctrl+Alt+T`, ou `Run all` dans le panneau Tests) : la commande de test du projet tourne hors du terminal, et ce qu'elle imprime est lu (cargo, `pytest -v`, `go test -v`, Jest / Vitest verbeux) : tests échoués du projet en tête, coche ou croix sur ceux du fichier ouvert, compte, et toute la sortie à côté. Format vérifié sur une vraie sortie de `cargo test` ; les autres par leurs formats connus | ✅ |
+| Explorateur de tests du projet par fichier, relance d'un seul test avec résultat, couverture | ⏳ |
 | Débogueur : points d'arrêt conditionnels, variables dépliables (objets, listes), survol d'une variable dans le code | ⏳ |
 
 Vérifié de bout en bout avec le vrai débogueur Python (debugpy) : arrêt sur un point d'arrêt,

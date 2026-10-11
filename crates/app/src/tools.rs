@@ -339,6 +339,37 @@ pub fn test_command(root: &Path) -> Option<&'static str> {
     found.map(|(_, command)| command)
 }
 
+/// `command`, a command that runs tests, asked to name each test it runs and say whether
+/// it passed, where it does not by itself.
+pub fn with_results(command: &str) -> String {
+    match command {
+        "pytest" => "pytest -v".to_owned(),
+        "go test ./..." => "go test -v ./...".to_owned(),
+        command => command.to_owned(),
+    }
+}
+
+/// Run `command` through the shell in `folder`, without a window, and return all it
+/// printed; or why it could not run.
+pub fn run_captured(folder: &Path, command: &str) -> String {
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let mut run = Command::new(shell);
+    run.args([flag, command]).current_dir(folder);
+    hidden(&mut run);
+    match run.output() {
+        Ok(output) => {
+            let printed = String::from_utf8_lossy(&output.stdout);
+            let complained = String::from_utf8_lossy(&output.stderr);
+            format!("{printed}{complained}")
+        }
+        Err(err) => format!("Cannot run `{command}`: {err}\n"),
+    }
+}
+
 /// Run `git` in `folder` and return what it printed; what it complained about when it fails.
 pub fn git(folder: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");
@@ -548,6 +579,14 @@ mod tests {
         );
         // Nothing to write in: the command is left as it is.
         assert_eq!(with_places("run ${file}", None, None), "run ${file}");
+    }
+
+    #[test]
+    fn a_command_is_run_and_what_it_printed_is_kept() {
+        let printed = run_captured(&std::env::temp_dir(), "echo hello there");
+        assert!(printed.contains("hello there"), "{printed}");
+        assert_eq!(with_results("pytest"), "pytest -v");
+        assert_eq!(with_results("cargo test"), "cargo test");
     }
 
     #[test]

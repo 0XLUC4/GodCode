@@ -156,6 +156,7 @@ enum Cmd {
     Blame,
     History,
     RunTests,
+    TestResults,
     Themes,
     Zen,
     CaretAbove,
@@ -516,6 +517,12 @@ const COMMANDS: &[Spec] = &[
         "Run Tests",
         "Ctrl+Shift+T",
     ),
+    spec(
+        Cmd::TestResults,
+        icon::CHECK_SQUARE,
+        "Run Tests and Show Results",
+        "Ctrl+Alt+T",
+    ),
     spec(Cmd::Themes, icon::PALETTE, "Color Theme…", ""),
     spec(Cmd::Zen, icon::EYE, "Toggle Zen Mode", "Ctrl+Alt+Z"),
     spec(
@@ -754,6 +761,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             None,
             Some(Cmd::TestsPanel),
             Some(Cmd::RunTests),
+            Some(Cmd::TestResults),
             Some(Cmd::TestAtCaret),
             Some(Cmd::Tasks),
             Some(Cmd::RunLast),
@@ -1458,6 +1466,11 @@ pub struct GodApp {
     split_down: bool,
     /// The tests of the file in front, and what they were found in.
     tests: (u64, Vec<(usize, String)>),
+    /// The tests of the project being run here; what the last run said of each test it
+    /// ran; and all it printed.
+    test_run: Option<Receiver<String>>,
+    test_results: Vec<(String, bool)>,
+    test_output: String,
     /// What picking a branch does: switch to it, merge it, rebase onto it.
     branch_action: Cmd,
 }
@@ -1605,6 +1618,9 @@ impl GodApp {
             keymap: load_keymap(),
             split_down: false,
             tests: (0, Vec::new()),
+            test_run: None,
+            test_results: Vec::new(),
+            test_output: String::new(),
             branch_action: Cmd::Branches,
         };
         if paths.is_empty() {
@@ -3380,42 +3396,152 @@ impl GodApp {
         self.open_file(ctx, &file);
     }
 
-    /// The tests of the file in front: click one to run it.
-    fn tests_list(&mut self, ui: &mut Ui) {
-        let palette = Palette::of(ui);
-        let Some(tab) = self.tabs.get(self.active) else {
-            return;
-        };
-        if self.tests.1.is_empty() {
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                let none = "No test found in this file (Rust, Python, Go, JavaScript, TypeScript).";
-                ui.label(RichText::new(none).color(palette.text_dim));
-            });
+    /// Run the tests of the project here, out of sight, to read what passed.
+    fn start_tests(&mut self, ctx: &Context) {
+        if self.test_run.is_some() {
             return;
         }
-        let mut run = None;
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            for (line, name) in &self.tests.1 {
-                let label = format!("{name}    line {}", line + 1);
-                let row = list_row(ui, &palette, &label, 30.0, palette.text);
-                ui.painter().text(
-                    pos2(row.rect.min.x + 10.0, row.rect.center().y),
-                    Align2::LEFT_CENTER,
-                    icon::PLAY,
-                    FontId::proportional(13.0),
-                    palette.text_dim,
-                );
-                if row.on_hover_text("Run this test").clicked() {
-                    run = Some(name.clone());
+        let command = self
+            .run_root()
+            .and_then(|root| Some((tools::with_results(tools::test_command(&root)?), root)));
+        let Some((command, root)) = command else {
+            self.toasts.error("No tests are known for this project");
+            return;
+        };
+        self.test_output = format!("$ {command}\n");
+        self.test_results.clear();
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            // The window may be gone when the tests end: there is then no one to tell.
+            let _ = sender.send(tools::run_captured(&root, &command));
+            waking.request_repaint();
+        });
+        self.test_run = Some(receiver);
+        self.bottom = Some(Bottom::Tests);
+    }
+
+    /// Take in what the tests run here printed, once they ended.
+    fn poll_tests(&mut self) {
+        let Some(run) = &self.test_run else {
+            return;
+        };
+        match run.try_recv() {
+            Ok(printed) => {
+                self.test_results = outline::results(&printed);
+                self.test_output.push_str(&printed);
+                self.test_run = None;
+                let failed = self
+                    .test_results
+                    .iter()
+                    .filter(|(_, passed)| !passed)
+                    .count();
+                let passed = self.test_results.len() - failed;
+                match (passed, failed) {
+                    (0, 0) => self
+                        .toasts
+                        .error("The tests ran, but none could be read: see what was printed"),
+                    (passed, 0) => self.toasts.success(format!("{passed} tests passed")),
+                    (passed, failed) => self
+                        .toasts
+                        .error(format!("{failed} tests failed, {passed} passed")),
                 }
             }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.test_run = None,
+        }
+    }
+
+    /// The tests: those of the project that failed in the last run made here, those of the
+    /// file in front (a click runs one in the terminal), and what that run printed.
+    fn tests_list(&mut self, ui: &mut Ui) {
+        const PASSED: Color32 = Color32::from_rgb(0x3F, 0xB9, 0x50);
+        const FAILED: Color32 = Color32::from_rgb(0xE5, 0x53, 0x4B);
+        let palette = Palette::of(ui);
+        let running = self.test_run.is_some();
+        let failed = self
+            .test_results
+            .iter()
+            .filter(|(_, passed)| !passed)
+            .count();
+        let passed = self.test_results.len() - failed;
+        let mut run_all = false;
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let all = Button::new(with_icon(icon::PLAY, "Run all"));
+            let tip = "Run the tests of the project here and show what passed (Ctrl+Alt+T)";
+            run_all = ui.add_enabled(!running, all).on_hover_text(tip).clicked();
+            if running {
+                ui.spinner();
+                ui.label(RichText::new("Running…").color(palette.text_dim));
+            } else if !self.test_results.is_empty() {
+                let ink = if failed > 0 { FAILED } else { PASSED };
+                ui.label(RichText::new(format!("{passed} passed, {failed} failed")).color(ink));
+            }
         });
-        let command =
-            run.and_then(|name| tools::test_one(tab.language.name, tab.path.as_deref()?, &name));
+        ui.add_space(4.0);
+        let mut run = None;
+        // What the last run said of a test: the last word, when it ran more than once.
+        let verdict = |name: &str| {
+            let said = self.test_results.iter().rev().find(|(ran, _)| ran == name);
+            said.map(|(_, passed)| *passed)
+        };
+        let marked = |ui: &Ui, row: &Response, glyph: &str, ink: Color32| {
+            ui.painter().text(
+                pos2(row.rect.min.x + 10.0, row.rect.center().y),
+                Align2::LEFT_CENTER,
+                glyph,
+                FontId::proportional(13.0),
+                ink,
+            );
+        };
+        ui.columns(2, |columns| {
+            ScrollArea::vertical()
+                .id_salt("tests-list")
+                .auto_shrink(false)
+                .show(&mut columns[0], |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    // Wherever they are in the project, the failed ones come first.
+                    for (name, _) in self.test_results.iter().filter(|(_, passed)| !passed) {
+                        let row = list_row(ui, &palette, name, 30.0, FAILED);
+                        marked(ui, &row, icon::X_CIRCLE, FAILED);
+                    }
+                    for (line, name) in &self.tests.1 {
+                        let label = format!("{name}    line {}", line + 1);
+                        let row = list_row(ui, &palette, &label, 30.0, palette.text);
+                        match verdict(name) {
+                            Some(true) => marked(ui, &row, icon::CHECK_CIRCLE, PASSED),
+                            Some(false) => marked(ui, &row, icon::X_CIRCLE, FAILED),
+                            None => marked(ui, &row, icon::PLAY, palette.text_dim),
+                        }
+                        if row.on_hover_text("Run this test in the terminal").clicked() {
+                            run = Some(name.clone());
+                        }
+                    }
+                    if self.tests.1.is_empty() && self.test_results.is_empty() {
+                        let none =
+                            "No test found in this file (Rust, Python, Go, JavaScript, TypeScript).";
+                        ui.label(RichText::new(none).color(palette.text_dim));
+                    }
+                });
+            ScrollArea::both()
+                .id_salt("tests-output")
+                .auto_shrink(false)
+                .stick_to_bottom(true)
+                .show(&mut columns[1], |ui| {
+                    let printed = RichText::new(&self.test_output).monospace().size(12.5);
+                    ui.add(egui::Label::new(printed).selectable(true));
+                });
+        });
+        let ctx = ui.ctx().clone();
+        if run_all {
+            self.start_tests(&ctx);
+        }
+        let command = run.and_then(|name| {
+            let tab = self.tabs.get(self.active)?;
+            tools::test_one(tab.language.name, tab.path.as_deref()?, &name)
+        });
         if let Some(command) = command {
-            let ctx = ui.ctx().clone();
             self.show_terminal(&ctx);
             if let Some(terminal) = &mut self.terminal {
                 terminal.send(&command);
@@ -3423,8 +3549,6 @@ impl GodApp {
         }
     }
 
-    /// Show the file in front in the browser, served from this computer: it reloads by
-    /// itself at each save.
     /// The address the file in front is served at: it is saved first, and its folder
     /// served when it is not yet.
     fn live_url(&mut self, ctx: &Context) -> Option<String> {
@@ -4943,6 +5067,7 @@ impl GodApp {
                     self.versions = Some((versions, 0));
                 }
             }
+            Cmd::TestResults => self.start_tests(ctx),
             Cmd::RunTests => {
                 let beside = self
                     .tabs
@@ -5138,6 +5263,7 @@ impl GodApp {
             (alt, Key::ArrowDown, Cmd::CaretBelow),
             (alt, Key::R, Cmd::RunLast),
             (shift, Key::R, Cmd::Tasks),
+            (alt, Key::T, Cmd::TestResults),
             (shift, Key::T, Cmd::RunTests),
             (ctrl, Key::Backslash, Cmd::Split),
             (Modifiers::ALT, Key::F7, Cmd::FindUsages),
@@ -5826,8 +5952,8 @@ impl GodApp {
                         Cmd::TestsPanel,
                         &[(
                             icon::PLAY,
-                            "Run all the tests (Ctrl+Shift+T)",
-                            Cmd::RunTests,
+                            "Run all the tests and show what passed (Ctrl+Alt+T)",
+                            Cmd::TestResults,
                         )],
                     ),
                     Bottom::Debug => (
@@ -7065,6 +7191,7 @@ impl eframe::App for GodApp {
         // After the servers were heard: one that just said what it can do is asked at once.
         self.ask_hints();
         self.poll_debug(&ctx);
+        self.poll_tests();
         // The tab in front is the most recent of the recent files.
         if let Some(tab) = self.tabs.get_mut(self.active)
             && tab.used != self.clock
