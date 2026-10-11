@@ -159,6 +159,7 @@ enum Cmd {
     RunTests,
     TestResults,
     RunCoverage,
+    MergeView,
     Coverage,
     Environment,
     Themes,
@@ -630,6 +631,12 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::TestsPanel, icon::CHECK_SQUARE, "Toggle Tests", ""),
     spec(Cmd::Merge, icon::ARROWS_MERGE, "Git Merge Branch…", ""),
     spec(Cmd::Rebase, icon::GIT_BRANCH, "Git Rebase onto…", ""),
+    spec(
+        Cmd::MergeView,
+        icon::ARROWS_MERGE,
+        "Conflict: Open Merge View",
+        "",
+    ),
     spec(Cmd::AcceptOurs, icon::CHECK, "Conflict: Keep Mine", ""),
     spec(Cmd::AcceptTheirs, icon::CHECK, "Conflict: Keep Theirs", ""),
     spec(Cmd::AcceptBoth, icon::CHECK, "Conflict: Keep Both", ""),
@@ -843,6 +850,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             None,
             Some(Cmd::Merge),
             Some(Cmd::Rebase),
+            Some(Cmd::MergeView),
             Some(Cmd::AcceptOurs),
             Some(Cmd::AcceptTheirs),
             Some(Cmd::AcceptBoth),
@@ -1507,6 +1515,10 @@ pub struct GodApp {
     branches: Option<(Vec<String>, String, usize)>,
     /// A file compared with its last commit: its name and the rows.
     diff: Option<(String, Vec<git::Row>)>,
+    /// The file whose conflicts are being settled side by side.
+    merging: Option<Merging>,
+    /// The database being looked into.
+    database: Option<Browsing>,
     /// Who last changed each line shows after the line of the caret.
     blame: bool,
     blamed: (u64, Vec<git::Blame>),
@@ -1718,6 +1730,8 @@ impl GodApp {
             themes: None,
             zen: false,
             tasks: None,
+            merging: None,
+            database: None,
             last_task: None,
             log: None,
             log_graph: false,
@@ -1881,6 +1895,30 @@ impl GodApp {
                 return false;
             }
         };
+        if bytes.starts_with(b"SQLite format 3\0") {
+            // Not a text: it is looked into, no tab holds it.
+            match godcode_core::sqlite::Database::open(bytes) {
+                Ok(database) => {
+                    let log = PathBuf::from(format!("{}-wal", path.display()));
+                    let behind = database.uses_wal()
+                        && std::fs::metadata(log).is_ok_and(|log| log.len() > 0);
+                    let mut browsing = Browsing {
+                        name,
+                        database,
+                        table: 0,
+                        page: 0,
+                        count: 0,
+                        rows: Vec::new(),
+                        error: None,
+                        behind,
+                    };
+                    browsing.read();
+                    self.database = Some(browsing);
+                }
+                Err(err) => self.toasts.error(format!("Cannot read {name}: {err}")),
+            }
+            return false;
+        }
         let Some(decoded) = godcode_core::decode(&bytes) else {
             self.toasts
                 .error(format!("{name} is not a UTF-8 text file"));
@@ -3713,6 +3751,236 @@ impl GodApp {
         written.next().map_or_else(Vec::new, read)
     }
 
+    /// The tables of a database and the rows of one of them, a page at a time.
+    fn database_window(&mut self, ctx: &Context) {
+        let Some(mut browsing) = self.database.take() else {
+            return;
+        };
+        let palette = Palette::of_ctx(ctx);
+        let (mut table, mut page) = (browsing.table, browsing.page);
+        let mut open = true;
+        egui::Window::new(format!("Database: {}", browsing.name))
+            .id(Id::new("database-window"))
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_size(vec2(1180.0, 640.0))
+            .show(ctx, |ui| {
+                if browsing.behind {
+                    let note = "Changes still in its write-ahead log (-wal file) do not show here";
+                    ui.colored_label(palette.text_dim, note);
+                }
+                let tables = browsing.database.tables();
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(200.0);
+                        let list = ScrollArea::vertical().id_salt("database-tables");
+                        list.auto_shrink(false).show(ui, |ui| {
+                            if tables.is_empty() {
+                                ui.colored_label(palette.text_dim, "No table");
+                            }
+                            for (index, found) in tables.iter().enumerate() {
+                                let row = ui.selectable_label(index == table, &found.name);
+                                if row.on_hover_text(&found.sql).clicked() {
+                                    (table, page) = (index, 0);
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        let pages = browsing.count.div_ceil(DATABASE_PAGE).max(1);
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} rows", browsing.count));
+                            let earlier = Button::new("Previous");
+                            if ui.add_enabled(page > 0, earlier).clicked() {
+                                page -= 1;
+                            }
+                            ui.label(format!("{} / {pages}", page + 1));
+                            if ui
+                                .add_enabled(page + 1 < pages, Button::new("Next"))
+                                .clicked()
+                            {
+                                page += 1;
+                            }
+                        });
+                        if let Some(error) = &browsing.error {
+                            ui.colored_label(palette.error, error);
+                        }
+                        let columns = tables.get(browsing.table).map(|found| &found.columns);
+                        let grid = ScrollArea::both().id_salt("database-rows");
+                        grid.auto_shrink(false).show(ui, |ui| {
+                            egui::Grid::new("database-grid")
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for column in columns.into_iter().flatten() {
+                                        ui.strong(column);
+                                    }
+                                    ui.end_row();
+                                    for row in &browsing.rows {
+                                        for value in row {
+                                            // One line of it, and not all of a long one.
+                                            let written =
+                                                value.to_string().replace(['\n', '\r'], " ");
+                                            let mut shown: String =
+                                                written.chars().take(DATABASE_CELL).collect();
+                                            if shown.len() < written.len() {
+                                                shown.push('…');
+                                            }
+                                            ui.label(shown);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    });
+                });
+            });
+        if (table, page) != (browsing.table, browsing.page) {
+            (browsing.table, browsing.page) = (table, page);
+            browsing.read();
+        }
+        if open {
+            self.database = Some(browsing);
+        }
+    }
+
+    /// The conflicts of a file in three columns: mine, the result, theirs. Each conflict
+    /// is settled by a button on its first row; `Apply` writes the result in the file.
+    fn merge_window(&mut self, ctx: &Context) {
+        use godcode_core::merge::{self, Choice, Kind};
+        let Some(mut merging) = self.merging.take() else {
+            return;
+        };
+        let rows = merge::rows(&merging.parts, &merging.choices);
+        let left = merge::unresolved(&merging.parts, &merging.choices);
+        let palette = Palette::of_ctx(ctx);
+        let mine = Color32::from_rgba_unmultiplied(0x3B, 0x82, 0xF6, 44);
+        let theirs = Color32::from_rgba_unmultiplied(0x58, 0xAC, 0x2C, 46);
+        let unsettled = Color32::from_rgba_unmultiplied(0xF1, 0x4C, 0x4C, 46);
+        let font = FontId::monospace(13.0);
+        let (mut open, mut apply) = (true, false);
+        let mut chosen = None;
+        let mut all = None;
+        egui::Window::new("Merge: mine  |  result  |  theirs")
+            .id(Id::new("merge-window"))
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_size(vec2(1280.0, 660.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(match left {
+                        0 => "Every conflict is settled".to_owned(),
+                        1 => "1 conflict left".to_owned(),
+                        left => format!("{left} conflicts left"),
+                    });
+                    if ui.button("All mine").clicked() {
+                        all = Some(Choice::Ours);
+                    }
+                    if ui.button("All theirs").clicked() {
+                        all = Some(Choice::Theirs);
+                    }
+                    let tip =
+                        "Write the result in the file; a conflict left open keeps its markers";
+                    apply = ui.button("Apply").on_hover_text(tip).clicked();
+                });
+                ui.separator();
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let height = 20.0;
+                let area = ScrollArea::vertical().auto_shrink(false);
+                area.show_rows(ui, height, rows.len(), |ui, range| {
+                    for index in range {
+                        let row = &rows[index];
+                        let size = vec2(ui.available_width(), height);
+                        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                        let third = rect.width() / 3.0;
+                        let settled = |conflict: usize| {
+                            let choice = merging.choices.get(conflict);
+                            choice.copied().flatten().is_some()
+                        };
+                        let waiting = row.conflict.is_some_and(|conflict| !settled(conflict));
+                        let tints = match row.kind {
+                            Kind::Same => [None; 3],
+                            Kind::Ours => [Some(mine), Some(mine), None],
+                            Kind::Theirs => [None, Some(theirs), Some(theirs)],
+                            Kind::Conflict if waiting => [Some(unsettled); 3],
+                            Kind::Both | Kind::Conflict => [Some(mine), None, Some(theirs)],
+                        };
+                        let texts = [&row.ours, &row.result, &row.theirs];
+                        for (column, (text, tint)) in texts.into_iter().zip(tints).enumerate() {
+                            let cell = Rect::from_min_size(
+                                pos2(rect.min.x + third * column as f32, rect.min.y),
+                                vec2(third - 4.0, height),
+                            );
+                            let painter = ui.painter_at(cell);
+                            match (text, tint) {
+                                // A side that has no line here.
+                                (None, _) => {
+                                    painter.rect_filled(cell, 0.0, palette.surface);
+                                }
+                                (Some(_), Some(tint)) => {
+                                    painter.rect_filled(cell, 0.0, tint);
+                                }
+                                (Some(_), None) => {}
+                            }
+                            if let Some(text) = text {
+                                painter.text(
+                                    pos2(cell.min.x + 8.0, cell.center().y),
+                                    Align2::LEFT_CENTER,
+                                    text,
+                                    font.clone(),
+                                    palette.text,
+                                );
+                            }
+                        }
+                        // The first row of a conflict holds what settles it.
+                        let starts = |conflict: &usize| {
+                            index == 0 || rows[index - 1].conflict != Some(*conflict)
+                        };
+                        if let Some(conflict) = row.conflict.filter(starts) {
+                            let offered = [
+                                (1.0, "Mine", Choice::Ours),
+                                (2.0, "Both", Choice::OursThenTheirs),
+                                (3.0, "Theirs", Choice::Theirs),
+                            ];
+                            for (column, label, choice) in offered {
+                                let size = vec2(52.0, height - 2.0);
+                                let corner = pos2(
+                                    rect.min.x + third * column - size.x - 10.0,
+                                    rect.min.y + 1.0,
+                                );
+                                let button = Button::new(RichText::new(label).size(11.0));
+                                if ui.put(Rect::from_min_size(corner, size), button).clicked() {
+                                    chosen = Some((conflict, choice));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        if let Some((conflict, choice)) = chosen
+            && let Some(slot) = merging.choices.get_mut(conflict)
+        {
+            *slot = Some(choice);
+        }
+        if let Some(choice) = all {
+            merging.choices.fill(Some(choice));
+        }
+        if apply {
+            let text = merge::resolved(&merging.parts, &merging.choices);
+            match self.tabs.iter_mut().find(|tab| tab.id == merging.tab) {
+                Some(tab) => {
+                    tab.text = text;
+                    tab.touched();
+                }
+                None => self
+                    .toasts
+                    .error("The file was closed: nothing was written"),
+            }
+        } else if open {
+            self.merging = Some(merging);
+        }
+    }
+
     /// The environments to fill the requests with: pick one, or none.
     fn environments_dialog(&mut self, ctx: &Context) {
         let Some((rows, mut selected)) = self.environments.take() else {
@@ -5182,6 +5450,23 @@ impl GodApp {
             Cmd::TestsPanel => {
                 let shown = self.bottom == Some(Bottom::Tests);
                 self.bottom = (!shown).then_some(Bottom::Tests);
+            }
+            Cmd::MergeView => {
+                let found = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|tab| Some((tab.id, godcode_core::merge::from_markers(&tab.text)?)));
+                match found {
+                    Some((tab, parts)) => {
+                        let choices = vec![None; parts.len()];
+                        self.merging = Some(Merging {
+                            tab,
+                            parts,
+                            choices,
+                        });
+                    }
+                    None => self.toasts.error("This file has no conflict to settle"),
+                }
             }
             Cmd::AcceptOurs | Cmd::AcceptTheirs | Cmd::AcceptBoth => {
                 let keep = match cmd {
@@ -7882,6 +8167,8 @@ impl eframe::App for GodApp {
         self.themes_dialog(&ctx);
         self.tasks_dialog(&ctx);
         self.environments_dialog(&ctx);
+        self.merge_window(&ctx);
+        self.database_window(&ctx);
         self.log_dialog(&ctx);
         self.templates_dialog(&ctx);
         self.toasts.show(&ctx);
@@ -8004,6 +8291,51 @@ fn load_themes() -> Result<(), String> {
     let themes = written.map_or(Ok(Vec::new()), |text| theme::parse_user_themes(&text))?;
     theme::set_user_themes(themes);
     Ok(())
+}
+
+/// A file with conflicts laid out in three columns: mine, the result, theirs.
+struct Merging {
+    /// The tab the result goes to.
+    tab: u64,
+    parts: Vec<godcode_core::merge::Part>,
+    /// What was chosen for each conflict, in their order.
+    choices: Vec<Option<godcode_core::merge::Choice>>,
+}
+
+/// Rows of a table shown at a time.
+const DATABASE_PAGE: usize = 200;
+/// Chars of a value shown in the grid.
+const DATABASE_CELL: usize = 120;
+
+/// A SQLite file being looked into: one page of one of its tables.
+struct Browsing {
+    name: String,
+    database: godcode_core::sqlite::Database,
+    table: usize,
+    page: usize,
+    /// How many rows the table has, and those of the page.
+    count: usize,
+    rows: Vec<Vec<godcode_core::sqlite::Value>>,
+    /// Why the table could not be read.
+    error: Option<String>,
+    /// Its write-ahead log holds changes that are not read here.
+    behind: bool,
+}
+
+impl Browsing {
+    /// Read the page of the table on show.
+    fn read(&mut self) {
+        let (database, start) = (&self.database, self.page * DATABASE_PAGE);
+        let read = database.tables().get(self.table).map(|table| {
+            let rows = database.rows(table, start, DATABASE_PAGE)?;
+            Ok((database.count(table)?, rows))
+        });
+        (self.count, self.rows, self.error) = match read {
+            Some(Ok((count, rows))) => (count, rows, None),
+            Some(Err(err)) => (0, Vec::new(), Some(err)),
+            None => (0, Vec::new(), None),
+        };
+    }
 }
 
 fn settings_file(name: &str) -> Option<PathBuf> {

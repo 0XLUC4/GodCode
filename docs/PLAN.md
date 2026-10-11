@@ -161,8 +161,9 @@ reprise jusqu'à la fin.
 Fait : branches, blame, diff avec le dernier commit, journal des commits avec le diff de
 chacun, stash et stash pop. merge et rebase d'une branche, conflits réglés au
 curseur (garder le mien, le leur, les deux). `Git Graph…` dessine toutes les branches et leurs fusions, un clic montre
-le commit. Reste : vue de fusion
-à trois colonnes ; monorepos, variables d'environnement. Fait : `New Project…` crée un projet depuis un
+le commit. `Conflict: Open Merge View` montre les conflits du fichier
+sur trois colonnes (le mien, le résultat, le leur) : `Mine` / `Both` / `Theirs` par conflit, `All mine`,
+`All theirs`, `Apply` écrit le résultat. Reste : monorepos, variables d'environnement. Fait : `New Project…` crée un projet depuis un
 modèle (page web, Node/TypeScript, Python, Rust).
 
 ### Phase 6 — outils (⏳)
@@ -191,7 +192,10 @@ a besoin de la place.
 L'adresse suit les liens cliqués dans la page, et l'aperçu suit l'éditeur : une autre page
 HTML du dossier servi, mise en avant, prend la place de celle affichée.
 
-Reste : bases de données (SQLite et PostgreSQL d'abord), Docker.
+Bases de données : ouvrir un fichier SQLite montre ses tables et leurs lignes, page par page (lecture
+seule, lecteur maison sans dépendance ; pas de requêtes SQL, pas de tables `WITHOUT ROWID`, le journal
+`-wal` n'est pas lu et c'est dit).
+Reste : requêtes SQL, PostgreSQL, Docker.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 
