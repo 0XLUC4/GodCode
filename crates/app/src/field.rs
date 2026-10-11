@@ -28,7 +28,12 @@ pub struct Index {
     pub starts: Vec<usize>,
     /// The char each line starts at, then one past the end of the text.
     chars: Vec<usize>,
-    spans: Vec<Span>,
+    /// The colours of a text that has some, kept so that a change is coloured without
+    /// the whole text being read again; and the one span of a text that has none.
+    coloured: Option<syntax::Coloured>,
+    flat: Vec<Span>,
+    /// The language the colours are of.
+    language: &'static str,
     /// Chars of the longest line.
     widest: usize,
     /// Columns of white space leading each line; `None` for a blank line.
@@ -76,8 +81,18 @@ fn closers(text: &str, lines: usize, spans: &[Span], language: &Language) -> Vec
     closes
 }
 
+/// A change of a text: the bytes that were replaced, and the bytes they now are.
+type Change = (Range<usize>, Range<usize>);
+
 impl Index {
+    #[cfg(test)]
     fn new(key: u64, text: &str, language: &Language) -> Self {
+        Self::after(key, text, language, None)
+    }
+
+    /// What is known of `text`. `before`: what was known of it before one change, and
+    /// that change; its colours are then worked out from the lines changed alone.
+    fn after(key: u64, text: &str, language: &Language, before: Option<(&Index, Change)>) -> Self {
         let mut starts = vec![0];
         starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
         starts.push(text.len() + 1);
@@ -90,14 +105,34 @@ impl Index {
             count += length + 1;
         }
         chars.push(count);
-        let spans = syntax::highlight(text, language);
+        // The text the colours known are of is this one less the change, in this language.
+        let known = before.and_then(|(index, (old, new))| {
+            let was = index.starts.last()? - 1;
+            let fits = was + new.len() == text.len() + old.len() && index.language == language.name;
+            let mut coloured = index.coloured.clone().filter(|_| fits)?;
+            coloured.edit(text, language, old, new);
+            Some(coloured)
+        });
+        // A text without colours keeps no more than its one span.
+        let plain = std::ptr::eq(language, Language::plain());
+        let coloured = known.or_else(|| (!plain).then(|| syntax::Coloured::new(text, language)));
+        let coloured = coloured.filter(|coloured| coloured.spans().len() > 1);
+        let flat = match &coloured {
+            Some(_) => Vec::new(),
+            None => syntax::highlight(text, Language::plain()),
+        };
+        let spans = coloured
+            .as_ref()
+            .map_or(&flat[..], |coloured| coloured.spans());
         Self {
             key,
-            closes: closers(text, starts.len() - 1, &spans, language),
+            closes: closers(text, starts.len() - 1, spans, language),
             given: None,
             starts,
             chars,
-            spans,
+            coloured,
+            flat,
+            language: language.name,
             widest,
             indents: crate::editor::indents_of(text),
         }
@@ -111,7 +146,15 @@ impl Index {
     /// It is all one colour: only where its lines are is known of it, and that can follow
     /// an edit without the text being read through again.
     fn plain(&self) -> bool {
-        self.spans.len() <= 1
+        self.coloured.is_none()
+    }
+
+    /// How the text is coloured: each span up to its end.
+    fn spans(&self) -> &[Span] {
+        match &self.coloured {
+            Some(coloured) => coloured.spans(),
+            None => &self.flat,
+        }
     }
 
     /// The byte of the char `index`, found by reading its line alone.
@@ -164,7 +207,7 @@ impl Index {
         for start in &mut self.chars[first + added..] {
             *start = start.saturating_add_signed(moved);
         }
-        self.spans = vec![Span {
+        self.flat = vec![Span {
             end: text.len(),
             token: syntax::Token::Plain,
         }];
@@ -253,8 +296,9 @@ impl Index {
         };
         let mut sections = Vec::new();
         let mut at = from;
-        let first = self.spans.partition_point(|span| span.end <= from);
-        for span in &self.spans[first..] {
+        let spans = self.spans();
+        let first = spans.partition_point(|span| span.end <= from);
+        for span in &spans[first..] {
             if at >= to {
                 break;
             }
@@ -602,7 +646,8 @@ fn common_suffix(a: &[u8], b: &[u8]) -> usize {
 impl History {
     /// Take in the text as it is now, at `time`. `own`: what the keyboard wrote since the
     /// last time, when nothing else can have changed the text; with `elsewhere`, the text
-    /// may have been changed by anything, and is compared with what it was.
+    /// may have been changed by anything, and is compared with what it was. Returns the
+    /// stretch that changed since the last time, when one stretch did.
     pub fn see(
         &mut self,
         text: &str,
@@ -610,16 +655,22 @@ impl History {
         time: f64,
         own: Vec<Written>,
         elsewhere: bool,
-    ) {
+    ) -> Option<Change> {
         let caret = caret.or(self.caret);
         let Some(mut shadow) = self.shadow.take() else {
             self.shadow = Some(text.to_owned());
             self.caret = caret;
-            return;
+            return None;
         };
         let after = caret.unwrap_or_default();
+        // The one stretch that changed, when it is one.
+        let mut change = None;
         if !elsewhere {
+            let alone = own.len() == 1;
             for (at, removed, written) in own {
+                if alone {
+                    change = Some((at..at + removed.len(), at..at + written.len()));
+                }
                 shadow.replace_range(at..at + removed.len(), &written);
                 self.push(at, removed, written, after, time);
             }
@@ -636,11 +687,13 @@ impl History {
             }
             let removed = shadow[prefix..shadow.len() - suffix].to_owned();
             let written = text[prefix..text.len() - suffix].to_owned();
+            change = Some((prefix..shadow.len() - suffix, prefix..text.len() - suffix));
             shadow.replace_range(prefix..shadow.len() - suffix, &written);
             self.push(prefix, removed, written, after, time);
         }
         self.shadow = Some(shadow);
         self.caret = caret;
+        change
     }
 
     fn push(
@@ -1302,12 +1355,14 @@ pub fn show(
     // The history is told what changed, here or elsewhere; then it is asked to step.
     let time = ui.input(|input| input.time);
     let history = &mut cache.history;
-    history.see(text, caret.map(Caret::range), time, own, known.is_none());
+    let mut change = history.see(text, caret.map(Caret::range), time, own, known.is_none());
     let stepped = wanted.and_then(|back| match back {
         true => history.undo(text),
         false => history.redo(text),
     });
     if let Some(range) = stepped {
+        // The text went back or forth after it was seen: what changed is not known.
+        change = None;
         caret = Some(Caret::of(range, text.chars().count()));
         changed = true;
     }
@@ -1344,7 +1399,10 @@ pub fn show(
     let mut given = cache.index.as_ref().and_then(|index| index.given.clone());
     let mut index = match cache.index.as_ref().filter(|index| index.key == key) {
         Some(index) => Arc::clone(index),
-        None => Arc::new(Index::new(key, text, look.language)),
+        None => {
+            let before = cache.index.as_deref().zip(change);
+            Arc::new(Index::after(key, text, look.language, before))
+        }
     };
 
     // The folds follow the text: lines typed above them push them down; a text changed
@@ -1826,6 +1884,39 @@ mod tests {
         // Two lines removed above: it comes back up.
         follow(&mut hints, 0, (3, 3), 0, -2);
         assert_eq!(places(&hints), [(3, 3)]);
+    }
+
+    #[test]
+    fn colours_worked_out_from_a_change_are_those_of_the_whole_text() {
+        let language = Language::of(std::path::Path::new("a.rs"));
+        let mut text = "fn a() {\n    let s = \"one\";\n}\n// end\n".to_owned();
+        let mut index = Index::new(0, &text, language);
+        // Typed in a line, a comment opened over what follows, then all of it replaced.
+        let changes = [
+            (14..14, "t"),
+            (9..9, "/* "),
+            (0..text.len() + 4, "let x = 1; // one\n"),
+        ];
+        for (old, written) in changes {
+            text.replace_range(old.clone(), written);
+            let change = (old.clone(), old.start..old.start + written.len());
+            index = Index::after(1, &text, language, Some((&index, change)));
+            assert_eq!(
+                index.spans(),
+                Index::new(1, &text, language).spans(),
+                "{text:?}"
+            );
+        }
+        // A change that is not the one from the text known is not believed.
+        let other = Index::after(2, "fn b() {}\n", language, Some((&index, (0..1, 0..2))));
+        assert_eq!(
+            other.spans(),
+            Index::new(2, "fn b() {}\n", language).spans()
+        );
+        // Nor are the colours of another language.
+        let script = Language::of(std::path::Path::new("a.js"));
+        let same = Index::after(3, &text, script, Some((&index, (0..0, 0..0))));
+        assert_eq!(same.spans(), Index::new(3, &text, script).spans());
     }
 
     #[test]

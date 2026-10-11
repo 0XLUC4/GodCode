@@ -129,7 +129,8 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Vim : marques de fichier `A`–`Z`, drapeau `c` de `:s` | ⏳ |
 | Fichiers jusqu'à 64 Mo (2 Mo avant). Au-delà de 2 Mo : texte brut, sans couleurs, serveur de langage, plan, complétion par mots ni historique local. Au repos rien n'est relu ; pendant la frappe, seules les lignes touchées le sont. Mesuré à 50 Mo : une frappe en fin de fichier coûte 50 µs, 21 ms tout au début (le texte est une `String` : ce qui suit le curseur est déplacé) ; 82 ms avant (`cargo test --release -p godcode typing_in_a_big -- --ignored --nocapture`) | ✅ |
 | Historique d'annulation par différences : seul ce qui change est gardé (64 Mo au plus), donc autant de niveaux dans un gros fichier que dans un petit ; une frappe groupée par pauses d'une seconde ; un changement fait ailleurs (commande, Vim, serveur de langage) est trouvé par comparaison | ✅ |
-| Gros fichiers : frappe en temps constant partout (corde ou tampon à trou au lieu d'une `String`) ; Entrée, Tab et les touches Vim relisent encore tout le texte ; couleurs refaites pour les seules lignes changées | ⏳ |
+| Couleurs refaites pour les seules lignes qu'un changement peut toucher : sur 200 000 lignes, une frappe relit sa ligne (≈1 ms) au lieu de tout le texte (≈60 ms) ; ouvrir ou fermer un commentaire relit ce qui suit | ✅ |
+| Gros fichiers : frappe en temps constant partout (corde ou tampon à trou au lieu d'une `String`) ; le reste de ce qui est su du texte (débuts de lignes, retraits, crochets) est encore refait en entier pour un texte coloré ; Entrée, Tab et les touches Vim relisent encore tout le texte | ⏳ |
 
 ### Phase 4 — exécution, tests, débogage (🔨)
 
