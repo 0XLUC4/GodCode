@@ -244,7 +244,11 @@ grisé (première ligne et nombre de lignes de plus), `Tab` la prend, `Échap` o
 À la demande seulement : rien ne part pendant qu'on tape.
 Modification avec validation : `Edit file` demande un changement du fichier en avant (10 000 caractères
 au plus) ; rien n'est écrit avant `Apply`, `Review` montre l'avant et l'après côte à côte, `Discard` laisse.
-Reste : outils MCP dans la conversation, agents qui enchaînent plusieurs étapes.
+Outils MCP : `Assistant: Edit MCP Servers` ouvre `mcp.json` (même forme que Claude Desktop, serveurs lancés
+par une commande) ; leurs outils sont proposés au modèle. Quand il en demande, l'outil et ses arguments
+s'affichent et rien ne tourne avant `Allow` ; `Refuse` le lui dit. Il peut enchaîner jusqu'à 8 tours
+d'outils par question. Les serveurs démarrent à la première ouverture du panneau.
+Reste : complétion automatique pendant la frappe, serveurs MCP par HTTP.
 
 ### Hors périmètre tant que le reste n'est pas solide (❌)
 

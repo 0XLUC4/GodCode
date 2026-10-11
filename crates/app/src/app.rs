@@ -182,6 +182,7 @@ enum Cmd {
     StashPop,
     Snippets,
     EditThemes,
+    EditMcp,
     Response,
     Assistant,
     Suggest,
@@ -594,6 +595,7 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::StashPop, icon::PACKAGE, "Git Stash Pop", ""),
     spec(Cmd::Snippets, icon::CODE_BLOCK, "Edit Snippets", ""),
     spec(Cmd::EditThemes, icon::PALETTE, "Edit My Themes", ""),
+    spec(Cmd::EditMcp, icon::ROWS, "Assistant: Edit MCP Servers", ""),
     spec(Cmd::Response, icon::GLOBE, "Toggle HTTP Response", ""),
     spec(
         Cmd::Suggest,
@@ -852,6 +854,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Response),
             Some(Cmd::Assistant),
             Some(Cmd::Suggest),
+            Some(Cmd::EditMcp),
             Some(Cmd::Check),
             None,
             Some(Cmd::ToggleTerminal),
@@ -1561,6 +1564,11 @@ pub struct GodApp {
     docker: Option<Docker>,
     /// The PostgreSQL server being asked questions.
     postgres: Option<Postgres>,
+    /// The servers that lend tools to the assistant, once started; and their tools,
+    /// each with the name the model knows it by and the place of its server here.
+    mcp: Vec<crate::mcp::Server>,
+    mcp_tools: Vec<(String, usize, crate::mcp::Tool)>,
+    mcp_started: bool,
     /// What was said with the assistant, and to which model.
     chat: Chat,
     /// What the model would write at the caret, shown until it is taken or left; and
@@ -1798,6 +1806,9 @@ impl GodApp {
             env_pick: None,
             docker: None,
             postgres: None,
+            mcp: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_started: false,
             ghost: None,
             suggesting: None,
             chat: Chat::new(
@@ -2089,6 +2100,12 @@ impl GodApp {
         }
         if snippets_file().as_deref() == Some(path.as_path()) {
             self.snippets = load_snippets();
+        }
+        if settings_file("mcp.json").as_deref() == Some(path.as_path()) {
+            // Those running are ended; the ones now written start with the assistant.
+            self.mcp.clear();
+            self.mcp_tools.clear();
+            self.mcp_started = false;
         }
         if settings_file("themes.json").as_deref() == Some(path.as_path()) {
             // The one in use is found again by its name, and shows as it is now written.
@@ -4585,7 +4602,7 @@ impl GodApp {
 
     /// Send what was written to the model, with the talk so far and the file in front.
     fn ask_assistant(&mut self, ctx: &Context, edit: bool) {
-        use crate::assistant::{self, Message, Settings};
+        use crate::assistant::{self, Message, Settings, Turn};
         let front = self.tabs.get(self.active);
         let long = |tab: &Tab| tab.text.chars().count() > EDIT_CHARS;
         let refused = match (edit, front) {
@@ -4609,26 +4626,20 @@ impl GodApp {
             self.chat.typed = question;
             return;
         }
-        let system = match self.tabs.get(self.active) {
-            Some(tab) => {
-                let (start, end) = (tab.selection.start, tab.selection.end);
-                let chars = tab.text.chars().skip(start.min(end));
-                let chosen: String = chars.take(start.abs_diff(end)).collect();
-                let chosen = Some(chosen.as_str()).filter(|chosen| !chosen.is_empty());
-                let written = match edit {
-                    true => assistant::edit_system,
-                    false => assistant::system,
-                };
-                written(Some(&tab.name), tab.language.name, &tab.text, chosen)
-            }
-            None => assistant::system(None, "", "", None),
-        };
         self.chat.laid.push(Vec::new());
+        self.chat.turns.push(Turn::User(question.clone()));
         self.chat.messages.push(Message {
             from_user: true,
             text: question,
         });
         self.chat.error = None;
+        self.chat.rounds = 0;
+        if !edit {
+            self.converse(ctx);
+            return;
+        }
+        // A change is asked for without tools: the answer is the file, nothing else.
+        let system = self.chat_system(true);
         let settings = Settings {
             provider: self.chat.provider,
             model: self.chat.model.clone(),
@@ -4637,20 +4648,168 @@ impl GodApp {
         let (sender, receiver) = channel();
         let waking = ctx.clone();
         std::thread::spawn(move || {
+            let said = assistant::ask(&settings, &system, &messages).map(Turn::Said);
             // The window may be gone: nobody listens then.
-            let _ = sender.send(assistant::ask(&settings, &system, &messages));
+            let _ = sender.send(said);
             waking.request_repaint();
         });
         self.chat.asking = Some(receiver);
     }
 
+    /// What the model is told before the talk: the file in front and what is selected
+    /// in it, and for an `edit` that it is to answer with the whole file.
+    fn chat_system(&self, edit: bool) -> String {
+        use crate::assistant;
+        let Some(tab) = self.tabs.get(self.active) else {
+            return assistant::system(None, "", "", None);
+        };
+        let (start, end) = (tab.selection.start, tab.selection.end);
+        let chars = tab.text.chars().skip(start.min(end));
+        let chosen: String = chars.take(start.abs_diff(end)).collect();
+        let chosen = Some(chosen.as_str()).filter(|chosen| !chosen.is_empty());
+        let written = match edit {
+            true => assistant::edit_system,
+            false => assistant::system,
+        };
+        written(Some(&tab.name), tab.language.name, &tab.text, chosen)
+    }
+
+    /// Send the talk as it stands to the model, with the tools there are on offer.
+    fn converse(&mut self, ctx: &Context) {
+        use crate::assistant::{self, Settings, ToolSpec};
+        let system = self.chat_system(false);
+        let settings = Settings {
+            provider: self.chat.provider,
+            model: self.chat.model.clone(),
+        };
+        let offered = self.mcp_tools.iter().map(|(name, _, tool)| ToolSpec {
+            name: name.clone(),
+            description: tool.description.clone(),
+            schema: tool.schema.clone(),
+        });
+        let (tools, turns): (Vec<ToolSpec>, _) = (offered.collect(), self.chat.turns.clone());
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            let said = assistant::ask_with_tools(&settings, &system, &turns, &tools);
+            // The window may be gone: nobody listens then.
+            let _ = sender.send(said);
+            waking.request_repaint();
+        });
+        self.chat.asking = Some(receiver);
+    }
+
+    /// Start the servers written in `mcp.json`: their tools are offered to the model.
+    fn start_mcp(&mut self, ctx: &Context) {
+        self.mcp_started = true;
+        let written = settings_file("mcp.json").and_then(|file| std::fs::read_to_string(file).ok());
+        let Some(written) = written else {
+            return;
+        };
+        let configs = match crate::mcp::configs(&written) {
+            Ok(configs) => configs,
+            Err(err) => {
+                self.chat.error = Some(format!("mcp.json: {err}"));
+                return;
+            }
+        };
+        let folder = self.run_root().or_else(|| std::env::current_dir().ok());
+        let folder = folder.unwrap_or_default();
+        for config in configs {
+            let waking = ctx.clone();
+            match crate::mcp::Server::start(&config, &folder, move || waking.request_repaint()) {
+                Ok(server) => self.mcp.push(server),
+                Err(err) => self.chat.error = Some(err),
+            }
+        }
+    }
+
+    /// Take in what the servers of tools said: the tools they have, what the ones run
+    /// answered. Once all those asked for have answered, the model is told and goes on.
+    fn poll_mcp(&mut self, ctx: &Context) {
+        use crate::assistant::{self, ToolResult, Turn};
+        use crate::mcp::Event;
+        let mut said = Vec::new();
+        for (index, server) in self.mcp.iter_mut().enumerate() {
+            said.extend(server.poll().into_iter().map(|event| (index, event)));
+        }
+        for (index, event) in said {
+            match event {
+                Event::Ready { tools, .. } | Event::ToolsChanged { tools, .. } => {
+                    self.mcp_tools.retain(|(_, of, _)| *of != index);
+                    let named = tools
+                        .into_iter()
+                        .map(|tool| (assistant::tool_name(&tool.server, &tool.name), index, tool));
+                    self.mcp_tools.extend(named);
+                }
+                Event::Called { id, result } => {
+                    let running = &mut self.chat.running;
+                    let asked = |(of, call, _): &(usize, u64, _)| (*of, *call) == (index, id);
+                    let Some(place) = running.iter().position(asked) else {
+                        continue;
+                    };
+                    let (_, _, call) = running.remove(place);
+                    let (text, failed) = match result {
+                        Ok(text) => (text, false),
+                        Err(why) => (why, true),
+                    };
+                    self.chat.results.push(ToolResult {
+                        id: call.id,
+                        tool: call.tool,
+                        text,
+                        failed,
+                    });
+                }
+                Event::Failed { server, why } => {
+                    self.chat.error = Some(format!("{server}: {why}"));
+                }
+                Event::Exited { .. } => self.mcp_tools.retain(|(_, of, _)| *of != index),
+            }
+        }
+        let chat = &mut self.chat;
+        let answered = chat.running.is_empty() && !chat.results.is_empty();
+        if !answered || chat.asking.is_some() {
+            return;
+        }
+        // In the order they were asked for, whichever answered first.
+        let order = std::mem::take(&mut chat.order);
+        let place = |result: &ToolResult| order.iter().position(|id| *id == result.id);
+        chat.results.sort_by_key(place);
+        let results = std::mem::take(&mut chat.results);
+        chat.turns.push(Turn::Results(results));
+        chat.rounds += 1;
+        if chat.rounds > TOOL_ROUNDS {
+            chat.error = Some(format!(
+                "Stopped: the model asked for tools {TOOL_ROUNDS} times in a row"
+            ));
+            return;
+        }
+        self.converse(ctx);
+    }
+
     /// The talk with the assistant: who answers, what was said, the question to write.
     fn assistant_panel(&mut self, ui: &mut Ui) {
-        use crate::assistant::{Message, Provider};
+        use crate::assistant::{Message, Provider, ToolResult, Turn};
         let palette = Palette::of(ui);
         let ctx = ui.ctx().clone();
+        if !self.mcp_started {
+            self.start_mcp(&ctx);
+        }
+        self.poll_mcp(&ctx);
         match self.chat.asking.as_ref().map(Receiver::try_recv) {
-            Some(Ok(Ok(text))) => {
+            // Tools are asked for: nothing runs before the user says so.
+            Some(Ok(Ok(Turn::Asked { said, calls }))) => {
+                self.chat.asking = None;
+                if !said.trim().is_empty() {
+                    self.chat.laid.push(markdown::blocks(&said));
+                    let (from_user, text) = (false, said.clone());
+                    self.chat.messages.push(Message { from_user, text });
+                }
+                self.chat.wanted.clone_from(&calls);
+                self.chat.turns.push(Turn::Asked { said, calls });
+            }
+            Some(Ok(Ok(Turn::User(_) | Turn::Results(_)))) => self.chat.asking = None,
+            Some(Ok(Ok(Turn::Said(text)))) => {
                 self.chat.asking = None;
                 let from_user = false;
                 // A change that was asked for is kept apart, to be looked at first: what
@@ -4669,6 +4828,7 @@ impl GodApp {
                     None => text,
                 };
                 self.chat.laid.push(markdown::blocks(&text));
+                self.chat.turns.push(Turn::Said(text.clone()));
                 self.chat.messages.push(Message { from_user, text });
             }
             Some(Ok(Err(err))) => (self.chat.asking, self.chat.error) = (None, Some(err)),
@@ -4691,9 +4851,13 @@ impl GodApp {
         if !self.chat.listed {
             self.list_models(&ctx);
         }
-        let asking = self.chat.asking.is_some();
+        // Nothing more is asked while an answer, a say of the user or a tool is awaited.
+        let busy = !self.chat.wanted.is_empty() || !self.chat.running.is_empty();
+        let asking = self.chat.asking.is_some() || busy;
         // What is done with the change proposed: looked at, made, or left.
         let mut verdict = None;
+        // Whether the tools the model asks for may run.
+        let mut allowed = None;
         let zoom = self.zoom;
         let mut provider = self.chat.provider;
         ui.horizontal(|ui| {
@@ -4718,8 +4882,18 @@ impl GodApp {
                     ui.selectable_value(&mut self.chat.model, model.clone(), model);
                 }
             });
+            if !self.mcp_tools.is_empty() {
+                let names: Vec<&str> = self.mcp_tools.iter().map(|tool| &*tool.0).collect();
+                let count = format!("{} tools", names.len());
+                ui.label(RichText::new(count).color(palette.text_dim))
+                    .on_hover_text(names.join("\n"));
+            }
             if ui.button("New chat").clicked() {
                 self.chat.messages.clear();
+                self.chat.turns.clear();
+                self.chat.wanted.clear();
+                self.chat.running.clear();
+                self.chat.results.clear();
                 self.chat.laid.clear();
                 self.chat.error = None;
             }
@@ -4772,6 +4946,35 @@ impl GodApp {
                     if let Some(error) = &self.chat.error {
                         ui.colored_label(palette.error, error);
                     }
+                    if !self.chat.wanted.is_empty() {
+                        ui.strong("The model asks to run:");
+                        for call in &self.chat.wanted {
+                            let asked = format!("{}  {}", call.tool, call.arguments);
+                            ui.label(RichText::new(asked).monospace().size(12.0));
+                        }
+                        ui.horizontal(|ui| {
+                            for (label, say) in [("Allow", true), ("Refuse", false)] {
+                                if ui.button(label).clicked() {
+                                    allowed = Some(say);
+                                }
+                            }
+                        });
+                    }
+                    if !self.chat.running.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            // Each with the server that runs it.
+                            let named =
+                                |(index, _, call): &(usize, u64, crate::assistant::Call)| {
+                                    let server =
+                                        self.mcp.get(*index).map_or("", |server| server.name());
+                                    format!("{} ({server})", call.tool)
+                                };
+                            let running: Vec<String> =
+                                self.chat.running.iter().map(named).collect();
+                            ui.label(format!("Running {}", running.join(", ")));
+                        });
+                    }
                     // Nothing of a change proposed is in the file until it is applied.
                     if let Some((_, name, _)) = &self.chat.proposal {
                         ui.horizontal(|ui| {
@@ -4785,6 +4988,30 @@ impl GodApp {
                     }
                 });
         });
+        if let Some(allowed) = allowed {
+            let calls = std::mem::take(&mut self.chat.wanted);
+            self.chat.order = calls.iter().map(|call| call.id.clone()).collect();
+            for call in calls {
+                let known = self.mcp_tools.iter().find(|(name, ..)| *name == call.tool);
+                let known = known.map(|(_, index, tool)| (*index, tool.name.clone()));
+                let refused = match (allowed, known) {
+                    (true, Some((index, tool))) => {
+                        let id = self.mcp[index].call(&tool, call.arguments.clone());
+                        self.chat.running.push((index, id, call));
+                        continue;
+                    }
+                    (true, None) => "There is no such tool",
+                    (false, _) => "The user refused to have this tool run",
+                };
+                self.chat.results.push(ToolResult {
+                    id: call.id,
+                    tool: call.tool,
+                    text: refused.to_owned(),
+                    failed: true,
+                });
+            }
+            ctx.request_repaint();
+        }
         let proposal = verdict.and_then(|what| Some((what, self.chat.proposal.clone()?)));
         if let Some((what, (id, name, new))) = proposal {
             let tab = self.tabs.iter_mut().find(|tab| tab.id == id);
@@ -6747,6 +6974,22 @@ impl GodApp {
                     None => self.toasts.error("Open a folder first"),
                 }
             }
+            Cmd::EditMcp => match settings_file("mcp.json") {
+                Some(file) => {
+                    if !file.exists() {
+                        let folder = file.parent().unwrap_or(&file);
+                        let _ = std::fs::create_dir_all(folder);
+                        let _ = std::fs::write(&file, "{\n  \"mcpServers\": {}\n}\n");
+                    }
+                    self.open_file(ctx, &file);
+                    self.toasts.success(
+                        "Written as for Claude Desktop: \"name\": {\"command\": \"npx\", \"args\": […]}",
+                    );
+                }
+                None => self
+                    .toasts
+                    .error("No place to keep the servers on this system"),
+            },
             Cmd::EditThemes => match settings_file("themes.json") {
                 Some(file) => {
                     if !file.exists() {
@@ -9353,6 +9596,9 @@ struct Ghost {
     text: String,
 }
 
+/// How many times in a row a model may ask for tools before it is stopped.
+const TOOL_ROUNDS: usize = 8;
+
 /// Chars of the longest file a model is asked to write again whole: its answers are cut
 /// well before the files it can read.
 const EDIT_CHARS: usize = 10_000;
@@ -9399,8 +9645,18 @@ struct Chat {
     laid: Vec<Vec<markdown::Placed>>,
     /// The question being written, the answer awaited, why the last one did not come.
     typed: String,
-    asking: Option<Receiver<Result<String, String>>>,
+    asking: Option<Receiver<Result<crate::assistant::Turn, String>>>,
     error: Option<String>,
+    /// The talk as the model is told it, with the tools it asked for and their answers.
+    turns: Vec<crate::assistant::Turn>,
+    /// The tools the model asks to have run, until the user says yes or no; those
+    /// running (the place of their server, the number of the call); what the others
+    /// answered already; the order they were asked in; how many times in a row.
+    wanted: Vec<crate::assistant::Call>,
+    running: Vec<(usize, u64, crate::assistant::Call)>,
+    results: Vec<crate::assistant::ToolResult>,
+    order: Vec<String>,
+    rounds: usize,
     /// The tab the answer awaited is to change, when a change was asked for.
     editing: Option<u64>,
     /// A change the model proposes, not made yet: the tab, its name, its new text.
@@ -9428,6 +9684,12 @@ impl Chat {
             typed: String::new(),
             asking: None,
             error: None,
+            turns: Vec::new(),
+            wanted: Vec::new(),
+            running: Vec::new(),
+            results: Vec::new(),
+            order: Vec::new(),
+            rounds: 0,
             editing: None,
             proposal: None,
         }

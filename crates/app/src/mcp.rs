@@ -28,7 +28,6 @@ const GRACE: Duration = Duration::from_millis(250);
 const SECRET_LENGTH: usize = 8;
 
 /// A server to start, as the user wrote it down.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq)]
 pub struct Config {
     pub name: String,
@@ -63,7 +62,6 @@ fn plain(value: &Value) -> String {
 /// Read the servers of a file written like Claude Desktop's:
 /// `{"mcpServers": {"name": {"command": "...", "args": [...], "env": {...}}}}`, sorted by
 /// name. Entries that are not that, such as the ones reached at a `url`, are left out.
-#[allow(dead_code)]
 pub fn configs(json: &str) -> Result<Vec<Config>, String> {
     let file: Value = serde_json::from_str(json).map_err(|err| format!("Not JSON: {err}"))?;
     let entries = file["mcpServers"].as_object().into_iter().flatten();
@@ -87,7 +85,6 @@ pub fn configs(json: &str) -> Result<Vec<Config>, String> {
 }
 
 /// Something a server can do when asked.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tool {
     /// The name of the server that lends it.
@@ -99,7 +96,6 @@ pub struct Tool {
 }
 
 /// What a server said.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// The server listens, and lends these tools.
@@ -284,7 +280,6 @@ fn end(child: &mut Child) {
 }
 
 /// A running Model Context Protocol server.
-#[allow(dead_code)]
 pub struct Server {
     name: String,
     child: Child,
@@ -307,7 +302,6 @@ pub struct Server {
     exited: bool,
 }
 
-#[allow(dead_code)]
 impl Server {
     /// Start the program and shake hands; [`Event::Ready`] or [`Event::Failed`] follows.
     /// `wake` is called, from another thread, whenever there is something to

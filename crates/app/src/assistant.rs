@@ -643,7 +643,6 @@ pub fn proposed(answer: &str) -> Option<(String, String)> {
 
 /// A tool the model may ask for: its name, what it does, and the JSON schema of what it
 /// takes.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
@@ -652,7 +651,6 @@ pub struct ToolSpec {
 }
 
 /// One step of a talk in which the model may use tools.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Turn {
     User(String),
@@ -668,7 +666,6 @@ pub enum Turn {
 }
 
 /// One tool the model asked to be run, and what to give it.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Call {
     pub id: String,
@@ -677,7 +674,6 @@ pub struct Call {
 }
 
 /// What a tool answered to the call `id`, or why it failed.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolResult {
     pub id: String,
@@ -691,7 +687,6 @@ pub struct ToolResult {
 ///
 /// A name cannot be turned back into its server and tool: whoever offers the tools keeps
 /// each name with the server and the tool it stands for, and looks it up there.
-#[allow(dead_code)]
 pub fn tool_name(server: &str, tool: &str) -> String {
     let allowed = |it: char| it.is_ascii_alphanumeric() || it == '_' || it == '-';
     format!("{server}__{tool}")
@@ -915,7 +910,6 @@ fn tool_failure(error: String) -> String {
 
 /// Ask with tools on offer: the answer is either words (`Turn::Said`) or a request to
 /// run tools (`Turn::Asked`).
-#[allow(dead_code)]
 pub fn ask_with_tools(
     settings: &Settings,
     system: &str,
