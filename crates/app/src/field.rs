@@ -286,6 +286,31 @@ pub struct Hint {
     pub label: String,
 }
 
+/// Move `hints` along with a change made on the line `edited`, which had `width` chars and
+/// now has `now`, the caret ending at its char `caret`; the text has `grown` lines more.
+/// What cannot be followed is left out: the server says it again.
+fn follow(
+    hints: &mut Vec<Hint>,
+    edited: usize,
+    (width, now): (usize, usize),
+    caret: usize,
+    grown: isize,
+) {
+    if grown != 0 {
+        // The line was cut or joined: where its hints went is not known.
+        hints.retain(|hint| hint.line != edited);
+        let below = hints.iter_mut().filter(|hint| hint.line > edited);
+        below.for_each(|hint| hint.line = hint.line.saturating_add_signed(grown));
+        return;
+    }
+    // Chars came or went before the caret: what stood after them moves as much.
+    let moved = now as isize - width as isize;
+    let from = caret.saturating_add_signed(-moved);
+    let after = |hint: &&mut Hint| hint.line == edited && hint.column >= from;
+    let pushed = hints.iter_mut().filter(after);
+    pushed.for_each(|hint| hint.column = hint.column.saturating_add_signed(moved));
+}
+
 /// The hints of `line`, in a list sorted by line.
 fn hints_of(hints: &[Hint], line: usize) -> &[Hint] {
     let from = hints.partition_point(|hint| hint.line < line);
@@ -455,6 +480,8 @@ pub struct Cache {
     seen: Option<Seen>,
     /// The changes made to the text, to take back.
     history: History,
+    /// The hints as they were last given, and where the typing since has pushed them.
+    hints: (Vec<Hint>, Arc<Vec<Hint>>),
 }
 
 /// The text as it last showed: the revision it is expected to come back with, its size,
@@ -1234,7 +1261,8 @@ pub fn show(
     // caret.
     let old = known.zip(cache.index.as_ref()).map(|(_, index)| {
         let line = caret.map(|caret| index.line_of(caret.head));
-        (index.key, index.lines(), line)
+        let width = line.map_or(0, |line| index.length(line));
+        (index.key, index.lines(), line, width)
     });
     let mut changed = false;
     // What is known of the text was kept in step with what was typed.
@@ -1321,10 +1349,27 @@ pub fn show(
 
     // The folds follow the text: lines typed above them push them down; a text changed
     // from elsewhere gives no way to tell where they went.
-    if let Some((_, lines, line)) = old.filter(|(key, ..)| *key != index.key) {
+    // The hints given anew are the ones; the others follow the typing like the folds.
+    if cache.hints.0 != look.hints {
+        cache.hints = (look.hints.to_vec(), Arc::new(look.hints.to_vec()));
+    }
+    if let Some((_, lines, line, width)) = old.filter(|(key, ..)| *key != index.key) {
         let grown = index.lines() as isize - lines as isize;
         match line {
             Some(edited) if changed => {
+                if !cache.hints.1.is_empty() {
+                    let line = edited.min(index.lines() - 1);
+                    let head = caret.map_or(0, |caret| caret.head);
+                    let column = head.saturating_sub(index.start_of(line));
+                    let widths = (width, index.length(line));
+                    follow(
+                        Arc::make_mut(&mut cache.hints.1),
+                        edited,
+                        widths,
+                        column,
+                        grown,
+                    );
+                }
                 let below = folded.iter_mut().filter(|header| **header > edited);
                 below.for_each(|header| *header = header.saturating_add_signed(grown));
                 // What the server said follows too, until it says again.
@@ -1340,6 +1385,7 @@ pub fn show(
             _ if grown != 0 => {
                 folded.clear();
                 given = None;
+                cache.hints.1 = Arc::default();
             }
             _ => {}
         }
@@ -1385,7 +1431,8 @@ pub fn show(
     };
 
     // The hints make their lines longer: by no more than the longest of them all.
-    let by_line = look.hints.chunk_by(|a, b| a.line == b.line);
+    let placed = Arc::clone(&cache.hints.1);
+    let by_line = placed.chunk_by(|a, b| a.line == b.line);
     let chars = |line: &[Hint]| line.iter().map(|hint| hint.label.chars().count()).sum();
     let hinted: usize = by_line.map(chars).max().unwrap_or(0);
     let mut lines = Lines {
@@ -1441,7 +1488,7 @@ pub fn show(
         };
         let mut job = lines.index.job_of(text, shown, look.font, look.dark, plain);
         // The hints of the row, placed from its first char.
-        let hints = hints_of(look.hints, line).iter().filter_map(|hint| {
+        let hints = hints_of(&placed, line).iter().filter_map(|hint| {
             let column = hint.column.min(length);
             let here = column >= from && (column < to || last_part);
             here.then(|| Hint {
@@ -1753,6 +1800,32 @@ mod tests {
         // Prose is folded by its indentation alone.
         let prose = Index::new(0, "a (\n  b\nc)\n", Language::plain());
         assert_eq!(prose.block(0), Some(1..2));
+    }
+
+    #[test]
+    fn hints_follow_what_is_typed_before_and_above_them() {
+        let hint = |line, column| Hint {
+            line,
+            column,
+            label: ": u8".to_owned(),
+        };
+        let places = |hints: &[Hint]| -> Vec<(usize, usize)> {
+            hints.iter().map(|hint| (hint.line, hint.column)).collect()
+        };
+        let given = vec![hint(1, 2), hint(1, 9), hint(4, 3)];
+        // A char typed at column 5 of line 1: the hint after it moves, not the one before.
+        let mut hints = given.clone();
+        follow(&mut hints, 1, (12, 13), 6, 0);
+        assert_eq!(places(&hints), [(1, 2), (1, 10), (4, 3)]);
+        // Taken back: they are where they were.
+        follow(&mut hints, 1, (13, 12), 5, 0);
+        assert_eq!(hints, given);
+        // A line added on line 1: its hints are left out, those below go down.
+        follow(&mut hints, 1, (12, 5), 0, 1);
+        assert_eq!(places(&hints), [(5, 3)]);
+        // Two lines removed above: it comes back up.
+        follow(&mut hints, 0, (3, 3), 0, -2);
+        assert_eq!(places(&hints), [(3, 3)]);
     }
 
     #[test]
