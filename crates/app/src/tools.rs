@@ -482,6 +482,26 @@ pub fn run_captured(folder: &Path, command: &str, values: &[(String, String)]) -
     }
 }
 
+/// Run `git` in `folder` for something that talks to another computer (pull, push,
+/// fetch), and return all it said. It never waits for a password typed in a terminal:
+/// there is none here, and it would wait for ever.
+pub fn git_remote(folder: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(folder);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    hidden(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("Cannot run git: {err}"))?;
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let complained = String::from_utf8_lossy(&output.stderr);
+    let said = format!("{printed}{complained}").trim().to_owned();
+    match output.status.success() {
+        true => Ok(said),
+        false => Err(said),
+    }
+}
+
 /// Run `git` in `folder` and return what it printed; what it complained about when it fails.
 pub fn git(folder: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");

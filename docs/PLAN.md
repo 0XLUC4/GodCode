@@ -173,6 +173,14 @@ sur trois colonnes (le mien, le résultat, le leur) : `Mine` / `Both` / `Theirs`
 lancés ici, au débogueur Python et au prochain terminal. Fait : `New Project…` crée un projet depuis un
 modèle (page web, Node/TypeScript, Python, Rust).
 
+Sous la main, comme dans IntelliJ : à droite des menus, la branche (un clic : branches), `Update` (pull,
+`Ctrl+T`), `Commit` (`Ctrl+K`), `Push`, puis lancer, déboguer, arrêter, chercher partout,
+l'assistant. Pull, push et fetch tournent hors de la fenêtre et disent comment ça s'est passé. Le panneau
+Commit coche les fichiers qui partent dans le commit (tous par défaut), avec `Commit` et `Commit and Push`,
+et ses boutons : fetch, stash, journal, graphe. Au pied de la barre de gauche : terminal, problèmes,
+tests, débogueur, réponse HTTP, assistant, Docker, PostgreSQL, journal Git. Les menus rangent le reste
+en sous-menus, avec un menu `Tools`.
+
 ### Phase 6 — outils (⏳)
 
 Fait : client HTTP — fichiers `.http`, `F5` envoie la requête sous le curseur, réponse

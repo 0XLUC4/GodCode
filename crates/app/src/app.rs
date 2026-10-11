@@ -171,6 +171,10 @@ enum Cmd {
     EnvFile,
     Docker,
     Postgres,
+    GitPull,
+    GitPush,
+    GitFetch,
+    GitCommit,
     Plugins,
     PluginsFolder,
     PluginsReload,
@@ -578,6 +582,15 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::EnvFile, icon::ROWS, "Choose .env File…", ""),
     spec(Cmd::Docker, icon::ROWS, "Docker…", ""),
     spec(Cmd::Postgres, icon::ROWS, "Connect to PostgreSQL…", ""),
+    spec(
+        Cmd::GitPull,
+        icon::ARROW_LINE_DOWN,
+        "Git Update Project (Pull)",
+        "Ctrl+T",
+    ),
+    spec(Cmd::GitPush, icon::ARROW_LINE_UP, "Git Push", ""),
+    spec(Cmd::GitFetch, icon::CLOUD_ARROW_DOWN, "Git Fetch", ""),
+    spec(Cmd::GitCommit, icon::GIT_COMMIT, "Git Commit…", "Ctrl+K"),
     spec(Cmd::Plugins, icon::ROWS, "Plugins: Run Command…", ""),
     spec(Cmd::PluginsFolder, icon::ROWS, "Plugins: Open Folder", ""),
     spec(Cmd::PluginsReload, icon::ROWS, "Plugins: Reload", ""),
@@ -898,6 +911,11 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
         &[
             Some(Cmd::SourceControl),
             Some(Cmd::Branches),
+            None,
+            Some(Cmd::GitCommit),
+            Some(Cmd::GitPull),
+            Some(Cmd::GitPush),
+            Some(Cmd::GitFetch),
             None,
             Some(Cmd::Diff),
             Some(Cmd::Blame),
@@ -1716,6 +1734,10 @@ pub struct GodApp {
     docker: Option<Docker>,
     /// The PostgreSQL server being asked questions.
     postgres: Option<Postgres>,
+    /// What Git is doing with another computer (a pull, a push, a fetch), and its name.
+    git_job: Option<(Answered, &'static str)>,
+    /// The changed files left out of the next commit: the ones not ticked.
+    left_out: std::collections::HashSet<String>,
     /// The plugins of the user; and what is typed to narrow their commands, with the
     /// one chosen, while they are picked from.
     plugins: Vec<crate::plugins::Plugin>,
@@ -1972,6 +1994,8 @@ impl GodApp {
             env_pick: None,
             docker: None,
             postgres: None,
+            git_job: None,
+            left_out: Default::default(),
             // One that cannot be read is told when they are next reloaded.
             plugins: load_plugins().0,
             plugin_pick: None,
@@ -2880,7 +2904,57 @@ impl GodApp {
     }
 
     /// Commit every change of the folder with the message typed in the panel.
-    fn commit(&mut self, ctx: &Context) {
+    /// Have Git talk to another computer (`args`: a pull, a push, a fetch), out of the
+    /// way: `what` it is called is told with how it went.
+    fn git_remote(&mut self, ctx: &Context, what: &'static str, args: &'static [&'static str]) {
+        let Some(root) = self.folder().filter(|_| self.repo.is_some()) else {
+            self.toasts.error("This folder is not a Git repository");
+            return;
+        };
+        if let Some((_, running)) = &self.git_job {
+            self.toasts.error(format!("{running} is still running"));
+            return;
+        }
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            // The window may be gone: nobody listens then.
+            let _ = sender.send(tools::git_remote(&root, args));
+            waking.request_repaint();
+        });
+        self.git_job = Some((receiver, what));
+    }
+
+    /// Take in how what Git was doing with another computer went.
+    fn poll_git(&mut self, ctx: &Context) {
+        let Some((receiver, what)) = &self.git_job else {
+            return;
+        };
+        let (went, what) = match receiver.try_recv() {
+            Ok(went) => (went, *what),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.git_job = None;
+                return;
+            }
+        };
+        self.git_job = None;
+        match went {
+            // Its last line says the most: what came in, what went out, or nothing new.
+            Ok(said) => {
+                let last = said.lines().last().unwrap_or("done").trim();
+                self.toasts.success(format!("{what}: {last}"));
+            }
+            Err(why) => self.toasts.error(format!("{what} failed: {why}")),
+        }
+        self.refresh_git(ctx);
+        for index in 0..self.tabs.len() {
+            self.refresh_diff(ctx, index);
+        }
+    }
+
+    /// Commit the changed files that are ticked, then `push` when asked.
+    fn commit(&mut self, ctx: &Context, push: bool) {
         let Some(root) = self.folder() else {
             return;
         };
@@ -2889,14 +2963,44 @@ impl GodApp {
             self.toasts.error("Write a commit message first");
             return;
         }
-        let committed = tools::git(&root, &["add", "-A"])
-            .and_then(|_| tools::git(&root, &["commit", "-m", message]));
+        let changes = self.repo.iter().flat_map(|repo| &repo.changes);
+        let ticked: Vec<&str> = changes
+            .map(|change| change.path.as_str())
+            .filter(|path| !self.left_out.contains(*path))
+            .collect();
+        if ticked.is_empty() {
+            self.toasts.error("No changed file is ticked");
+            return;
+        }
+        let committed = match self.left_out.is_empty() {
+            true => tools::git(&root, &["add", "-A"])
+                .and_then(|_| tools::git(&root, &["commit", "-m", message])),
+            // Those ticked alone: the others stay as they are, changed and not committed.
+            false => {
+                let named = |first: &[&'static str]| -> Vec<&str> {
+                    let mut args = first.to_vec();
+                    args.push("--");
+                    args.extend(ticked.iter().copied());
+                    args
+                };
+                let commit = [&["commit", "-m"][..], &[message]].concat();
+                let mut commit: Vec<&str> = commit;
+                commit.push("--");
+                commit.extend(ticked.iter().copied());
+                tools::git(&root, &named(&["add"])).and_then(|_| tools::git(&root, &commit))
+            }
+        };
+        let went = committed.is_ok();
         match committed {
             Ok(_) => {
                 self.toasts.success("Committed");
                 self.commit_message.clear();
+                self.left_out.clear();
             }
             Err(err) => self.toasts.error(err),
+        }
+        if went && push {
+            self.git_remote(ctx, "Push", &["push"]);
         }
         self.refresh_git(ctx);
         for index in 0..self.tabs.len() {
@@ -2945,17 +3049,39 @@ impl GodApp {
         let ctx = ui.ctx().clone();
         let root = self.folder();
         let mut refresh = false;
-        let mut commit = false;
+        // Commit the files ticked; and push them then.
+        let mut commit = None;
         let mut init = false;
-        let mut in_terminal = None;
         let mut open = None;
+        // A file ticked or not; all of them at once.
+        let mut ticked = None;
+        let mut all = None;
         ui.horizontal(|ui| {
             ui.add_space(10.0);
-            ui.label(RichText::new("SOURCE CONTROL").size(12.0).strong());
+            ui.label(RichText::new("COMMIT").size(12.0).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(4.0);
                 refresh =
                     widgets::small_icon_button(ui, icon::ARROWS_CLOCKWISE, "Refresh").clicked();
+                // What is done with the repository, a click away as the changes are.
+                let tools = [
+                    (icon::GRAPH, "Git graph", Cmd::GitGraph),
+                    (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
+                    (icon::TRAY_ARROW_UP, "Stash pop", Cmd::StashPop),
+                    (icon::TRAY_ARROW_DOWN, "Stash the changes", Cmd::Stash),
+                    (icon::CLOUD_ARROW_DOWN, "Fetch", Cmd::GitFetch),
+                    (icon::ARROW_LINE_UP, "Push", Cmd::GitPush),
+                    (
+                        icon::ARROW_LINE_DOWN,
+                        "Update project: pull (Ctrl+T)",
+                        Cmd::GitPull,
+                    ),
+                ];
+                for (glyph, tip, cmd) in tools {
+                    if widgets::small_icon_button(ui, glyph, tip).clicked() {
+                        self.pending.push(cmd);
+                    }
+                }
             });
         });
         ui.add_space(4.0);
@@ -2987,20 +3113,28 @@ impl GodApp {
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        commit = ui
-                            .button(with_icon(icon::CHECK_CIRCLE, "Commit all"))
-                            .clicked();
-                        if ui.button("Pull").clicked() {
-                            in_terminal = Some("git pull");
+                        if ui.button(with_icon(icon::CHECK_CIRCLE, "Commit")).clicked() {
+                            commit = Some(false);
                         }
-                        if ui.button("Push").clicked() {
-                            in_terminal = Some("git push");
+                        if ui.button("Commit and Push").clicked() {
+                            commit = Some(true);
+                        }
+                        if self.git_job.is_some() {
+                            ui.spinner();
                         }
                     });
                     ui.add_space(8.0);
                     let count = repo.changes.len();
-                    let title = format!("CHANGES  {count}");
-                    ui.label(RichText::new(title).size(12.0).color(palette.text_dim));
+                    let chosen = count - self.left_out.len().min(count);
+                    ui.horizontal(|ui| {
+                        // Ticked when every file is: a click ticks or unticks them all.
+                        let mut every = self.left_out.is_empty();
+                        if ui.checkbox(&mut every, "").changed() {
+                            all = Some(every);
+                        }
+                        let title = format!("CHANGES  {chosen} of {count}");
+                        ui.label(RichText::new(title).size(12.0).color(palette.text_dim));
+                    });
                 });
             ui.add_space(2.0);
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -3010,12 +3144,22 @@ impl GodApp {
                 repo.changes.len(),
                 |ui, range| {
                     for change in &repo.changes[range] {
-                        let label = format!("{}    {}", change.state.letter(), change.path);
-                        if list_row(ui, &palette, &label, 12.0, palette.text).clicked()
-                            && change.state != git::State::Deleted
-                        {
-                            open = Some(change.path.clone());
-                        }
+                        let row = vec2(ui.available_width(), LIST_ROW);
+                        let across = Layout::left_to_right(Align::Center);
+                        ui.allocate_ui_with_layout(row, across, |ui| {
+                            ui.add_space(10.0);
+                            // Ticked, it goes in the next commit.
+                            let mut goes = !self.left_out.contains(&change.path);
+                            if ui.checkbox(&mut goes, "").changed() {
+                                ticked = Some((change.path.clone(), goes));
+                            }
+                            let label = format!("{}    {}", change.state.letter(), change.path);
+                            if list_row(ui, &palette, &label, 2.0, palette.text).clicked()
+                                && change.state != git::State::Deleted
+                            {
+                                open = Some(change.path.clone());
+                            }
+                        });
                     }
                 },
             );
@@ -3035,16 +3179,24 @@ impl GodApp {
         if init && let Err(err) = tools::git(&root, &["init"]) {
             self.toasts.error(err);
         }
-        if commit {
-            self.commit(&ctx);
+        match (ticked, all) {
+            (Some((path, true)), _) => {
+                self.left_out.remove(&path);
+            }
+            (Some((path, false)), _) => {
+                self.left_out.insert(path);
+            }
+            (None, Some(true)) => self.left_out.clear(),
+            (None, Some(false)) => {
+                let changes = self.repo.iter().flat_map(|repo| &repo.changes);
+                self.left_out = changes.map(|change| change.path.clone()).collect();
+            }
+            (None, None) => {}
+        }
+        if let Some(push) = commit {
+            self.commit(&ctx, push);
         } else if refresh || init {
             self.refresh_git(&ctx);
-        }
-        if let Some(command) = in_terminal {
-            self.show_terminal(&ctx);
-            if let Some(terminal) = &mut self.terminal {
-                terminal.send(command);
-            }
         }
         if let Some(path) = open {
             self.open_file(&ctx, &root.join(path));
@@ -7189,6 +7341,14 @@ impl GodApp {
                         .success(format!("{} plugins", self.plugins.len())),
                 }
             }
+            Cmd::GitPull => self.git_remote(ctx, "Update", &["pull", "--no-edit"]),
+            Cmd::GitPush => self.git_remote(ctx, "Push", &["push"]),
+            Cmd::GitFetch => self.git_remote(ctx, "Fetch", &["fetch", "--all", "--prune"]),
+            Cmd::GitCommit => {
+                // The changes and the message to write show beside the code.
+                (self.sidebar, self.side) = (true, Side::Git);
+                self.refresh_git(ctx);
+            }
             Cmd::Postgres => {
                 // The address the project keeps for itself is the one most likely meant.
                 let kept = self.env_values().into_iter();
@@ -7620,6 +7780,8 @@ impl GodApp {
             (ctrl, Key::Backslash, Cmd::Split),
             (Modifiers::ALT, Key::F7, Cmd::FindUsages),
             (Modifiers::ALT, Key::Backslash, Cmd::Suggest),
+            (ctrl, Key::K, Cmd::GitCommit),
+            (ctrl, Key::T, Cmd::GitPull),
             (Modifiers::ALT, Key::F1, Cmd::Reveal),
             (Modifiers::ALT, Key::F12, Cmd::ToggleTerminal),
             (Modifiers::SHIFT, Key::F6, Cmd::Rename),
@@ -7784,6 +7946,61 @@ impl GodApp {
                 };
                 if widgets::small_icon_button(ui, glyph, tip).clicked() {
                     clicked.push(Cmd::ToggleTheme);
+                }
+                // What is done all day is a click away, from the right: finding, running,
+                // then what Git does with the project and the branch it is on.
+                let mut tools = vec![
+                    (
+                        icon::MAGNIFYING_GLASS,
+                        "Search everywhere (Ctrl+Shift+P)",
+                        Cmd::Commands,
+                    ),
+                    (icon::SPARKLE, "Assistant", Cmd::Assistant),
+                ];
+                ui.separator();
+                if self.debug.is_some() {
+                    tools.push((icon::STOP, "Stop (Shift+F5)", Cmd::StopDebug));
+                }
+                tools.extend([
+                    (icon::BUG, "Debug this file (Ctrl+F5)", Cmd::Debug),
+                    (icon::PLAY, "Run (F5)", Cmd::Run),
+                ]);
+                for (index, (glyph, tip, cmd)) in tools.into_iter().enumerate() {
+                    if index == 2 {
+                        ui.separator();
+                    }
+                    if widgets::small_icon_button(ui, glyph, tip).clicked() {
+                        clicked.push(cmd);
+                    }
+                }
+                let Some(repo) = &self.repo else {
+                    return;
+                };
+                ui.separator();
+                let git = [
+                    (icon::ARROW_LINE_UP, "Push", Cmd::GitPush),
+                    (icon::GIT_COMMIT, "Commit… (Ctrl+K)", Cmd::GitCommit),
+                    (
+                        icon::ARROW_LINE_DOWN,
+                        "Update project: pull (Ctrl+T)",
+                        Cmd::GitPull,
+                    ),
+                ];
+                for (glyph, tip, cmd) in git {
+                    if widgets::small_icon_button(ui, glyph, tip).clicked() {
+                        clicked.push(cmd);
+                    }
+                }
+                if self.git_job.is_some() {
+                    ui.spinner();
+                }
+                let branch = repo.branch.as_deref().unwrap_or("no branch");
+                let label = format!("{} {branch} {}", icon::GIT_BRANCH, icon::CARET_DOWN);
+                let widget =
+                    Button::new(RichText::new(label).size(12.5)).frame_when_inactive(false);
+                let tip = "Branches: switch, create, merge";
+                if ui.add(widget).on_hover_text(tip).clicked() {
+                    clicked.push(Cmd::Branches);
                 }
             });
         });
@@ -8050,6 +8267,55 @@ impl GodApp {
                     self.search.focus = side == Side::Search && !shown;
                 }
             }
+            // At the foot of the bar, the panels that open under the code.
+            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                ui.add_space(6.0);
+                let panels = [
+                    (
+                        Bottom::Terminal,
+                        icon::TERMINAL_WINDOW,
+                        "Terminal",
+                        Cmd::ToggleTerminal,
+                    ),
+                    (
+                        Bottom::Problems,
+                        icon::WARNING_CIRCLE,
+                        "Problems",
+                        Cmd::Problems,
+                    ),
+                    (Bottom::Tests, icon::CHECK_SQUARE, "Tests", Cmd::TestsPanel),
+                    (Bottom::Debug, icon::BUG, "Debug", Cmd::DebugPanel),
+                    (
+                        Bottom::Response,
+                        icon::GLOBE,
+                        "HTTP response",
+                        Cmd::Response,
+                    ),
+                    (
+                        Bottom::Assistant,
+                        icon::SPARKLE,
+                        "Assistant",
+                        Cmd::Assistant,
+                    ),
+                ];
+                for (panel, glyph, tip, cmd) in panels {
+                    let shown = self.bottom == Some(panel);
+                    if widgets::toggle_button(ui, glyph, tip, shown).clicked() {
+                        self.pending.push(cmd);
+                    }
+                }
+                ui.separator();
+                let windows = [
+                    (icon::CUBE, "Docker", Cmd::Docker),
+                    (icon::DATABASE, "Connect to PostgreSQL", Cmd::Postgres),
+                    (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
+                ];
+                for (glyph, tip, cmd) in windows {
+                    if widgets::toggle_button(ui, glyph, tip, false).clicked() {
+                        self.pending.push(cmd);
+                    }
+                }
+            });
         });
     }
 
@@ -9708,6 +9974,7 @@ impl eframe::App for GodApp {
         self.ask_hints();
         self.ask_folds();
         self.suggest_at_a_pause(&ctx);
+        self.poll_git(&ctx);
         self.poll_debug(&ctx);
         self.poll_tests();
         // The tab in front is the most recent of the recent files.
