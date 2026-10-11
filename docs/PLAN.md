@@ -37,7 +37,7 @@ pull/push, lignes modifiées dans la marge), palette de commandes, complétion p
 snippets, vérification des crochets, compilateurs à la sauvegarde (Rust, Python, JS, Go),
 thèmes sombre/clair, zoom.
 
-### Phase 1 — éditeur professionnel (🔨)
+### Phase 1 — éditeur professionnel (✅)
 
 | Fonction | État |
 |---|---|
@@ -68,7 +68,7 @@ thèmes sombre/clair, zoom.
 | Complétion web : attributs dans une balise (ceux de l'élément puis les communs, `class=""` avec le curseur entre les guillemets) et valeurs de `type`, `target`, `rel`, `method`… ; propriétés CSS et leurs valeurs courantes, dans un fichier `.css`, dans `<style>` et dans l'attribut `style` ; les noms à tiret (`font-size`, `aria-label`) sont suivis d'un bout à l'autre | ✅ |
 | Abréviations à la Emmet, avec Tab. HTML : `ul>li.item$*3`, `#id`, `.classe`, `[attributs]`, `{texte}`, `>` `+` `*n`, groupes `( )`, remontée `^`, `!` pour une page entière. CSS, dans un bloc : `m10-20` → `margin: 10px 20px;`, `w100p`, `fz1.5r`, `c#333`, `df`, `jcsb`, `posa`… (`crates/core/src/emmet.rs`). Les abréviations CSS marchent aussi dans `<style>` | ✅ |
 
-### Phase 2 — moteur de langages (🔨)
+### Phase 2 — moteur de langages (✅)
 
 Client LSP générique (`crates/lsp`) : un serveur par langage et par projet, lancé à la
 première ouverture d'un fichier, lectures et écritures hors du thread de l'interface.
@@ -132,7 +132,7 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Couleurs refaites pour les seules lignes qu'un changement peut toucher : sur 200 000 lignes, une frappe relit sa ligne (≈1 ms) au lieu de tout le texte (≈60 ms) ; ouvrir ou fermer un commentaire relit ce qui suit | ✅ |
 | Gros fichiers : frappe en temps constant partout (corde ou tampon à trou au lieu d'une `String`) ; le reste de ce qui est su du texte (débuts de lignes, retraits, crochets) est encore refait en entier pour un texte coloré ; Entrée, Tab et les touches Vim relisent encore tout le texte | ⏳ |
 
-### Phase 4 — exécution, tests, débogage (🔨)
+### Phase 4 — exécution, tests, débogage (✅)
 
 | Fonction | État |
 |---|---|
@@ -160,7 +160,7 @@ reprise jusqu'à la fin.
 `cargo test -p godcode-lsp --test python -- --ignored` le rejoue ; il lui faut debugpy
 (`pip install debugpy`, ou son dossier dans `GODCODE_DEBUGPY`).
 
-### Phase 5 — Git complet et projets (⏳)
+### Phase 5 — Git complet et projets (✅)
 
 Fait : branches, blame, diff avec le dernier commit, journal des commits avec le diff de
 chacun, stash et stash pop. merge et rebase d'une branche, conflits réglés au
@@ -181,7 +181,7 @@ et ses boutons : fetch, stash, journal, graphe. Au pied de la barre de gauche : 
 tests, débogueur, réponse HTTP, assistant, Docker, PostgreSQL, journal Git. Les menus rangent le reste
 en sous-menus, avec un menu `Tools`.
 
-### Phase 6 — outils (⏳)
+### Phase 6 — outils (✅)
 
 Fait : client HTTP — fichiers `.http`, `F5` envoie la requête sous le curseur, réponse
 (JSON mis en forme) dans le panneau Response ; passe par `curl`. `@nom = valeur` nomme une
@@ -229,7 +229,7 @@ choisi est proposée), liste tables et vues, envoie une requête, montre les lig
 (protocole v3, mots de passe en clair, MD5 et SCRAM-SHA-256), **sans chiffrement** : pour un serveur local
 ou de développement. Jamais lancé contre un vrai serveur : seulement contre un faux, dans les tests.
 
-### Phase 7 — personnalisation et extensions (⏳)
+### Phase 7 — personnalisation et extensions (✅ livré, suites ⏳)
 
 Fait : 6 thèmes (GodCode Dark/Light, Darcula, Monokai, Solarized Light, High Contrast),
 mode Zen (`Ctrl+Alt+Z`). `Editor Font…` choisit le fichier de police (.ttf, .otf) qui dessine le code,
@@ -248,7 +248,7 @@ décrite en tête de `plugins.rs`, avec un exemple. Passe par `wasmi`, interpré
 dépendance de ce poids après `wry`.
 Reste : des plugins qui font plus que transformer du texte (panneaux, touches, accès au projet).
 
-### Phase 8 — IA (⏳, volontairement en dernier)
+### Phase 8 — IA (✅ livré, jamais essayé avec un vrai modèle)
 
 Fait : assistant contextuel — panneau `ASSISTANT` (`Toggle Assistant`) : une question est envoyée avec la
 conversation, le texte du fichier en avant (60 000 caractères au plus) et la sélection. Modèles locaux
