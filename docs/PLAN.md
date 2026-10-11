@@ -22,9 +22,9 @@ crates/
   dap/   (phase 4)      client Debug Adapter Protocol.
 ```
 
-Limite connue : l'éditeur repose sur le champ de texte d'egui (un seul curseur, texte mis en
-page en entier). Multi-curseurs, repli de code et fichiers de plus de 2 Mo demandent un
-widget d'édition maison : c'est le chantier de la phase 3, à ne pas bricoler avant.
+L'éditeur repose sur un champ de texte maison (`crates/app/src/field.rs`) qui ne met en page
+que les rangées visibles. Limite connue : le texte reste une seule `String`, copiée en entier
+dans l'historique d'annulation ; au-delà de 2 Mo un fichier s'ouvre en texte brut (voir phase 3).
 
 ## État
 
@@ -97,33 +97,29 @@ protocole mais n'ont pas été lancés ici. `GODCODE_LSP_LOG=1` affiche les mess
 (survol, implémentations, symboles, synchronisation incrémentale, hiérarchie d'appels, Quick Fix, import par complétion, indices en ligne). Il lui faut
 `typescript@5` : TypeScript 7 ne fournit plus le `tsserver` qu'il pilote.
 
-### Phase 3 — widget d'édition maison (🔨)
+### Phase 3 — widget d'édition maison (✅ livré, suites ⏳)
 
-Fait sans attendre le widget : **multi-curseurs** (`Ctrl+Alt+Haut/Bas`, `Alt+Clic`) — frappe,
-effacement et déplacement à tous les curseurs, sur le champ de texte actuel.
-
-Le widget maison a commencé (`crates/app/src/field.rs`) : un champ de texte qui ne met en
-page que les lignes visibles. Il garde son curseur et son historique là où le champ d'egui
-les garde, donc tout le reste de l'éditeur (marques, gouttière, complétion, multi-curseurs,
-commandes) marche avec les deux. Il s'active par `Toggle Fast Rendering (Experimental)`
-(menu View) et reste éteint par défaut.
+Le champ de texte d'egui est retiré : `crates/app/src/field.rs` est le seul champ. Il ne met
+en page que les rangées visibles, et garde son curseur et son historique là où le champ
+d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de l'éditeur.
 
 | Tranche | État |
 |---|---|
-| Rendu virtualisé : frappe, sélection clavier et souris, copier/couper/coller, annuler/rétablir, une ligne = une rangée | ✅ derrière le réglage |
-| Les tests de l'éditeur rejoués sur le nouveau champ | ✅ |
-| Retour à la ligne (soft wrap) dans le nouveau champ : aujourd'hui l'ancien champ reprend la main | ⏳ |
-| Saisie par IME (chinois, japonais…), défilement automatique pendant une sélection à la souris | ⏳ |
-| Fichiers de plus de 2 Mo : le champ le permet, le reste de l'app relit encore tout le texte à chaque frappe | ⏳ |
-| Repli de code : flèche près du numéro de ligne, `Fold / Unfold Block`, `Unfold All` ; blocs trouvés par l'indentation ; un bloc s'ouvre quand le curseur y entre | ✅ derrière le réglage |
+| Rendu virtualisé : frappe, sélection clavier et souris, copier/couper/coller, annuler/rétablir | ✅ |
+| Multi-curseurs (`Ctrl+Alt+Haut/Bas`, `Alt+Clic`) : frappe, effacement et déplacement à tous les curseurs | ✅ |
+| Retour à la ligne (soft wrap, `Alt+Z`) : rangées coupées aux espaces, comptées sans mettre le texte en page ; haut/bas vont de rangée en rangée | ✅ |
+| Saisie par IME : texte en cours de composition, fenêtre de l'IME placée au curseur | ✅ testé par événements simulés, pas avec un vrai IME |
+| Défilement automatique pendant une sélection à la souris | ✅ |
+| Repli de code : flèche près du numéro de ligne, `Fold / Unfold Block`, `Unfold All` ; blocs trouvés par l'indentation ; un bloc s'ouvre quand le curseur y entre | ✅ |
 | Replis gardés d'une session à l'autre, repli par accolades ou par le serveur de langage | ⏳ |
-| Indices en ligne (inlay hints) : écrits dans la ligne sans faire partie du texte, redemandés à chaque changement ; le serveur TypeScript est réglé pour en donner, rust-analyzer et clangd en donnent d'eux-mêmes (non lancés ici) | ✅ derrière le réglage |
+| Indices en ligne (inlay hints) : écrits dans la ligne sans faire partie du texte, redemandés à chaque changement ; le serveur TypeScript est réglé pour en donner, rust-analyzer et clangd en donnent d'eux-mêmes (non lancés ici) | ✅ |
 | Réglage pour couper les indices, indices demandés pour les seules lignes visibles (aujourd'hui : tout le fichier) | ⏳ |
 | Sélection en colonnes : `Alt+Maj+glisser` ou `Ctrl+Alt+Maj+flèches` ; ce qui est tapé remplace chaque ligne du rectangle, puis chaque ligne garde un curseur | ✅ |
-| Touches Vim (`Switch Keys`) : modes normal, insertion, visuel et visuel ligne ; déplacements `h j k l w b e 0 ^ $ gg G` avec compte ; `d c y` avec déplacement ou doublés, `x D C p P r J o O i a I A u Ctrl+R /` ; mode affiché dans la barre d'état, curseur bloc dans le nouveau champ. Moteur pur et testé : `crates/core/src/modal.rs` | ✅ |
+| Touches Vim (`Switch Keys`) : modes normal, insertion, visuel et visuel ligne ; déplacements `h j k l w b e 0 ^ $ gg G` avec compte ; `d c y` avec déplacement ou doublés, `x D C p P r J o O i a I A u Ctrl+R /` ; mode affiché dans la barre d'état, curseur bloc. Moteur pur et testé : `crates/core/src/modal.rs` | ✅ |
 | Touches Emacs : `Ctrl+F B N P A E`, `Alt+F B`, `Ctrl+D K Y W`, `Alt+W D`, marque `Ctrl+Espace`, `Ctrl+G`, `Ctrl+/`, `Ctrl+S` cherche, `Ctrl+X Ctrl+S` enregistre, `Ctrl+X Ctrl+F` ouvre | ✅ (moteur testé, non vu tourner à l'écran) |
-| Vim : `.`, `f t`, objets de texte (`iw`, `i(`), registres nommés, `:` ; annulation plus fine que celle du champ (par pauses de frappe) | ⏳ |
-| Bascule par défaut, puis retrait de l'ancien champ | ⏳ |
+| Vim : `.`, `f t`, objets de texte (`iw`, `i(`), registres nommés, `:` | ⏳ |
+| Fichiers jusqu'à 64 Mo (2 Mo avant). Au repos, rien n'est relu (70 µs par image à 50 Mo) ; le texte n'est relu qu'après un changement. Au-delà de 2 Mo : texte brut, sans couleurs, serveur de langage, plan, complétion par mots ni historique local. Mesuré : une frappe coûte 16 ms à 10 Mo, 80 ms à 50 Mo (`cargo test --release -p godcode typing_in_a_big -- --ignored --nocapture`) | ✅ |
+| Gros fichiers : frappe en temps constant (corde ou tampon à trou au lieu d'une `String`), couleurs refaites pour les seules lignes changées, annulation par différences au lieu de copies entières (aujourd'hui : copies plafonnées à 256 Mo) | ⏳ |
 
 ### Phase 4 — exécution, tests, débogage (⏳)
 

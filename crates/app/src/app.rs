@@ -41,7 +41,7 @@ const MAX_RECENT: usize = 10;
 const FONT_SIZE: f32 = 14.0;
 const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.6..=3.0;
 /// Larger files are refused: the editor lays the whole text out.
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HITS: usize = 5000;
 const MAX_PICKS: usize = 50;
 const MAX_REPORTS: usize = 500;
@@ -973,7 +973,8 @@ impl Tab {
     /// The text changed: derived data is stale, and it may differ from the file again.
     fn touched(&mut self) {
         self.revision += 1;
-        self.dirty = hash_of(&self.text) != self.saved;
+        // A big text is not read through at every key to see if it is back as saved.
+        self.dirty = self.text.len() > editor::LARGE_BYTES || hash_of(&self.text) != self.saved;
     }
 
     /// Select `range`, bring it into view and give the keyboard to the editor.
@@ -1614,7 +1615,7 @@ impl GodApp {
         let name = file_name(path);
         if std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_FILE_BYTES) {
             self.toasts
-                .error(format!("{name} is too large to edit here (over 2 MB)"));
+                .error(format!("{name} is too large to edit here (over 64 MB)"));
             return false;
         }
         let bytes = match std::fs::read(path) {
@@ -1634,6 +1635,13 @@ impl GodApp {
             self.remember(path);
         }
         self.push_tab(name, Some(path.to_path_buf()), decoded);
+        // A big file is plain text: colouring it again and telling a language server about
+        // it at every key would make typing wait.
+        if self.tabs[self.active].text.len() > editor::LARGE_BYTES {
+            self.tabs[self.active].language = Language::plain();
+            self.toasts
+                .success("Large file: plain text, without colours or language server");
+        }
         // The caret starts at the top, not where the text field would put it.
         let tab = &mut self.tabs[self.active];
         editor::set_selection(ctx, tab.editor_id(), &(0..0));
@@ -1697,7 +1705,10 @@ impl GodApp {
             self.toasts.error(err);
             return false;
         }
-        keep_version(&path, &bytes);
+        // Forty versions of a big file would fill the disk.
+        if bytes.len() <= editor::LARGE_BYTES {
+            keep_version(&path, &bytes);
+        }
         if let Some(live) = &self.live {
             live.changed();
         }
@@ -2054,7 +2065,11 @@ impl GodApp {
             return;
         }
         tab.checked = Some(key);
-        tab.problems = check::brackets(&tab.text, tab.language);
+        tab.problems = if tab.text.len() > editor::LARGE_BYTES {
+            Vec::new()
+        } else {
+            check::brackets(&tab.text, tab.language)
+        };
         let fresh = tab.reports_at == Some(tab.revision);
         let reported = self
             .reports
@@ -3997,11 +4012,15 @@ impl GodApp {
         };
         self.caret_line = godcode_core::line_col(&tab.text, tab.selection.start).0 - 1;
         let key = hash_of((tab.id, tab.revision, tab.language.name));
+        // A big text is not read through at every key for what it defines.
+        let small = tab.text.len() <= editor::LARGE_BYTES;
         if self.symbols.0 != key {
-            self.symbols = (key, outline::symbols(&tab.text, tab.language));
+            let symbols = small.then(|| outline::symbols(&tab.text, tab.language));
+            self.symbols = (key, symbols.unwrap_or_default());
         }
         if self.tests.0 != key {
-            self.tests = (key, outline::tests(&tab.text, tab.language));
+            let tests = small.then(|| outline::tests(&tab.text, tab.language));
+            self.tests = (key, tests.unwrap_or_default());
         }
     }
 
@@ -4088,6 +4107,7 @@ impl GodApp {
             stopped: None,
             hints: &[],
             block_caret: false,
+            revision: 0,
         };
         let id = tab.editor_id();
         if editor::run(ctx, id, &mut tab.text, &config, op) {
@@ -5798,6 +5818,7 @@ impl GodApp {
             breakpoints: &tab.breakpoints,
             stopped,
             hints: &tab.hints,
+            revision: tab.revision,
             block_caret: front && self.keys == Keys::Vim && self.vim.mode != modal::Mode::Insert,
         };
         let id = tab.editor_id();

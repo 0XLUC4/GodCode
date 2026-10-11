@@ -328,7 +328,28 @@ pub struct Cache {
     index: Option<Arc<Index>>,
     /// The rows of the lines (see [`row_starts`]), and the key of what they were counted for.
     rows: Option<(u64, Option<Arc<Vec<usize>>>)>,
+    /// The text as it last showed.
+    seen: Option<Seen>,
+    /// What the history was last given (the key of the text, the caret), when that first
+    /// showed, and whether the history has seen it stay long enough to keep it.
+    fed: Option<(u64, CCursorRange, f64, bool)>,
+    /// The history was told how many copies of a big text it may keep.
+    capped: bool,
 }
+
+/// What reading a text through told of it, and the revision it was read at.
+#[derive(Clone, Copy)]
+struct Seen {
+    revision: u64,
+    bytes: usize,
+    chars: usize,
+    hash: u64,
+}
+
+/// The copies of the text the history keeps take no more than this.
+const HISTORY_BYTES: usize = 256 * 1024 * 1024;
+/// The history keeps a change once it has seen it stay this long.
+const SETTLE_SECONDS: f64 = 1.05;
 
 impl Cache {
     /// The row `line` showed on the last time, keeping its fraction.
@@ -513,6 +534,9 @@ pub struct Look<'a> {
     pub block_caret: bool,
     /// Lines too long for the view go on below instead of running off it.
     pub wrap: bool,
+    /// A number that changes whenever the text may have changed since the field last
+    /// showed it: while it stays, the text is not read through again.
+    pub revision: u64,
 }
 
 pub struct Shown {
@@ -525,9 +549,9 @@ pub struct Shown {
     pub lines: Lines,
 }
 
-fn key_of(text: &str, look: &Look<'_>) -> u64 {
+fn key_of(text_hash: u64, look: &Look<'_>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
+    text_hash.hash(&mut hasher);
     theme::current().name.hash(&mut hasher);
     look.language.name.hash(&mut hasher);
     look.font.size.to_bits().hash(&mut hasher);
@@ -683,7 +707,19 @@ fn replace(text: &mut String, caret: Caret, written: &str) -> Caret {
 
 /// What the keyboard did to the text and the caret this frame. `page`: rows in view;
 /// `wrap`: the columns a row holds when lines are cut to fit.
-fn typed(ui: &Ui, text: &mut String, mut caret: Caret, page: usize, wrap: Option<usize>) -> Caret {
+fn typed(
+    ui: &Ui,
+    text: &mut String,
+    mut caret: Caret,
+    page: usize,
+    wrap: Option<usize>,
+) -> (Caret, bool) {
+    let mut edited = false;
+    // Writing nothing over nothing changes nothing.
+    let mut replace = |text: &mut String, caret: Caret, written: &str| {
+        edited |= !written.is_empty() || !caret.sorted().is_empty();
+        replace(text, caret, written)
+    };
     let events = ui.input(|input| input.events.clone());
     for event in events {
         let len = text.chars().count();
@@ -795,7 +831,7 @@ fn typed(ui: &Ui, text: &mut String, mut caret: Caret, page: usize, wrap: Option
             _ => {}
         }
     }
-    caret
+    (caret, edited)
 }
 
 /// Show `text` over the rest of `ui`, which is expected to scroll. `cache` holds what was
@@ -825,7 +861,20 @@ pub fn show(
     });
 
     let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-    let len = text.chars().count();
+    // A history of whole copies of a big text is given fewer of them to keep.
+    if !cache.capped && text.len() > HISTORY_BYTES / 100 {
+        let settings = egui::util::undoer::Settings {
+            max_undos: (HISTORY_BYTES / text.len()).clamp(4, 100),
+            ..Default::default()
+        };
+        state.set_undoer(egui::util::undoer::Undoer::with_settings(settings));
+        cache.capped = true;
+    }
+    // The text as it last showed, when nothing can have changed it since.
+    let known = cache
+        .seen
+        .filter(|seen| seen.revision == look.revision && seen.bytes == text.len());
+    let len = known.map_or_else(|| text.chars().count(), |seen| seen.chars);
     let stored = state.cursor.char_range();
     let mut caret = stored.map(|range| Caret::of(range, len));
     let focused = ui.memory(|memory| memory.has_focus(id));
@@ -844,14 +893,13 @@ pub fn show(
             escape: false,
         };
         ui.memory_mut(|memory| memory.set_focus_lock_filter(id, filter));
-        let was = text.clone();
         let (undo, redo) = ui.input_mut(|input| {
             let shifted = Modifiers::COMMAND | Modifiers::SHIFT;
             let redo =
                 input.consume_key(shifted, Key::Z) || input.consume_key(Modifiers::COMMAND, Key::Y);
             (input.consume_key(Modifiers::COMMAND, Key::Z), redo)
         });
-        let mut new = typed(ui, text, old, page, wrap);
+        let (mut new, mut edited) = typed(ui, text, old, page, wrap);
         if undo || redo {
             let mut undoer = state.undoer();
             let current = (new.range(), text.clone());
@@ -863,15 +911,27 @@ pub fn show(
             if let Some((range, restored)) = step.cloned() {
                 *text = restored;
                 new = Caret::of(range, text.chars().count());
+                edited = true;
             }
             state.set_undoer(undoer);
         }
-        changed = *text != was;
+        changed = edited;
         caret = Some(new);
     }
 
     // What is known of the text, made again when it changed.
-    let key = key_of(text, look);
+    let seen = known.filter(|_| !changed).unwrap_or_else(|| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        Seen {
+            revision: look.revision,
+            bytes: text.len(),
+            chars: text.chars().count(),
+            hash: hasher.finish(),
+        }
+    });
+    cache.seen = Some(seen);
+    let key = key_of(seen.hash, look);
     let previous = cache.index.clone();
     let index = match cache.index.as_ref().filter(|index| index.key == key) {
         Some(index) => Arc::clone(index),
@@ -1109,10 +1169,27 @@ pub fn show(
     let cursor = caret.map(Caret::range);
     state.cursor.set_char_range(cursor);
     if focused && let Some(range) = cursor {
-        let mut undoer = state.undoer();
         let time = ui.input(|input| input.time);
-        undoer.feed_state(time, &(range, text.clone()));
-        state.set_undoer(undoer);
+        // The history takes a copy of the text: it is given one while the text or the
+        // caret change, and until it has seen them stay, not at every frame of a text at
+        // rest.
+        let same = |(fed_key, fed_range, ..): &(u64, CCursorRange, f64, bool)| {
+            (*fed_key, *fed_range) == (key, range)
+        };
+        if !cache.fed.as_ref().is_some_and(same) {
+            cache.fed = Some((key, range, time, false));
+            // Come back once the change has settled, for the history to keep it.
+            let settled = std::time::Duration::from_secs_f64(SETTLE_SECONDS + 0.05);
+            ui.ctx().request_repaint_after(settled);
+        }
+        if let Some((.., since, settled)) = &mut cache.fed
+            && !*settled
+        {
+            let mut undoer = state.undoer();
+            undoer.feed_state(time, &(range, text.clone()));
+            state.set_undoer(undoer);
+            *settled = time - *since >= SETTLE_SECONDS;
+        }
     }
     state.store(ui.ctx(), id);
     Shown {
@@ -1241,6 +1318,47 @@ mod tests {
         // The end of a row that goes on below belongs to the next row.
         assert_eq!(vertical(text, 12, false, Some(8)), 4);
         assert_eq!(vertical(text, 7, true, Some(8)), 13);
+    }
+
+    /// What a keystroke costs in a big file. `cargo test --release -p godcode big -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "a measure, not a check"]
+    fn a_big_file_is_measured() {
+        let line = "    let total = compute(alpha, \"text\", 42); // a note about it\n";
+        let language = Language::of(std::path::Path::new("a.rs"));
+        for megabytes in [2, 10, 50] {
+            let text = line.repeat(megabytes * 1024 * 1024 / line.len());
+            let timed = |name: &str, work: &mut dyn FnMut()| {
+                let start = std::time::Instant::now();
+                work();
+                println!("{megabytes} MB  {name}: {:?}", start.elapsed());
+            };
+            timed("hash", &mut || {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                text.hash(&mut hasher);
+                std::hint::black_box(hasher.finish());
+            });
+            timed("clone", &mut || {
+                std::hint::black_box(text.clone());
+            });
+            timed("count chars", &mut || {
+                std::hint::black_box(text.chars().count());
+            });
+            timed("count lines", &mut || {
+                std::hint::black_box(text.bytes().filter(|byte| *byte == b'\n').count());
+            });
+            timed("highlight", &mut || {
+                std::hint::black_box(syntax::highlight(&text, language));
+            });
+            timed("index", &mut || {
+                std::hint::black_box(Index::new(0, &text, language).lines());
+            });
+            let plain = Language::plain();
+            timed("index, plain", &mut || {
+                std::hint::black_box(Index::new(0, &text, plain).lines());
+            });
+        }
     }
 
     #[test]

@@ -24,6 +24,9 @@ const MARGIN: Margin = Margin {
     top: 4,
     bottom: 4,
 };
+/// Over this size a text is too big to be read through at every key: it gets no colours,
+/// no completion from its own words, no bracket matching.
+pub const LARGE_BYTES: usize = 2 * 1024 * 1024;
 /// Space around the digits of the line numbers.
 const GUTTER_PAD: f32 = 14.0;
 /// Completions shown at once; the list slides to keep the chosen one in view.
@@ -85,6 +88,9 @@ pub struct Config<'a> {
     pub breakpoints: &'a [usize],
     /// The line the debugged program is stopped at.
     pub stopped: Option<usize>,
+    /// A number that changes whenever the text may have changed since the editor last
+    /// showed it.
+    pub revision: u64,
     /// What the language server writes in the lines.
     pub hints: &'a [field::Hint],
     /// The caret covers its char: keys are commands (Vim).
@@ -555,6 +561,10 @@ fn type_at_carets(ui: &Ui, id: Id, text: &mut String, view: &mut View) -> bool {
         view.extra.clear();
         return false;
     };
+    // Most of the time there is one caret: nothing to read the text for.
+    if view.extra.is_empty() {
+        return false;
+    }
     let len = text.chars().count();
     view.extra
         .retain(|caret| *caret <= len && *caret != primary);
@@ -754,7 +764,9 @@ fn refresh_completion(
             body: body.clone(),
             kind: Kind::Snippet,
         });
-        let known = complete::complete(text, caret, config.language);
+        let small = text.len() <= LARGE_BYTES;
+        let known = small.then(|| complete::complete(text, caret, config.language));
+        let known = known.into_iter().flatten();
         let items: Vec<Completion> = own.chain(known).collect();
         let typed_chars = caret - complete::word_start(text, caret);
         let wanted = manual || was_open || typed_chars >= 2;
@@ -882,7 +894,11 @@ pub fn show(
     let mut changed = keys(ui, id, text, config, view);
     let selected_before = selection_of(ui.ctx(), id);
 
-    let lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    // Counted when the text was last read through: it only tells how wide the numbers are.
+    let lines = match &view.layout {
+        Some(layout) => layout.starts.len() - 1,
+        None => text.bytes().filter(|byte| *byte == b'\n').count() + 1,
+    };
     let (digit, row_height) =
         ui.fonts_mut(|fonts| (fonts.glyph_width(&font, '0'), fonts.row_height(&font)));
     let gutter_width = lines.to_string().len().max(3) as f32 * digit + 2.0 * GUTTER_PAD;
@@ -925,6 +941,8 @@ pub fn show(
                 hints: config.hints,
                 block_caret: config.block_caret,
                 wrap: config.wrap,
+                // What the keys just did to the text is not in the revision yet.
+                revision: config.revision.wrapping_add(u64::from(changed)),
             };
             let (index, folded) = (&mut view.index, &mut view.folded);
             let shown = field::show(ui, id, text, &look, index, folded);
@@ -1109,7 +1127,10 @@ pub fn show(
                     .pair
                     .filter(|(key, at, _)| *key == layout.key && *at == caret);
                 let (_, _, pair) = known.unwrap_or_else(|| {
-                    let pair = check::matching_bracket(text, config.language, caret);
+                    let small = text.len() <= LARGE_BYTES;
+                    let pair = small
+                        .then(|| check::matching_bracket(text, config.language, caret))
+                        .flatten();
                     (layout.key, caret, pair)
                 });
                 view.pair = Some((layout.key, caret, pair));
@@ -1512,6 +1533,9 @@ mod tests {
         file: &'static str,
         wrap: bool,
         hints: Vec<field::Hint>,
+        /// Bumped when the text changed, as the app does; and the size it had then.
+        revision: u64,
+        bytes: usize,
     }
 
     fn editor_id() -> Id {
@@ -1532,6 +1556,8 @@ mod tests {
                 file,
                 wrap,
                 hints: Vec::new(),
+                revision: 0,
+                bytes: text.len(),
             };
             harness.frame(Vec::new());
             harness.frame(Vec::new());
@@ -1547,6 +1573,10 @@ mod tests {
                 ..Default::default()
             };
             self.time += 0.1;
+            // A test that wrote in the text itself is seen by its size.
+            if std::mem::replace(&mut self.bytes, self.text.len()) != self.text.len() {
+                self.revision += 1;
+            }
             let config = Config {
                 language: Language::of(std::path::Path::new(self.file)),
                 font_size: 14.0,
@@ -1565,6 +1595,7 @@ mod tests {
                 stopped: None,
                 hints: &self.hints,
                 block_caret: false,
+                revision: self.revision,
             };
             let mut output = None;
             let _ = self.ctx.run_ui(input, |ui| {
@@ -1577,7 +1608,12 @@ mod tests {
                     &mut |_| {},
                 ));
             });
-            output.expect("the editor ran")
+            let output = output.expect("the editor ran");
+            if output.changed {
+                self.revision += 1;
+                self.bytes = self.text.len();
+            }
+            output
         }
 
         fn key(&mut self, key: Key, modifiers: Modifiers) -> Output {
@@ -1817,6 +1853,54 @@ mod tests {
         let mut text = "abc\nd\n".to_owned();
         assert_eq!(write_over(&mut text, &[2..3, 5..5], "--"), [4, 8]);
         assert_eq!(text, "ab--\nd--\n");
+    }
+
+    /// What a key costs in a big file, through the whole editor. `cargo test --release -p
+    /// godcode typing_in_a_big -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measure, not a check"]
+    fn typing_in_a_big_file_is_measured() {
+        let line = "a line of plain text, as long as the lines of a log often are, or so\n";
+        for megabytes in [2, 10, 50] {
+            let text = line.repeat(megabytes * 1024 * 1024 / line.len());
+            let mut harness = Harness::of("big.txt", &text, false);
+            set_selection(&harness.ctx, editor_id(), &(0..0));
+            harness.frame(Vec::new());
+            let start = std::time::Instant::now();
+            harness.frame(vec![Event::Text("x".to_owned())]);
+            let key = start.elapsed();
+            let start = std::time::Instant::now();
+            harness.frame(Vec::new());
+            let after = start.elapsed();
+            harness.time += 5.0;
+            harness.frame(Vec::new());
+            let start = std::time::Instant::now();
+            harness.frame(Vec::new());
+            let rest = start.elapsed();
+            println!(
+                "{megabytes} MB  a key: {key:?}, the frame after: {after:?}, at rest: {rest:?}"
+            );
+            assert!(harness.text.starts_with("xa line"));
+        }
+    }
+
+    #[test]
+    fn a_text_changed_from_outside_is_read_again() {
+        let mut harness = Harness::new("one\ntwo\n");
+        harness.type_text("X");
+        // Same size, same revision: nothing tells the field. The app always bumps it.
+        harness.text = "fn a() {\n    b();\n}\n".to_owned();
+        harness.frame(Vec::new());
+        let layout = harness.view.layout.as_ref().expect("read");
+        assert_eq!(layout.starts.len() - 1, 4, "the new text was read through");
+        // Undo comes back through the history, which was fed while the text changed.
+        let mut harness = Harness::new("");
+        harness.type_text("first");
+        harness.time += 5.0;
+        harness.frame(Vec::new());
+        harness.type_text(" second");
+        harness.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(harness.text, "first");
     }
 
     #[test]
