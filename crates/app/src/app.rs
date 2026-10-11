@@ -168,6 +168,7 @@ enum Cmd {
     Zen,
     SaveLayout,
     Layouts,
+    Tongue,
     EnvFile,
     Docker,
     CaretAbove,
@@ -568,6 +569,7 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::Zen, icon::EYE, "Toggle Zen Mode", "Ctrl+Alt+Z"),
     spec(Cmd::SaveLayout, icon::ROWS, "Save Layout…", ""),
     spec(Cmd::Layouts, icon::ROWS, "Layout…", ""),
+    spec(Cmd::Tongue, icon::GLOBE, "Interface Language", ""),
     spec(Cmd::EnvFile, icon::ROWS, "Choose .env File…", ""),
     spec(Cmd::Docker, icon::ROWS, "Docker…", ""),
     spec(
@@ -770,6 +772,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Zen),
             Some(Cmd::Layouts),
             Some(Cmd::SaveLayout),
+            Some(Cmd::Tongue),
             Some(Cmd::Themes),
             Some(Cmd::Font),
             Some(Cmd::FontReset),
@@ -895,6 +898,13 @@ const EDITOR_MENU: &[Option<Cmd>] = &[
     None,
     Some(Cmd::Run),
 ];
+
+/// Whether the name of a command holds `wanted` (in small letters): its English name, or
+/// the one it shows under in the language of the interface.
+fn named_like(spec: &Spec, wanted: &str) -> bool {
+    let holds = |name: &str| name.to_lowercase().contains(wanted);
+    holds(spec.label) || holds(crate::lang::tr(spec.label))
+}
 
 fn spec_of(cmd: Cmd) -> Option<&'static Spec> {
     COMMANDS.iter().find(|spec| spec.cmd == cmd)
@@ -1651,6 +1661,8 @@ impl GodApp {
                 zoom.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
             });
         // The scheme last chosen; before there were schemes, dark or light.
+        let tongue = get("tongue").and_then(|code| crate::lang::Tongue::of_code(&code));
+        crate::lang::set(tongue.unwrap_or_default());
         // A theme of the user that cannot be read is told when its file is next saved.
         let _ = load_themes();
         let named = get("scheme_name").and_then(|name| theme::scheme_index(&name));
@@ -2686,7 +2698,11 @@ impl GodApp {
         let mut open = None;
         ui.horizontal(|ui| {
             ui.add_space(10.0);
-            ui.label(RichText::new("SOURCE CONTROL").size(12.0).strong());
+            ui.label(
+                RichText::new(crate::lang::tr("SOURCE CONTROL"))
+                    .size(12.0)
+                    .strong(),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(4.0);
                 refresh =
@@ -6179,6 +6195,14 @@ impl GodApp {
                 self.docker = Some(Docker::default());
                 self.ask_docker(ctx, None);
             }
+            Cmd::Tongue => {
+                // There are two: the other one.
+                let other = crate::lang::Tongue::ALL
+                    .into_iter()
+                    .find(|tongue| *tongue != crate::lang::current());
+                crate::lang::set(other.unwrap_or_default());
+                self.toasts.success(crate::lang::current().name());
+            }
             Cmd::SaveLayout => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Layout,
@@ -6703,7 +6727,7 @@ impl GodApp {
     fn menu_bar(&self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
         egui::MenuBar::new().ui(ui, |ui| {
             for (title, items) in MENUS {
-                ui.menu_button(*title, |ui| {
+                ui.menu_button(crate::lang::tr(title), |ui| {
                     ui.set_min_width(260.0);
                     menu_items(ui, clicked, items);
                 });
@@ -7205,16 +7229,20 @@ impl GodApp {
         };
         let palette = Palette::of(ui);
         let problems = self.problems();
+        let tr = crate::lang::tr;
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             let views = [
-                (Bottom::Problems, format!("PROBLEMS  {}", problems.len())),
+                (
+                    Bottom::Problems,
+                    format!("{}  {}", tr("PROBLEMS"), problems.len()),
+                ),
                 (Bottom::Todo, format!("TODO  {}", self.todos.len())),
-                (Bottom::Response, "RESPONSE".to_owned()),
-                (Bottom::Debug, "DEBUG".to_owned()),
+                (Bottom::Response, tr("RESPONSE").to_owned()),
+                (Bottom::Debug, tr("DEBUG").to_owned()),
                 (Bottom::Tests, format!("TESTS  {}", self.tests.1.len())),
                 (Bottom::Terminal, "TERMINAL".to_owned()),
-                (Bottom::Assistant, "ASSISTANT".to_owned()),
+                (Bottom::Assistant, tr("ASSISTANT").to_owned()),
             ];
             for (view, title) in views {
                 let active = view == shown;
@@ -8005,7 +8033,7 @@ impl GodApp {
             let wanted = wanted.trim().to_lowercase();
             return COMMANDS
                 .iter()
-                .filter(|spec| spec.label.to_lowercase().contains(&wanted))
+                .filter(|spec| named_like(spec, &wanted))
                 .map(Pick::Command)
                 .collect();
         }
@@ -8049,9 +8077,7 @@ impl GodApp {
         picks.extend(files.map(|(_, path)| Pick::File(path.clone())));
         if !query.is_empty() {
             let wanted = query.to_lowercase();
-            let commands = COMMANDS
-                .iter()
-                .filter(|spec| spec.label.to_lowercase().contains(&wanted));
+            let commands = COMMANDS.iter().filter(|spec| named_like(spec, &wanted));
             picks.extend(commands.take(MAX_EXTRA_PICKS).map(Pick::Command));
             let symbols = self
                 .symbols
@@ -8145,7 +8171,7 @@ impl GodApp {
                             )
                         }
                         Pick::Command(spec) => (
-                            with_icon(spec.glyph, spec.label).into(),
+                            with_icon(spec.glyph, crate::lang::tr(spec.label)).into(),
                             spec.shortcut.to_owned(),
                         ),
                         Pick::Place(named) => {
@@ -8710,6 +8736,7 @@ impl eframe::App for GodApp {
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
         storage.set_string("layouts", layouts_text(&self.layouts));
+        storage.set_string("tongue", crate::lang::current().code().to_owned());
         storage.set_string("assistant_provider", self.chat.provider.name().to_owned());
         storage.set_string("assistant_model", self.chat.model.clone());
         storage.set_string("env_file", self.env_file.clone().unwrap_or_default());
@@ -9228,7 +9255,7 @@ fn menu_items(ui: &mut Ui, clicked: &mut Vec<Cmd>, items: &[Option<Cmd>]) {
     for item in items {
         match item.and_then(spec_of) {
             Some(spec) => {
-                let label = with_icon(spec.glyph, spec.label);
+                let label = with_icon(spec.glyph, crate::lang::tr(spec.label));
                 let button = Button::new(label).shortcut_text(spec.shortcut);
                 if ui.add(button).clicked() {
                     clicked.push(spec.cmd);
