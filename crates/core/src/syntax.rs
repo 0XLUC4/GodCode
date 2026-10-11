@@ -1683,6 +1683,77 @@ impl Spans {
 }
 
 /// Colour `text`: spans in order, covering it entirely.
+/// The colours written in a line of a style sheet or of a page: where each is, in chars,
+/// and what it is, as red, green, blue and opacity. `#rgb`, `#rrggbb`, with or without
+/// opacity, and `rgb(…)` / `rgba(…)` with numbers.
+pub fn colours(line: &str) -> Vec<(std::ops::Range<usize>, [u8; 4])> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let rest: String = chars[at..].iter().take(40).collect();
+        let named = at > 0 && (chars[at - 1].is_alphanumeric() || chars[at - 1] == '_');
+        let read = match chars[at] {
+            '#' if !named => hexadecimal(&rest),
+            'r' if !named => in_numbers(&rest),
+            _ => None,
+        };
+        match read {
+            Some((length, colour)) => {
+                found.push((at..at + length, colour));
+                at += length;
+            }
+            None => at += 1,
+        }
+    }
+    found
+}
+
+/// A colour in hexadecimal at the start of `text`, and the chars it takes.
+fn hexadecimal(text: &str) -> Option<(usize, [u8; 4])> {
+    let digits: Vec<u32> = text[1..].chars().map_while(|ch| ch.to_digit(16)).collect();
+    let pair = |at: usize| (digits[at] * 16 + digits[at + 1]) as u8;
+    let one = |at: usize| (digits[at] * 17) as u8;
+    let colour = match digits.len() {
+        3 => [one(0), one(1), one(2), 255],
+        4 => [one(0), one(1), one(2), one(3)],
+        6 => [pair(0), pair(2), pair(4), 255],
+        8 => [pair(0), pair(2), pair(4), pair(6)],
+        _ => return None,
+    };
+    Some((digits.len() + 1, colour))
+}
+
+/// A colour as `rgb(…)` or `rgba(…)` at the start of `text`, and the chars it takes.
+fn in_numbers(text: &str) -> Option<(usize, [u8; 4])> {
+    let inside = text.strip_prefix("rgba(").or(text.strip_prefix("rgb("))?;
+    let (inside, _) = inside.split_once(')')?;
+    let parts: Vec<&str> = inside
+        .split([',', ' ', '/'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let channel = |part: &str| {
+        part.parse::<f32>()
+            .ok()
+            .map(|value| value.clamp(0.0, 255.0) as u8)
+    };
+    let opacity = match parts.get(3) {
+        Some(part) => match part.strip_suffix('%') {
+            Some(percent) => percent.parse::<f32>().ok()? / 100.0,
+            None => part.parse::<f32>().ok()?,
+        },
+        None => 1.0,
+    };
+    let colour = [
+        channel(parts.first()?)?,
+        channel(parts.get(1)?)?,
+        channel(parts.get(2)?)?,
+        (opacity.clamp(0.0, 1.0) * 255.0) as u8,
+    ];
+    let length = text.chars().take_while(|ch| *ch != ')').count() + 1;
+    (parts.len() == 3 || parts.len() == 4).then_some((length, colour))
+}
+
 pub fn highlight(text: &str, language: &Language) -> Vec<Span> {
     let mut spans = Spans(Vec::new());
     match language.family {
@@ -1970,6 +2041,20 @@ fn markdown(text: &str, spans: &mut Spans) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_colours_of_a_line_are_found() {
+        let line = "a { color: #fff; background: #3498DB80; border: 1px solid rgb(10, 20, 300) }";
+        let found = colours(line);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0], (11..15, [255, 255, 255, 255]));
+        assert_eq!(found[1], (29..38, [0x34, 0x98, 0xDB, 0x80]));
+        assert_eq!(found[2].1, [10, 20, 255, 255]);
+        assert_eq!(&line[found[2].0.clone()], "rgb(10, 20, 300)");
+        assert_eq!(colours("rgba(0 0 0 / 50%)")[0].1, [0, 0, 0, 127]);
+        // An id, a word, a number of digits that makes no colour: none.
+        assert!(colours("#header { margin: 0 } grgb(1,2,3) #12 #12345 x#fff").is_empty());
+    }
 
     /// The text of every non-plain span, with its kind.
     fn tokens<'a>(text: &'a str, file: &str) -> Vec<(&'a str, Token)> {

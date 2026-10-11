@@ -1312,6 +1312,35 @@ pub fn show(
                     palette.text_dim.gamma_multiply(0.75),
                 );
             }
+            // A colour written in a page or a style sheet is underlined with itself.
+            let coloured = config.language.is_markup()
+                || matches!(config.language.name, "CSS" | "JavaScript" | "TypeScript");
+            if coloured && text.len() <= LARGE_BYTES {
+                let (above, below) = (clip.min.y - origin.y - row_height, clip.max.y - origin.y);
+                for (line, _) in geometry.between(above, below) {
+                    let starts = &geometry.index().starts;
+                    let written = text.get(starts[line]..starts[line + 1] - 1).unwrap_or("");
+                    // Most lines name none: they are not read char by char.
+                    if !written.contains('#') && !written.contains("rgb") {
+                        continue;
+                    }
+                    let first = geometry.index().start_of(line);
+                    for (chars, [red, green, blue, opacity]) in syntax::colours(written) {
+                        let from = geometry.pos(first + chars.start).translate(origin);
+                        let to = geometry.pos(first + chars.end).translate(origin);
+                        // Cut by the end of a row, it is told on its first row.
+                        if to.min.y > from.min.y {
+                            continue;
+                        }
+                        let bar = Rect::from_min_max(
+                            pos2(from.min.x, from.max.y - 3.0),
+                            pos2(to.min.x, from.max.y),
+                        );
+                        let ink = Color32::from_rgba_unmultiplied(red, green, blue, opacity);
+                        ui.painter().rect_filled(bar, 1.0, ink);
+                    }
+                }
+            }
             for caret in &view.extra {
                 let cell = geometry.pos(*caret).translate(origin);
                 let bar = Rect::from_min_size(cell.min, vec2(1.5, cell.height()));
