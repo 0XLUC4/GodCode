@@ -891,6 +891,12 @@ impl History {
         self.step(text, false)
     }
 
+    /// What changes next is not made in one go with what changed last, however close in
+    /// time the two are.
+    fn apart(&mut self) {
+        self.group += 1;
+    }
+
     fn step(&mut self, text: &mut String, back: bool) -> Option<CCursorRange> {
         let (from, to) = match back {
             true => (&mut self.undos, &mut self.redos),
@@ -1275,12 +1281,97 @@ fn word_stop(text: &str, index: usize, forward: bool) -> usize {
 }
 
 /// The word around `index`: what a double click selects.
-fn word_at(text: &str, index: usize) -> Range<usize> {
+pub(crate) fn word_at(text: &str, index: usize) -> Range<usize> {
     let wordy = |ch: char| ch.is_alphanumeric() || ch == '_';
     let at = byte(text, index);
     let after = text[at..].chars().take_while(|ch| wordy(*ch)).count();
     let before = text[..at].chars().rev().take_while(|ch| wordy(*ch)).count();
     index - before..index + after
+}
+
+/// The white space `line` starts with.
+fn lead_of(line: &str) -> &str {
+    &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
+}
+
+/// What was last copied from a field: pasted back, it is known where it comes from.
+#[derive(Clone)]
+struct Copied {
+    text: String,
+    /// The white space that led its first line, up to where it starts.
+    lead: String,
+    /// It is the whole line of a caret that had nothing selected.
+    line: bool,
+}
+
+fn copied_id() -> Id {
+    Id::new("field-copied")
+}
+
+/// Put `copied` in the clipboard, and keep what is known of it for when it is pasted.
+fn copy(ui: &Ui, copied: Copied) {
+    ui.ctx().copy_text(copied.text.clone());
+    let copied = Copied {
+        text: copied.text.replace("\r\n", "\n"),
+        ..copied
+    };
+    ui.data_mut(|data| data.insert_temp(copied_id(), copied));
+}
+
+/// The white space leading the last line of `lines` that is not blank, when that line
+/// closes a bracket: a block copied from its first letter was indented as the line that
+/// ends it.
+fn closing_lead(lines: &str) -> Option<&str> {
+    let last = lines.rsplit('\n').find(|line| !line.trim().is_empty())?;
+    let lead = lead_of(last);
+    last[lead.len()..]
+        .starts_with(['}', ')', ']'])
+        .then_some(lead)
+}
+
+/// What pasting `written` at `caret` writes, and over what; then how many chars after it
+/// the caret ends. A whole line (`copied` as one here, or from elsewhere with its line
+/// end) goes above the line of a caret with nothing selected, and the caret stays where it
+/// is. The lines of a block take the indentation of the line pasted on, keeping what they
+/// had more than their first line: known for what was `copied` here, for a block that
+/// starts with its white space, and for one whose last line closes a bracket. Any other
+/// is written as it is.
+fn pasted(
+    text: &str,
+    caret: Caret,
+    written: &str,
+    copied: Option<&Copied>,
+) -> (Caret, String, usize) {
+    let chars = caret.sorted();
+    let at = byte(text, chars.start);
+    let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+    let whole = copied.map_or(written.ends_with('\n'), |copied| copied.line);
+    if whole && chars.is_empty() {
+        let column = text[line..at].chars().count();
+        return (Caret::at(chars.start - column), written.to_owned(), column);
+    }
+    let lead = lead_of(&text[line..at]);
+    let based = written.split_once('\n').and_then(|(first, rest)| {
+        let base = match copied {
+            Some(copied) => Some(copied.lead.as_str()),
+            None if first.starts_with([' ', '\t']) => Some(""),
+            None => closing_lead(rest),
+        };
+        let base = base.filter(|base| *base != lead)?;
+        let mut based = first.to_owned();
+        for line in rest.split('\n') {
+            based.push('\n');
+            if line.trim().is_empty() {
+                based.push_str(line);
+                continue;
+            }
+            let own = line.strip_prefix(base);
+            based.push_str(lead);
+            based.push_str(own.unwrap_or_else(|| line.trim_start_matches([' ', '\t'])));
+        }
+        Some(based)
+    });
+    (caret, based.unwrap_or_else(|| written.to_owned()), 0)
 }
 
 /// Write `written` over the selection. Returns the caret after it.
@@ -1310,9 +1401,16 @@ fn typed(
     for event in events {
         let len = pen.len(text);
         match event {
-            Event::Text(written) | Event::Paste(written) => {
+            Event::Text(written) => {
                 let written = written.replace("\r\n", "\n");
                 caret = pen.write(text, caret, &written);
+            }
+            Event::Paste(written) => {
+                let written = written.replace("\r\n", "\n");
+                let copied: Option<Copied> = ui.data(|data| data.get_temp(copied_id()));
+                let copied = copied.filter(|copied| copied.text == written);
+                let (over, written, after) = pasted(text, caret, &written, copied.as_ref());
+                caret = Caret::at(pen.write(text, over, &written).head + after);
             }
             Event::Ime(egui::ImeEvent::Commit(written)) => {
                 caret = pen.write(text, caret, &written);
@@ -1330,7 +1428,13 @@ fn typed(
                 let chars = caret.sorted();
                 if !chars.is_empty() {
                     let bytes = byte(text, chars.start)..byte(text, chars.end);
-                    ui.ctx().copy_text(text[bytes].to_owned());
+                    let line = text[..bytes.start].rfind('\n').map_or(0, |found| found + 1);
+                    let copied = Copied {
+                        lead: lead_of(&text[line..bytes.start]).to_owned(),
+                        text: text[bytes].to_owned(),
+                        line: false,
+                    };
+                    copy(ui, copied);
                     if event == Event::Cut {
                         caret = pen.write(text, caret, "");
                     }
@@ -1346,7 +1450,12 @@ fn typed(
                 if !line.ends_with('\n') {
                     line.push('\n');
                 }
-                ui.ctx().copy_text(line);
+                let copied = Copied {
+                    text: line,
+                    lead: String::new(),
+                    line: true,
+                };
+                copy(ui, copied);
                 if event == Event::Cut {
                     // The last line has no end of its own: the one before it goes with it.
                     let last = end == text.len() && !text[start..end].ends_with('\n');
@@ -1442,6 +1551,17 @@ fn typed(
     (caret, pen.steps)
 }
 
+/// The keys that are the field's and not a way to another widget: the arrows and Tab, and
+/// with `escape` the key that otherwise takes the keyboard away from it.
+pub fn own_keys(escape: bool) -> EventFilter {
+    EventFilter {
+        tab: true,
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        escape,
+    }
+}
+
 /// Show `text` over the rest of `ui`, which is expected to scroll. `cache` holds what was
 /// worked out of the text the last time.
 pub fn show(
@@ -1501,14 +1621,7 @@ pub fn show(
     let mut own = Vec::new();
     let mut wanted = None;
     if focused && let Some(old) = caret {
-        // The arrows and Tab are the field's, not a way to another widget.
-        let filter = EventFilter {
-            tab: true,
-            horizontal_arrows: true,
-            vertical_arrows: true,
-            escape: false,
-        };
-        ui.memory_mut(|memory| memory.set_focus_lock_filter(id, filter));
+        ui.memory_mut(|memory| memory.set_focus_lock_filter(id, own_keys(false)));
         let (undo, redo) = ui.input_mut(|input| {
             let shifted = Modifiers::COMMAND | Modifiers::SHIFT;
             let redo =
@@ -1532,7 +1645,19 @@ pub fn show(
     // The history is told what changed, here or elsewhere; then it is asked to step.
     let time = ui.input(|input| input.time);
     let history = &mut cache.history;
+    // A paste is taken back alone, not with what was typed around it.
+    let pasted = !own.is_empty()
+        && ui.input(|input| {
+            let mut events = input.events.iter();
+            events.any(|event| matches!(event, Event::Paste(_)))
+        });
+    if pasted {
+        history.apart();
+    }
     let mut change = history.see(text, caret.map(Caret::range), time, own, known.is_none());
+    if pasted {
+        history.apart();
+    }
     let stepped = wanted.and_then(|back| match back {
         true => history.undo(text),
         false => history.redo(text),

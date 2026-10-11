@@ -31,7 +31,9 @@ pub const LARGE_BYTES: usize = 2 * 1024 * 1024;
 const GUTTER_PAD: f32 = 14.0;
 /// Completions shown at once; the list slides to keep the chosen one in view.
 const POPUP_ROWS: usize = 8;
-const POPUP_ROW: egui::Vec2 = vec2(300.0, 22.0);
+const POPUP_ROW: egui::Vec2 = vec2(400.0, 22.0);
+/// What the frame of the list adds around its rows, on each side.
+const POPUP_EDGE: f32 = 5.0;
 pub const ERROR_COLOR: Color32 = Color32::from_rgb(0xF1, 0x4C, 0x4C);
 pub const WARNING_COLOR: Color32 = Color32::from_rgb(0xCC, 0xA7, 0x00);
 /// Columns a tab takes when lines are measured for the indent guides.
@@ -163,6 +165,7 @@ impl View {
             selected: 0,
             caret,
             navigated: false,
+            typed: None,
         });
     }
 
@@ -183,11 +186,7 @@ pub(crate) fn indents_of(text: &str) -> Vec<Option<usize>> {
     text.split('\n')
         .map(|line| {
             let lead = line.len() - line.trim_start_matches([' ', '\t']).len();
-            let columns = line[..lead]
-                .bytes()
-                .map(|byte| if byte == b'\t' { TAB_COLUMNS } else { 1 })
-                .sum();
-            (lead < line.len()).then_some(columns)
+            (lead < line.len()).then(|| columns_of(&line[..lead]))
         })
         .collect()
 }
@@ -200,6 +199,8 @@ struct Popup {
     caret: usize,
     /// The arrows were used: Enter then picks instead of breaking the line.
     navigated: bool,
+    /// The start of a word that the list completes, once it was read from the text.
+    typed: Option<String>,
 }
 
 pub struct Output {
@@ -358,15 +359,80 @@ fn is_prose(language: &Language) -> bool {
     matches!(language.name, "Plain Text" | "Markdown")
 }
 
-/// Typing a bracket or a quote adds its partner; typing the partner steps over it.
+/// The char that closes what `opener` opens: a bracket, or a quote, which closes itself.
+fn closer_of(opener: char) -> Option<char> {
+    Some(match opener {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '"' | '\'' | '`' => opener,
+        _ => return None,
+    })
+}
+
+/// Whether `quote` opens a string in `language`, as its colours tell. Not `'` in Rust,
+/// where it starts a lifetime as often as a char.
+fn opens_string(quote: char, language: &Language) -> bool {
+    if quote == '\'' && language.name == "Rust" {
+        return false;
+    }
+    let probe = format!("{quote}x{quote}");
+    let spans = syntax::highlight(&probe, language);
+    matches!(spans.first(), Some(span) if span.token == syntax::Token::String)
+}
+
+/// What typing `'` or `` ` ``, or in markup the `>` that ends a tag, does at `caret`: it
+/// steps over the same char when that one is next, as [`paired`] does for the brackets
+/// and `"`, whoever wrote it; and a quote that opens a string comes with the one that
+/// closes it. Returns the caret after it and whether the text changed; `None` when the
+/// char is to be typed as any other.
+fn quoted(
+    text: &mut String,
+    caret: usize,
+    typed: char,
+    config: &Config<'_>,
+) -> Option<(usize, bool)> {
+    let tag = typed == '>' && config.language.is_markup();
+    if !tag && !matches!(typed, '\'' | '`') {
+        return None;
+    }
+    let at = godcode_core::byte_index(text, caret);
+    let after = text[at..].chars().next();
+    if after == Some(typed) {
+        return Some((caret + 1, false));
+    }
+    if tag || !opens_string(typed, config.language) {
+        return None;
+    }
+    // After a word, a quote or a backslash it closes, escapes or is an apostrophe.
+    let before = text[..at].chars().next_back();
+    let opens = after.is_none_or(|ch| ch.is_whitespace() || ")]},;".contains(ch))
+        && !before.is_some_and(|ch| ch.is_alphanumeric() || "_\"'`\\".contains(ch));
+    if !opens {
+        return None;
+    }
+    text.insert_str(at, &format!("{typed}{typed}"));
+    Some((caret + 1, true))
+}
+
+/// A bracket or a quote typed with text selected goes around it instead of over it.
+/// Returns the selection, which is still what it was; `None` for any other char.
+fn surrounded(text: &mut String, selection: &Range<usize>, typed: char) -> Option<Range<usize>> {
+    let closer = closer_of(typed)?;
+    let start = godcode_core::byte_index(text, selection.start);
+    let end = start + godcode_core::byte_index(&text[start..], selection.len());
+    text.insert(end, closer);
+    text.insert(start, typed);
+    Some(selection.start + 1..selection.end + 1)
+}
+
+/// Typing a bracket or a quote adds its partner, or puts the selection between the two;
+/// typing the partner steps over it.
 fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
     if is_prose(config.language) {
         return false;
     }
-    let Some(caret) = selection_of(ui.ctx(), id)
-        .filter(Range::is_empty)
-        .map(|selection| selection.start)
-    else {
+    let Some(selection) = selection_of(ui.ctx(), id) else {
         return false;
     };
     let typed = ui.input(|input| {
@@ -378,7 +444,15 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
     let Some(typed) = typed else {
         return false;
     };
-    let Some((caret, changed)) = paired(text, caret, typed, config) else {
+    let done = if selection.is_empty() {
+        let caret = selection.start;
+        quoted(text, caret, typed, config)
+            .or_else(|| paired(text, caret, typed, config))
+            .map(|(caret, changed)| (caret..caret, changed))
+    } else {
+        surrounded(text, &selection, typed).map(|shown| (shown, true))
+    };
+    let Some((shown, changed)) = done else {
         return false;
     };
     // The char is dealt with: the text field is not to type it too.
@@ -388,8 +462,216 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
             .events
             .retain(|event| !matches!(event, Event::Text(text) if *text == taken));
     });
-    set_selection(ui.ctx(), id, &(caret..caret));
+    set_selection(ui.ctx(), id, &shown);
     changed
+}
+
+/// The columns the white space `space` takes.
+fn columns_of(space: &str) -> usize {
+    let columns = |byte| if byte == b'\t' { TAB_COLUMNS } else { 1 };
+    space.bytes().map(columns).sum()
+}
+
+/// What Backspace does at `caret` when it takes more than a char: between a bracket or a
+/// quote and the one that closes it, both go; in the white space that leads a line, the
+/// caret goes back to the tab stop before it. Returns the caret after it; `None` when one
+/// char is to go, as anywhere.
+fn erased(text: &mut String, caret: usize, config: &Config<'_>) -> Option<usize> {
+    let at = godcode_core::byte_index(text, caret);
+    let before = text[..at].chars().next_back()?;
+    let after = text[at..].chars().next();
+    let tag = before == '<' && config.language.is_markup();
+    let closer = if tag { Some('>') } else { closer_of(before) };
+    if closer.is_some() && closer == after && !is_prose(config.language) {
+        // Brackets and quotes take one byte each.
+        text.replace_range(at - 1..at + 1, "");
+        return Some(caret - 1);
+    }
+    let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+    let lead = &text[line..at];
+    if !lead.chars().all(|ch| ch == ' ' || ch == '\t') {
+        return None;
+    }
+    let width = columns_of(config.indent).max(1);
+    let past = match columns_of(lead) % width {
+        0 => width,
+        past => past,
+    };
+    let spaces = lead.len() - lead.trim_end_matches(' ').len();
+    let gone = past.min(spaces);
+    if gone < 2 {
+        return None;
+    }
+    text.replace_range(at - gone..at, "");
+    Some(caret - gone)
+}
+
+/// What Tab writes with the caret in the white space that leads a line, between two tab
+/// stops: the spaces it takes to reach the next one. Returns the caret after it; `None`
+/// when a whole level is to be written, as anywhere.
+fn tab_stop(text: &mut String, caret: usize, config: &Config<'_>) -> Option<usize> {
+    if config.indent.contains('\t') {
+        return None;
+    }
+    let at = godcode_core::byte_index(text, caret);
+    let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+    let lead = &text[line..at];
+    if !lead.chars().all(|ch| ch == ' ' || ch == '\t') {
+        return None;
+    }
+    let width = config.indent.len().max(1);
+    let past = columns_of(lead) % width;
+    if past == 0 {
+        return None;
+    }
+    text.insert_str(at, &" ".repeat(width - past));
+    Some(caret + width - past)
+}
+
+/// The markers of the comments that document code in `language`.
+fn doc_markers(language: &Language) -> &'static [&'static str] {
+    match (language.name, language.line_comment()) {
+        ("R", _) => &["#'"],
+        ("Nim" | "GDScript", _) => &["##"],
+        ("Lua", _) => &["---"],
+        (_, Some("//")) => &["///", "//!"],
+        _ => &[],
+    }
+}
+
+/// The marker the comment `code` starts with, when the line after it is to start with it
+/// too: the one of a doc comment, always; the one of a plain comment only when `rest`,
+/// what follows the caret, has text that would not be a comment without it.
+fn comment_marker(code: &str, rest: &str, language: &Language) -> Option<&'static str> {
+    let plain = language.line_comment()?;
+    // A row of the last char of a marker is a rule drawn across the file, not a comment.
+    let documents = |marker: &&&str| {
+        let text = code.strip_prefix(**marker);
+        text.is_some_and(|text| !text.starts_with(&marker[marker.len() - 1..]))
+    };
+    let doc = doc_markers(language).iter().find(documents).copied();
+    doc.or_else(|| (code.starts_with(plain) && !rest.trim().is_empty()).then_some(plain))
+}
+
+/// Whether the line after `above` goes on a `/* … */` comment whose lines start with a
+/// star: read up from it, no further than where that comment opens.
+fn in_block_comment(above: &str) -> bool {
+    for line in above.rsplit('\n').skip(1) {
+        let line = line.trim_start();
+        if line.contains("*/") {
+            return false;
+        }
+        if line.starts_with("/*") {
+            return true;
+        }
+        if !line.starts_with('*') {
+            return false;
+        }
+    }
+    false
+}
+
+/// What Enter does at `caret` when it is not only a line broken as code is: a line of
+/// white space alone is left empty, and a comment goes on on the next line (a doc comment,
+/// a plain one cut in two, a `/* … */` one with a star). Returns the caret after it;
+/// `None` when the line is to be broken as anywhere.
+fn continued(text: &mut String, caret: usize, config: &Config<'_>) -> Option<usize> {
+    let at = godcode_core::byte_index(text, caret);
+    let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |found| at + found);
+    let (before, rest) = (&text[line..at], &text[at..end]);
+    let blank = |part: &str| part.chars().all(|ch| ch == ' ' || ch == '\t');
+    if end > line && blank(before) && blank(rest) {
+        // The white space goes down with the caret: the line left has none.
+        text.insert(line, '\n');
+        return Some(caret + 1);
+    }
+    let code = before.trim_start_matches([' ', '\t']);
+    let lead = &before[..before.len() - code.len()];
+    // The white space after the caret is not taken along: the marker brings its own.
+    let spaces = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let closes = rest[spaces..].starts_with("*/");
+    let open = !code.contains("*/");
+    let (written, below) = if open && code.starts_with("/*") && !is_prose(config.language) {
+        // Between the two ends of a comment, what closes it goes on its own line.
+        let below = if closes {
+            format!("\n{lead} ")
+        } else {
+            String::new()
+        };
+        (format!("\n{lead} * "), below)
+    } else if open && code.starts_with('*') && in_block_comment(&text[..line]) {
+        let star = if closes { "" } else { "* " };
+        (format!("\n{lead}{star}"), String::new())
+    } else {
+        let marker = comment_marker(code, rest, config.language)?;
+        (format!("\n{lead}{marker} "), String::new())
+    };
+    let caret = caret + written.chars().count();
+    text.replace_range(at..at + spaces, &format!("{written}{below}"));
+    Some(caret)
+}
+
+/// Enter at the selection of the editor `id`: see [`continued`], or else [`edit::newline`].
+/// Returns whether the text changed.
+fn break_line(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>) -> bool {
+    let caret = selection_of(ctx, id).filter(Range::is_empty);
+    let Some(caret) = caret.and_then(|caret| continued(text, caret.start, config)) else {
+        return run(ctx, id, text, config, Op::Newline);
+    };
+    set_selection(ctx, id, &(caret..caret));
+    true
+}
+
+/// Open a line under the line of the caret, or `above` it, without breaking that line:
+/// the new one is indented as Enter at the end of the line before it would. Returns
+/// whether the text changed.
+fn open_line(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>, above: bool) -> bool {
+    let Some(selection) = selection_of(ctx, id) else {
+        return false;
+    };
+    let caret = if above {
+        selection.start
+    } else {
+        selection.end
+    };
+    let at = godcode_core::byte_index(text, caret);
+    let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |found| at + found);
+    let column = text[line..at].chars().count();
+    let from = match (above, line) {
+        (false, _) => caret + text[at..end].chars().count(),
+        // Above the first line there is no line to break: one is written, indented alike.
+        (true, 0) => {
+            let lead = text.len() - text.trim_start_matches([' ', '\t']).len();
+            text.insert_str(0, &format!("{}\n", &text[..lead]));
+            set_selection(ctx, id, &(lead..lead));
+            return true;
+        }
+        (true, _) => caret - column - 1,
+    };
+    set_selection(ctx, id, &(from..from));
+    break_line(ctx, id, text, config)
+}
+
+/// Select the word the caret is in or by, when nothing is selected.
+fn select_word(ctx: &Context, id: Id, text: &str) {
+    let Some(caret) = selection_of(ctx, id).filter(Range::is_empty) else {
+        return;
+    };
+    let word = field::word_at(text, caret.start);
+    if !word.is_empty() {
+        set_selection(ctx, id, &word);
+    }
+}
+
+/// `key` was pressed alone, with no modifier held.
+fn struck(ui: &Ui, key: Key) -> bool {
+    let alone = |event: &Event| {
+        matches!(event, Event::Key { key: pressed, pressed: true, modifiers, .. }
+            if *pressed == key && modifiers.is_none())
+    };
+    ui.input(|input| input.events.iter().any(alone))
 }
 
 /// What typing `typed` at `caret` does when the char is one that code is helped with: a
@@ -883,6 +1165,12 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
         } else if pressed(Modifiers::NONE, Key::ArrowUp) {
             popup.selected = (popup.selected + popup.items.len() - 1) % popup.items.len();
             popup.navigated = true;
+        } else if pressed(Modifiers::NONE, Key::PageDown) {
+            popup.selected = (popup.selected + POPUP_ROWS).min(popup.items.len() - 1);
+            popup.navigated = true;
+        } else if pressed(Modifiers::NONE, Key::PageUp) {
+            popup.selected = popup.selected.saturating_sub(POPUP_ROWS);
+            popup.navigated = true;
         } else if pressed(Modifiers::NONE, Key::Tab)
             || (popup.navigated && pressed(Modifiers::NONE, Key::Enter))
         {
@@ -893,13 +1181,44 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
     if pair(ui, id, text, config) {
         return true;
     }
+    // Not while the keys are commands (Vim): these write.
+    if !config.block_caret {
+        // Shifted first, as below.
+        let above = pressed(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter);
+        if above || pressed(Modifiers::COMMAND, Key::Enter) {
+            view.completion = None;
+            return open_line(ui.ctx(), id, text, config, above);
+        }
+        if pressed(Modifiers::ALT, Key::J) {
+            select_word(ui.ctx(), id, text);
+            return false;
+        }
+    }
+    // Backspace and Tab, where they do more than erase a char or write a level.
+    let caret = selection_of(ui.ctx(), id).filter(Range::is_empty);
+    if let Some(caret) = caret.map(|caret| caret.start) {
+        let moved = if struck(ui, Key::Backspace) {
+            erased(text, caret, config).map(|caret| (Key::Backspace, caret))
+        } else if struck(ui, Key::Tab) {
+            tab_stop(text, caret, config).map(|caret| (Key::Tab, caret))
+        } else {
+            None
+        };
+        if let Some((key, caret)) = moved {
+            pressed(Modifiers::NONE, key);
+            set_selection(ui.ctx(), id, &(caret..caret));
+            view.completion = None;
+            return true;
+        }
+    }
     // Shifted first: a plain pattern also matches the shifted key.
     let op = if pressed(Modifiers::SHIFT, Key::Tab) {
         Op::Outdent
     } else if pressed(Modifiers::NONE, Key::Tab) {
         Op::Indent
     } else if pressed(Modifiers::NONE, Key::Enter) {
-        Op::Newline
+        view.completion = None;
+        return break_line(ui.ctx(), id, text, config);
     } else {
         return false;
     };
@@ -970,6 +1289,7 @@ fn refresh_completion(
             selected: 0,
             caret,
             navigated: false,
+            typed: None,
         });
     } else if view
         .completion
@@ -980,13 +1300,69 @@ fn refresh_completion(
     }
 }
 
-/// Draw the completion list under the caret. Returns the item clicked.
-fn show_completion(ui: &Ui, id: Id, popup: &Popup, at: Pos2, palette: &Palette) -> Option<usize> {
+/// The chars of `label` that the letters `typed` are found at, in order and whatever their
+/// case: its first ones when it starts with them. None when they are not all in it.
+fn matched(label: &str, typed: &str) -> Vec<usize> {
+    let mut wanted = typed.chars().flat_map(char::to_lowercase).peekable();
+    let mut found = Vec::new();
+    for (index, ch) in label.chars().enumerate() {
+        if wanted.peek().is_some() && ch.to_lowercase().next() == wanted.peek().copied() {
+            found.push(index);
+            wanted.next();
+        }
+    }
+    if wanted.peek().is_some() {
+        found.clear();
+    }
+    found
+}
+
+/// What a snippet writes, on one line.
+fn preview(body: &str) -> String {
+    let body = body.replace("$0", "");
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The word being typed that ends at `caret`: what the completions there complete.
+fn typed_word(text: &str, caret: usize, language: &Language) -> String {
+    // In markup and in style sheets a name goes on over its hyphens.
+    let hyphens = language.is_markup() || language.name == "CSS";
+    let named = |ch: &char| ch.is_alphanumeric() || *ch == '_' || (hyphens && *ch == '-');
+    let before = &text[..godcode_core::byte_index(text, caret)];
+    let word: Vec<char> = before.chars().rev().take_while(named).collect();
+    word.into_iter().rev().collect()
+}
+
+/// Where a list of `size` goes for the `caret`, a rectangle on screen: under it, or above
+/// it when it would run off the bottom of `screen`; and never off its sides.
+fn popup_pos(caret: Rect, size: egui::Vec2, screen: Rect) -> Pos2 {
+    let (under, above) = (caret.max.y + 2.0, caret.min.y - 2.0 - size.y);
+    let y = if under + size.y > screen.max.y && above >= screen.min.y {
+        above
+    } else {
+        under
+    };
+    pos2(caret.min.x.min(screen.max.x - size.x).max(screen.min.x), y)
+}
+
+/// Draw the completion list by the `caret`, a rectangle on screen. Returns the item
+/// clicked.
+fn show_completion(
+    ui: &Ui,
+    id: Id,
+    popup: &Popup,
+    caret: Rect,
+    palette: &Palette,
+) -> Option<usize> {
     let mut clicked = None;
     let first = popup.selected.saturating_sub(POPUP_ROWS - 1);
+    let rows = popup.items.len().min(POPUP_ROWS) as f32;
+    let size = vec2(POPUP_ROW.x, POPUP_ROW.y * rows) + egui::Vec2::splat(2.0 * POPUP_EDGE);
+    let typed = popup.typed.as_deref().unwrap_or("");
+    let font = FontId::monospace(13.0);
     Area::new(id.with("completion"))
         .order(Order::Foreground)
-        .fixed_pos(at)
+        .fixed_pos(popup_pos(caret, size, ui.ctx().content_rect()))
         .show(ui.ctx(), |ui| {
             Frame::popup(ui.style())
                 .inner_margin(Margin::same(4))
@@ -1001,26 +1377,51 @@ fn show_completion(ui: &Ui, id: Id, popup: &Popup, at: Pos2, palette: &Palette) 
                         } else if response.hovered() {
                             painter.rect_filled(rect, CornerRadius::same(4), palette.hover);
                         }
-                        painter.text(
-                            pos2(rect.min.x + 8.0, rect.center().y),
-                            Align2::LEFT_CENTER,
-                            &item.label,
-                            FontId::monospace(13.0),
-                            palette.text,
-                        );
                         let kind = match item.kind {
                             Kind::Snippet => "snippet",
                             Kind::Keyword => "keyword",
                             Kind::Word => "word",
                             Kind::Symbol => "symbol",
                         };
-                        painter.text(
+                        let kind = painter.text(
                             pos2(rect.max.x - 8.0, rect.center().y),
                             Align2::RIGHT_CENTER,
                             kind,
                             FontId::proportional(11.0),
                             palette.text_dim,
                         );
+                        // The letters typed stand out in the name they are found in.
+                        let found = matched(&item.label, typed);
+                        let mut job = LayoutJob::default();
+                        for (at, ch) in item.label.chars().enumerate() {
+                            let ink = if found.contains(&at) {
+                                palette.accent_text
+                            } else {
+                                palette.text
+                            };
+                            let format = TextFormat::simple(font.clone(), ink);
+                            job.append(ch.encode_utf8(&mut [0; 4]), 0.0, format);
+                        }
+                        let label = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                        let left = pos2(rect.min.x + 8.0, rect.center().y);
+                        let after = left.x + label.size().x + 12.0;
+                        let top = left - vec2(0.0, label.size().y / 2.0);
+                        painter.galley(top, label, palette.text);
+                        // What a snippet writes, as far as there is room before its kind.
+                        let written = match item.kind {
+                            Kind::Snippet => preview(&item.body),
+                            _ => String::new(),
+                        };
+                        let room = rect.with_min_x(after).with_max_x(kind.min.x - 8.0);
+                        if written != item.label && room.width() > 0.0 {
+                            painter.with_clip_rect(room).text(
+                                pos2(after, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                written,
+                                FontId::monospace(11.5),
+                                palette.text_dim,
+                            );
+                        }
                         if response.clicked() {
                             clicked = Some(index);
                         }
@@ -1106,12 +1507,7 @@ pub fn show(
     let body = full.with_min_x(gutter.max.x).with_max_x(map.min.x);
     ui.painter().rect_filled(full, 0.0, palette.bg);
 
-    let unit_columns = config
-        .indent
-        .bytes()
-        .map(|byte| if byte == b'\t' { TAB_COLUMNS } else { 1 })
-        .sum::<usize>()
-        .max(1);
+    let unit_columns = columns_of(config.indent).max(1);
     let mut child = ui.new_child(UiBuilder::new().max_rect(body));
     let mut scroll = if config.wrap {
         ScrollArea::vertical()
@@ -1448,8 +1844,14 @@ pub fn show(
     ) = scrolled.inner;
 
     refresh_completion(ui, text, config, view, caret_index, typed);
-    let clicked = match (&view.completion, caret_screen) {
-        (Some(popup), Some(at)) => show_completion(ui, id, popup, at + vec2(0.0, 2.0), &palette),
+    let clicked = match (&mut view.completion, caret_screen) {
+        (Some(popup), Some(foot)) => {
+            if popup.typed.is_none() {
+                popup.typed = Some(typed_word(text, popup.caret, config.language));
+            }
+            let caret = Rect::from_min_max(foot - vec2(0.0, row_height), foot);
+            show_completion(ui, id, popup, caret, &palette)
+        }
         _ => None,
     };
     if let Some(index) = clicked {
@@ -1460,6 +1862,11 @@ pub fn show(
         // Written after the field showed: it has not seen it.
         view.index.forget();
         changed = true;
+    }
+    // Escape closes the list, or leaves one caret: it does not take the keyboard away then.
+    let held = view.completion.is_some() || !view.extra.is_empty() || view.block.is_some();
+    if focused && held {
+        ui.memory_mut(|memory| memory.set_focus_lock_filter(id, field::own_keys(true)));
     }
 
     let painter = ui.painter_at(gutter);
@@ -2908,5 +3315,461 @@ mod tests {
             false,
         );
         assert_eq!(harness.text, "first second");
+    }
+
+    /// The editor showing `text` as the file `file`, with `selection` selected.
+    fn editing(file: &'static str, text: &str, selection: Range<usize>) -> Harness {
+        let mut harness = Harness::of(file, text, false);
+        set_selection(&harness.ctx, editor_id(), &selection);
+        harness.frame(Vec::new());
+        harness
+    }
+
+    /// Ctrl+Z, long enough after what was done for it to be a change of its own.
+    fn undo(harness: &mut Harness) {
+        harness.time += 5.0;
+        harness.frame(Vec::new());
+        harness.key(Key::Z, Modifiers::COMMAND);
+    }
+
+    #[test]
+    fn a_closer_typed_where_it_already_is_is_stepped_over() {
+        let mut harness = editing("a.js", "", 0..0);
+        // Each opener comes with its closer, and the closer typed next goes over it.
+        let pairs = [
+            ("(", ")"),
+            ("[", "]"),
+            ("{", "}"),
+            ("\"", "\""),
+            ("'", "'"),
+            ("`", "`"),
+        ];
+        for (opener, closer) in pairs {
+            harness.type_text(opener);
+            harness.type_text(closer);
+        }
+        assert_eq!(harness.text, "()[]{}\"\"''``");
+        assert_eq!(harness.frame(Vec::new()).selection, Some(12..12));
+        // One that was there before, typed by hand, is stepped over just the same.
+        let mut harness = editing("a.js", "f(x)", 3..3);
+        let out = harness.type_text(")");
+        assert_eq!((harness.text.as_str(), out.selection), ("f(x)", Some(4..4)));
+        // An apostrophe in a word opens nothing.
+        let mut harness = editing("a.js", "// don", 6..6);
+        harness.type_text("'");
+        assert_eq!(harness.text, "// don'");
+        // In Rust a `'` may start a lifetime: it comes alone, and is stepped over still.
+        let mut harness = editing("main.rs", "&", 1..1);
+        harness.type_text("'");
+        assert_eq!(harness.text, "&'");
+        let mut harness = editing("main.rs", "'a'", 2..2);
+        let out = harness.type_text("'");
+        assert_eq!((harness.text.as_str(), out.selection), ("'a'", Some(3..3)));
+        // The end of a tag that is already there.
+        let mut harness = editing("index.html", "<a href=\"x\">", 11..11);
+        let out = harness.type_text(">");
+        assert_eq!(harness.text, "<a href=\"x\">");
+        assert_eq!(out.selection, Some(12..12));
+    }
+
+    #[test]
+    fn backspace_between_an_empty_pair_takes_both() {
+        for pair in ["()", "[]", "{}", "\"\"", "''", "``"] {
+            let mut harness = editing("a.js", &format!("a{pair}b"), 2..2);
+            let out = harness.key(Key::Backspace, Modifiers::NONE);
+            assert_eq!((harness.text.as_str(), out.selection), ("ab", Some(1..1)));
+            // In one step to take back.
+            undo(&mut harness);
+            assert_eq!(harness.text, format!("a{pair}b"));
+        }
+        // A pair with something in it loses its opener alone.
+        let mut harness = editing("a.js", "(x)", 1..1);
+        harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(harness.text, "x)");
+        // An empty tag is a pair in markup, not in code.
+        let mut harness = editing("index.html", "a<>", 2..2);
+        harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(harness.text, "a");
+        let mut harness = editing("main.rs", "a<>", 2..2);
+        harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(harness.text, "a>");
+    }
+
+    #[test]
+    fn a_bracket_or_a_quote_typed_over_a_selection_goes_around_it() {
+        let mut harness = editing("a.js", "let a = one;", 8..11);
+        let out = harness.type_text("(");
+        assert_eq!(harness.text, "let a = (one);");
+        assert_eq!(out.selection, Some(9..12), "what was selected still is");
+        harness.time += 5.0;
+        let out = harness.type_text("\"");
+        assert_eq!(harness.text, "let a = (\"one\");");
+        assert_eq!(out.selection, Some(10..13));
+        // Each is one step to take back.
+        undo(&mut harness);
+        assert_eq!(harness.text, "let a = (one);");
+        // Any other char is written over the selection, as ever.
+        let mut harness = editing("a.js", "let a = one;", 8..11);
+        harness.type_text(")");
+        assert_eq!(harness.text, "let a = );");
+    }
+
+    #[test]
+    fn backspace_and_tab_in_the_leading_white_space_go_by_tab_stops() {
+        let mut harness = editing("main.rs", "      x", 6..6);
+        // From between two stops to the stop before, then a whole level.
+        let out = harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("    x", Some(4..4))
+        );
+        harness.time += 5.0;
+        let out = harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!((harness.text.as_str(), out.selection), ("x", Some(0..0)));
+        undo(&mut harness);
+        assert_eq!(harness.text, "    x", "a level comes back in one step");
+        // After text, a space is a char like the others.
+        let mut harness = editing("main.rs", "a    ", 5..5);
+        harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(harness.text, "a   ");
+        // Tab goes to the next stop: three spaces from the second column, four from a stop.
+        let mut harness = editing("main.rs", "  x", 1..1);
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("     x", Some(4..4))
+        );
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "         x");
+        assert_eq!(out.selection, Some(8..8));
+    }
+
+    #[test]
+    fn home_goes_to_the_first_letter_of_the_line_then_to_its_start() {
+        let mut harness = editing("main.rs", "one\n    let a;", 13..13);
+        let home = |harness: &mut Harness, modifiers| harness.key(Key::Home, modifiers).selection;
+        assert_eq!(home(&mut harness, Modifiers::NONE), Some(8..8));
+        assert_eq!(home(&mut harness, Modifiers::NONE), Some(4..4));
+        assert_eq!(home(&mut harness, Modifiers::NONE), Some(8..8));
+        // With Shift, what is passed over is selected.
+        harness.key(Key::End, Modifiers::NONE);
+        assert_eq!(home(&mut harness, Modifiers::SHIFT), Some(8..14));
+        assert_eq!(home(&mut harness, Modifiers::SHIFT), Some(4..14));
+    }
+
+    #[test]
+    fn a_line_is_opened_under_or_above_the_caret_without_breaking_its_line() {
+        // Ctrl+Enter in the middle of a line: the line stays whole.
+        let mut harness = editing("main.rs", "fn a() {\n    one();\n}", 15..15);
+        let out = harness.key(Key::Enter, Modifiers::COMMAND);
+        assert_eq!(harness.text, "fn a() {\n    one();\n    \n}");
+        assert_eq!(out.selection, Some(24..24));
+        undo(&mut harness);
+        assert_eq!(harness.text, "fn a() {\n    one();\n}", "in one step");
+        // Under a line that opens a block, the new line is one level in.
+        let mut harness = editing("main.rs", "fn a() {\n}", 3..3);
+        let out = harness.key(Key::Enter, Modifiers::COMMAND);
+        assert_eq!(harness.text, "fn a() {\n    \n}");
+        assert_eq!(out.selection, Some(13..13));
+        // Ctrl+Shift+Enter: above, indented as Enter after the line before would.
+        let above = Modifiers::COMMAND | Modifiers::SHIFT;
+        let mut harness = editing("main.rs", "fn a() {\n    two();\n}", 15..15);
+        let out = harness.key(Key::Enter, above);
+        assert_eq!(harness.text, "fn a() {\n    \n    two();\n}");
+        assert_eq!(out.selection, Some(13..13));
+        // Above the first line, indented as it is.
+        let mut harness = editing("main.rs", "    x", 5..5);
+        let out = harness.key(Key::Enter, above);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("    \n    x", Some(4..4))
+        );
+        // Not while the keys are commands (Vim): the same key, given straight to `keys`.
+        let ctrl_enter = |commands: bool| {
+            let mut harness = editing("main.rs", "one", 1..1);
+            let config = Config {
+                block_caret: commands,
+                ..config_of("main.rs", false, &[], 0)
+            };
+            let _ = harness.ctx.clone().run_ui(RawInput::default(), |ui| {
+                ui.memory_mut(|memory| memory.request_focus(editor_id()));
+                let event = Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                };
+                ui.input_mut(|input| input.events.push(event));
+                keys(
+                    ui,
+                    editor_id(),
+                    &mut harness.text,
+                    &config,
+                    &mut harness.view,
+                );
+            });
+            harness.text
+        };
+        assert_eq!(ctrl_enter(true), "one");
+        assert_eq!(ctrl_enter(false), "one\n");
+    }
+
+    #[test]
+    fn alt_j_selects_the_word_at_the_caret() {
+        let mut harness = editing("main.rs", "let alpha = beta;", 6..6);
+        let out = harness.key(Key::J, Modifiers::ALT);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("let alpha = beta;", Some(4..9))
+        );
+        // With a selection it has nothing to do yet: the other carets hold no selection.
+        let out = harness.key(Key::J, Modifiers::ALT);
+        assert_eq!(out.selection, Some(4..9));
+        assert!(harness.view.extra.is_empty());
+        // By no word, nothing is selected.
+        let mut harness = editing("main.rs", "a  b", 2..2);
+        assert_eq!(harness.key(Key::J, Modifiers::ALT).selection, Some(2..2));
+    }
+
+    #[test]
+    fn a_block_pasted_takes_the_indentation_of_the_line_it_is_pasted_on() {
+        let page = "fn a() {\n    if b {\n        \n    }\n}";
+        // From elsewhere, copied from its first letter: its last line tells how deep it was.
+        let mut harness = editing("main.rs", page, 28..28);
+        harness.frame(vec![Event::Paste("if x {\r\n    y();\r\n}".to_owned())]);
+        let out = harness.frame(Vec::new());
+        let block = "        if x {\n            y();\n        }";
+        assert_eq!(
+            harness.text,
+            format!("fn a() {{\n    if b {{\n{block}\n    }}\n}}")
+        );
+        assert_eq!(
+            out.selection,
+            Some(61..61),
+            "the caret ends after the block"
+        );
+        // Taken back in one step, and alone: what was typed just before stays.
+        let mut harness = editing("main.rs", page, 28..28);
+        harness.type_text("z");
+        harness.frame(vec![Event::Paste("if x {\n    y();\n}".to_owned())]);
+        harness.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(harness.text, "fn a() {\n    if b {\n        z\n    }\n}");
+        // Copied here from the middle of a line: where it comes from is known.
+        let text = "    one(\n        two,\n    three\nfn b() {\n        \n}";
+        let mut harness = editing("main.rs", text, 4..21);
+        harness.frame(vec![Event::Copy]);
+        set_selection(&harness.ctx, editor_id(), &(49..49));
+        harness.frame(Vec::new());
+        harness.frame(vec![Event::Paste("one(\n        two,".to_owned())]);
+        assert!(
+            harness
+                .text
+                .ends_with("fn b() {\n        one(\n            two,\n}"),
+            "{}",
+            harness.text
+        );
+        // A text from elsewhere that tells nothing of where it was is written as it is.
+        let mut harness = editing("a.yaml", "    ", 4..4);
+        harness.frame(vec![Event::Paste("- a: 1\n  b: 2".to_owned())]);
+        assert_eq!(harness.text, "    - a: 1\n  b: 2");
+    }
+
+    #[test]
+    fn a_whole_line_pasted_goes_above_the_line_of_the_caret() {
+        // Copied with nothing selected: the line of the caret, whole.
+        let mut harness = editing("main.rs", "one\ntwo\nthree", 5..5);
+        harness.frame(vec![Event::Copy]);
+        set_selection(&harness.ctx, editor_id(), &(10..10));
+        harness.frame(Vec::new());
+        harness.frame(vec![Event::Paste("two\n".to_owned())]);
+        let out = harness.frame(Vec::new());
+        assert_eq!(harness.text, "one\ntwo\ntwo\nthree");
+        assert_eq!(out.selection, Some(14..14), "the caret stays in its word");
+        undo(&mut harness);
+        assert_eq!(harness.text, "one\ntwo\nthree", "in one step");
+        // From elsewhere, a text that ends with a line end is taken for whole lines.
+        harness.frame(vec![Event::Paste("zero\n".to_owned())]);
+        assert_eq!(harness.text, "one\ntwo\nzero\nthree");
+        // Selected and copied here, the same text goes where the caret is.
+        let mut harness = editing("main.rs", "one\ntwo\nthree", 4..8);
+        harness.frame(vec![Event::Copy]);
+        set_selection(&harness.ctx, editor_id(), &(1..1));
+        harness.frame(Vec::new());
+        harness.frame(vec![Event::Paste("two\n".to_owned())]);
+        assert_eq!(harness.text, "otwo\nne\ntwo\nthree");
+        // Over a selection, a whole line takes its place.
+        let mut harness = editing("main.rs", "one\ntwo", 4..7);
+        harness.frame(vec![Event::Paste("six\n".to_owned())]);
+        assert_eq!(harness.text, "one\nsix\n");
+    }
+
+    #[test]
+    fn enter_goes_on_with_the_comment_it_is_in() {
+        // A doc comment goes on, from its end too.
+        let mut harness = editing("main.rs", "    /// one", 11..11);
+        let out = harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "    /// one\n    /// ");
+        assert_eq!(out.selection, Some(20..20));
+        let mut harness = editing("main.rs", "//! one", 7..7);
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "//! one\n//! ");
+        let mut harness = editing("a.lua", "--- one", 7..7);
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "--- one\n--- ");
+        // A plain one ends at its end, and goes on when it is cut in two.
+        let mut harness = editing("main.rs", "// one two", 10..10);
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "// one two\n");
+        let mut harness = editing("main.rs", "// one two", 6..6);
+        let out = harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("// one\n// two", Some(10..10))
+        );
+        undo(&mut harness);
+        assert_eq!(harness.text, "// one two", "in one step");
+        // A rule drawn with the marker is no doc comment.
+        let mut harness = editing("main.rs", "//////", 6..6);
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "//////\n");
+        // Between the two ends of a block comment, then on each of its lines.
+        let mut harness = editing("a.js", "/** */", 3..3);
+        let out = harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("/**\n * \n */", Some(7..7))
+        );
+        harness.type_text("x");
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "/**\n * x\n * \n */");
+        // A star that multiplies is not one.
+        let mut harness = editing("a.js", "a\n* b", 5..5);
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "a\n* b\n");
+    }
+
+    #[test]
+    fn enter_leaves_no_white_space_on_a_line_it_leaves_empty() {
+        let mut harness = editing("main.rs", "fn a() {\n    one();\n}", 19..19);
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "fn a() {\n    one();\n    \n}");
+        // Left without a word written, the line keeps nothing; the next one is indented.
+        harness.time += 5.0;
+        let out = harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "fn a() {\n    one();\n\n    \n}");
+        assert_eq!(out.selection, Some(25..25));
+        undo(&mut harness);
+        assert_eq!(harness.text, "fn a() {\n    one();\n    \n}");
+        // Opening a line under it leaves it empty too.
+        harness.key(Key::Enter, Modifiers::COMMAND);
+        assert_eq!(harness.text, "fn a() {\n    one();\n\n    \n}");
+    }
+
+    /// A file where `abc` starts more names than the list shows at once, `abc` typed
+    /// at its end.
+    fn completing() -> Harness {
+        let names: Vec<String> = (0..12).map(|number| format!("abcde{number:02}")).collect();
+        let text = format!("{}\n", names.join(" "));
+        let end = text.chars().count();
+        let mut harness = editing("main.rs", &text, end..end);
+        for letter in ["a", "b", "c"] {
+            harness.type_text(letter);
+        }
+        harness
+    }
+
+    #[test]
+    fn the_completion_list_is_walked_by_rows_and_by_pages() {
+        let mut harness = completing();
+        let chosen = |harness: &Harness| harness.view.completion.as_ref().map(|list| list.selected);
+        let count = harness
+            .view
+            .completion
+            .as_ref()
+            .map_or(0, |list| list.items.len());
+        assert!(count > POPUP_ROWS, "{count} completions");
+        // Up from the first one is the last one, down from it the first again.
+        harness.key(Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(chosen(&harness), Some(count - 1));
+        harness.key(Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(chosen(&harness), Some(0));
+        // A page is what shows at once; the ends stop it.
+        harness.key(Key::PageDown, Modifiers::NONE);
+        assert_eq!(chosen(&harness), Some(POPUP_ROWS));
+        harness.key(Key::PageDown, Modifiers::NONE);
+        assert_eq!(chosen(&harness), Some(count - 1));
+        harness.key(Key::PageUp, Modifiers::NONE);
+        assert_eq!(chosen(&harness), Some(count - 1 - POPUP_ROWS));
+        harness.key(Key::PageUp, Modifiers::NONE);
+        assert_eq!(chosen(&harness), Some(0));
+        // The caret did not move: what was typed is what the list completes.
+        let list = harness.view.completion.as_ref().expect("the list is open");
+        assert_eq!(list.typed.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn escape_closes_the_list_and_leaves_the_keyboard_to_the_editor() {
+        let mut harness = completing();
+        let out = harness.key(Key::Escape, Modifiers::NONE);
+        assert!(harness.view.completion.is_none());
+        assert!(out.focused, "the editor still has the keyboard");
+        harness.type_text("!");
+        assert!(harness.text.ends_with("abc!"), "{}", harness.text);
+        // With several carets too: one is left, in the editor.
+        harness.view.extra = vec![0];
+        harness.frame(Vec::new());
+        let out = harness.key(Key::Escape, Modifiers::NONE);
+        assert!(harness.view.extra.is_empty() && out.focused);
+        // With neither, Escape gives the keyboard up, as before.
+        assert!(!harness.key(Key::Escape, Modifiers::NONE).focused);
+    }
+
+    #[test]
+    fn the_completion_list_stays_in_the_window() {
+        let list = |harness: &Harness| {
+            let id = editor_id().with("completion");
+            harness.ctx.memory(|memory| memory.area_rect(id))
+        };
+        // At the top of the window it hangs under the caret.
+        let mut harness = completing();
+        let caret = harness.frame(Vec::new()).caret_pos.expect("a caret");
+        let rect = list(&harness).expect("the list shows");
+        assert!(rect.min.y >= caret.y, "{rect:?} under {caret:?}");
+        // At the bottom there is no room under: it stands on the line of the caret.
+        let lines = "\n".repeat(34);
+        let mut harness = editing("main.rs", &format!("abcde01 abcde02{lines}"), 49..49);
+        for letter in ["a", "b", "c"] {
+            harness.type_text(letter);
+        }
+        let caret = harness.frame(Vec::new()).caret_pos.expect("a caret");
+        let rect = list(&harness).expect("the list shows");
+        assert!(
+            caret.y > 560.0 && rect.max.y < caret.y,
+            "{rect:?} over {caret:?}"
+        );
+        assert!(rect.min.y >= 0.0, "{rect:?}");
+        // A place worked out alone: off the right edge it is pushed back in.
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0));
+        let caret = Rect::from_min_max(pos2(880.0, 100.0), pos2(880.0, 117.0));
+        assert_eq!(
+            popup_pos(caret, vec2(410.0, 98.0), screen),
+            pos2(490.0, 119.0)
+        );
+    }
+
+    #[test]
+    fn a_completion_shows_what_was_typed_of_it_and_what_it_writes() {
+        // The start of a name, whatever the case; or its letters, in order.
+        assert_eq!(matched("Counter", "cou"), [0, 1, 2]);
+        assert_eq!(matched("set_counter", "sc"), [0, 4]);
+        assert!(matched("counter", "cox").is_empty());
+        assert!(matched("counter", "").is_empty());
+        assert_eq!(preview("fn $0() {\n\t\n}"), "fn () { }");
+        // A name goes on over its hyphens in a style sheet, not in code.
+        let css = Language::of(std::path::Path::new("a.css"));
+        let rust = Language::of(std::path::Path::new("a.rs"));
+        assert_eq!(typed_word("a { font-si", 11, css), "font-si");
+        assert_eq!(typed_word("a { font-si", 11, rust), "si");
     }
 }
