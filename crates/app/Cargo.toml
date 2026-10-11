@@ -1,0 +1,23 @@
+[package]
+name = "godcode"
+description = "GodCode: pure-Rust code editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "godcode"
+path = "src/main.rs"
+
+[dependencies]
+godcode-core.workspace = true
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = "0.35"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.17"
+egui-phosphor = { version = "0.13", features = ["fill"] }
+# Deleted files go to the recycle bin instead of being lost.
+trash = "5"
+
+[build-dependencies]
+winresource = "0.1"

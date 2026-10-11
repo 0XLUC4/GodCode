@@ -1,0 +1,3 @@
+# Link the C runtime into the executable: it then runs on a PC without the Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

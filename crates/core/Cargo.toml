@@ -1,0 +1,8 @@
+[package]
+name = "godcode-core"
+description = "GodCode editing logic: syntax colours, text edits, search and fuzzy matching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
