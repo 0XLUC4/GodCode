@@ -143,7 +143,8 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Explorateur de tests du projet par fichier, relance d'un seul test avec résultat, couverture | ⏳ |
 | Variables dépliables : un clic ouvre une liste ou un objet, ses parties viennent dessous ; points d'arrêt conditionnels : `Breakpoint Condition…` (`Shift+F9`) sur la ligne du curseur, vide pour toujours | ✅ |
 | Pendant un arrêt, le survol d'un nom dans le code dit ce qu'il vaut ; un point d'arrêt conditionnel est dessiné creux dans la marge | ✅ (survol non vu à l'écran) |
-| Débogueur : modifier une valeur, points d'arrêt qui suivent les lignes quand on édite au-dessus | ⏳ |
+| Les points d'arrêt suivent leur code quand des lignes sont tapées ou effacées au-dessus (dans l'éditeur ; pas après un reformatage) | ✅ |
+| Débogueur : modifier une valeur | ⏳ |
 
 Vérifié de bout en bout avec le vrai débogueur Python (debugpy) : arrêt sur un point d'arrêt,
 pile, variables et leurs parties, expressions surveillées, point d'arrêt conditionnel,

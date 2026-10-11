@@ -925,6 +925,8 @@ struct Tab {
     /// which it does.
     breakpoints: Vec<usize>,
     conditions: std::collections::HashMap<usize, String>,
+    /// How many lines the text had when it last showed; 0 before it ever did.
+    lines: usize,
     /// What the language server writes in the lines; and what it was last asked: the
     /// revision of the text, the lines, whether they go to the end of the text. The hints
     /// stay as they are until it has answered about the text typed since.
@@ -975,6 +977,7 @@ impl Tab {
             pinned: false,
             breakpoints: Vec::new(),
             conditions: Default::default(),
+            lines: 0,
             hints: Vec::new(),
             hints_at: None,
             other: None,
@@ -6526,6 +6529,19 @@ impl GodApp {
         if output.changed {
             tab.touched();
         }
+        // Lines typed or erased above a breakpoint take it along: it stays on its code.
+        let grown = output.lines as isize - tab.lines as isize;
+        let known = std::mem::replace(&mut tab.lines, output.lines) != 0;
+        if let (true, true, Some(((line, _), _))) = (output.changed, known, output.places) {
+            // The caret ends under what was typed, or where what was erased began.
+            let edited = (line - 1).saturating_sub(grown.max(0) as usize);
+            if grown != 0
+                && move_stops(&mut tab.breakpoints, &mut tab.conditions, edited, grown)
+                && let (Some(session), Some(path)) = (&mut self.debug, &tab.path)
+            {
+                session.set_breakpoints(path, &stops_of(tab));
+            }
+        }
         if let Some(selection) = output.selection {
             // Moved by hand: there is nothing to shrink back to any more.
             if selection != tab.selection {
@@ -7608,6 +7624,31 @@ fn toggle_breakpoint_of(
     }
 }
 
+/// The text grew by `grown` lines (or shrank) under the line `edited`: the breakpoints
+/// below it, and their conditions, move as much. Those on lines that went join the line
+/// where they went. Returns whether one moved.
+fn move_stops(
+    lines: &mut Vec<usize>,
+    conditions: &mut std::collections::HashMap<usize, String>,
+    edited: usize,
+    grown: isize,
+) -> bool {
+    let moved = |line: usize| match line > edited {
+        true => line.saturating_add_signed(grown).max(edited),
+        false => line,
+    };
+    let before = lines.clone();
+    lines.iter_mut().for_each(|line| *line = moved(*line));
+    lines.sort_unstable();
+    lines.dedup();
+    let kept = std::mem::take(conditions);
+    conditions.extend(
+        kept.into_iter()
+            .map(|(line, condition)| (moved(line), condition)),
+    );
+    *lines != before
+}
+
 /// The places the debugger stops at in `tab`, each with its condition when it has one.
 fn stops_of(tab: &Tab) -> Vec<godcode_lsp::dap::Stop> {
     let stops = tab.breakpoints.iter();
@@ -7978,6 +8019,21 @@ fn text_on_disk(path: &Path) -> Option<Decoded> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breakpoints_stay_on_their_code_when_lines_come_and_go() {
+        let mut lines = vec![2, 5, 9];
+        let mut conditions = std::collections::HashMap::from([(5, "i > 3".to_owned())]);
+        // Two lines typed under line 3: what is below goes down, what is above stays.
+        assert!(move_stops(&mut lines, &mut conditions, 3, 2));
+        assert_eq!(lines, [2, 7, 11]);
+        assert_eq!(conditions.get(&7).map(String::as_str), Some("i > 3"));
+        // Lines 5 to 8 erased: the breakpoint that was among them waits where they were.
+        assert!(move_stops(&mut lines, &mut conditions, 4, -4));
+        assert_eq!(lines, [2, 4, 7]);
+        // Nothing below the edit: nothing moves.
+        assert!(!move_stops(&mut lines, &mut conditions, 20, 3));
+    }
 
     #[test]
     fn a_font_file_is_told_from_another() {

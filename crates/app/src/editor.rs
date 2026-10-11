@@ -211,6 +211,8 @@ pub struct Output {
     pub gutter: Option<usize>,
     /// Line and column, from 1, of the start and of the end of the selection.
     pub places: Option<((usize, usize), (usize, usize))>,
+    /// How many lines the text has.
+    pub lines: usize,
 }
 
 /// A code-aware edit at the selection.
@@ -1612,6 +1614,7 @@ pub fn show(
         .map(|selection| (place(selection.start), place(selection.end)));
     Output {
         places,
+        lines: geometry.index().lines(),
         changed,
         selection,
         jump,
