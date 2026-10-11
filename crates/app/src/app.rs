@@ -1548,6 +1548,11 @@ pub struct GodApp {
     /// What the last HTTP request answered, and the answer still awaited.
     response: String,
     requesting: Option<Receiver<Result<String, String>>>,
+    /// The request awaited, as it is listed; the last ones sent with what each answered,
+    /// the latest first; and the one of them on show.
+    requested: String,
+    responses: Vec<(String, String)>,
+    response_at: usize,
     /// The program being debugged, and whether it is stopped.
     debug: Option<godcode_lsp::dap::Session>,
     debug_stopped: bool,
@@ -1740,6 +1745,9 @@ impl GodApp {
             snippets: load_snippets(),
             response: String::new(),
             requesting: None,
+            requested: String::new(),
+            responses: Vec::new(),
+            response_at: 0,
             debug: None,
             debug_stopped: false,
             frames: Vec::new(),
@@ -2266,6 +2274,10 @@ impl GodApp {
         {
             self.requesting = None;
             self.response = answer.unwrap_or_else(|err| format!("The request failed: {err}"));
+            let sent = (std::mem::take(&mut self.requested), self.response.clone());
+            self.responses.insert(0, sent);
+            self.responses.truncate(RESPONSES_KEPT);
+            self.response_at = 0;
         }
         if let Some(receiver) = &self.indexing
             && let Ok(index) = receiver.try_recv()
@@ -4578,6 +4590,7 @@ impl GodApp {
                 .error("No request here: write a line such as GET https://example.com");
             return;
         };
+        self.requested = format!("{} {}", request.method, request.url);
         let (sender, receiver) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -6853,14 +6866,43 @@ impl GodApp {
                 } else {
                     &self.response
                 };
-                ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(12, 0))
-                        .show(ui, |ui| {
-                            let text = RichText::new(shown).monospace().size(13.0);
-                            ui.add(egui::Label::new(text).selectable(true).extend());
+                let mut picked = None;
+                ui.horizontal_top(|ui| {
+                    // The requests sent before: a click shows again what one answered.
+                    if self.responses.len() > 1 {
+                        ui.vertical(|ui| {
+                            ui.set_width(300.0);
+                            let list = ScrollArea::vertical().id_salt("responses");
+                            list.auto_shrink(false).show(ui, |ui| {
+                                for (index, (sent, _)) in self.responses.iter().enumerate() {
+                                    let mut title: String = sent.chars().take(44).collect();
+                                    if title.len() < sent.len() {
+                                        title.push('…');
+                                    }
+                                    let chosen = index == self.response_at;
+                                    let row = ui.selectable_label(chosen, title);
+                                    if row.on_hover_text(sent).clicked() {
+                                        picked = Some(index);
+                                    }
+                                }
+                            });
                         });
+                        ui.separator();
+                    }
+                    let answer = ScrollArea::both().id_salt("response");
+                    answer.auto_shrink(false).show(ui, |ui| {
+                        Frame::new()
+                            .inner_margin(Margin::symmetric(12, 0))
+                            .show(ui, |ui| {
+                                let text = RichText::new(shown).monospace().size(13.0);
+                                ui.add(egui::Label::new(text).selectable(true).extend());
+                            });
+                    });
                 });
+                if let Some((_, answered)) = picked.and_then(|index| self.responses.get(index)) {
+                    self.response.clone_from(answered);
+                    self.response_at = picked.unwrap_or(0);
+                }
             }
         }
     }
@@ -8319,6 +8361,9 @@ struct Merging {
     /// What was chosen for each conflict, in their order.
     choices: Vec<Option<godcode_core::merge::Choice>>,
 }
+
+/// How many requests are kept with what they answered.
+const RESPONSES_KEPT: usize = 20;
 
 /// Rows of a table shown at a time.
 const DATABASE_PAGE: usize = 200;
