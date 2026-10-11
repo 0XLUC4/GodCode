@@ -127,47 +127,62 @@ pub fn complete(text: &str, caret: usize, language: &Language) -> Vec<Completion
         kind,
     };
 
-    // Inside a tag, what can be written is an attribute of its element.
-    if let Some(element) = language
-        .is_markup()
-        .then(|| tag_being_written(&text[..end]))
-        .flatten()
-    {
-        let own = ATTRIBUTES.iter().filter(|(of, _)| *of == element);
-        let known = own
-            .chain(&ATTRIBUTES[..1])
-            .flat_map(|(_, names)| names.iter());
-        let fitting = known.filter(|name| fits(name)).map(|name| {
+    // The name being written with its hyphens: of `font-s`, the word is `s` alone.
+    let before = &text[..end];
+    let named = before
+        .chars()
+        .rev()
+        .take_while(|ch| is_word_char(*ch) || *ch == '-');
+    let full = &before[end - named.map(char::len_utf8).sum::<usize>()..];
+    let lead = full.len() - prefix.len();
+    // Those of `names` the name being written starts, each written from the word on.
+    let offered = |names: &mut dyn Iterator<Item = &'static str>, body: &dyn Fn(&str) -> String| {
+        let wanted = full.to_lowercase();
+        let fitting = names.filter(|name| name.len() > lead && name.starts_with(&wanted));
+        let made = fitting.map(|name| completion(name, &body(name)[lead..], Kind::Keyword));
+        made.take(MAX_COMPLETIONS).collect::<Vec<_>>()
+    };
+    let around = &before[..end - full.len()];
+    let place = match language.is_markup() {
+        true => place_in_markup(around),
+        false if language.name == "CSS" => Some(Place::Style(around, false)),
+        false => None,
+    };
+    let found = match place {
+        // In a tag: the attributes of its element, then those of any element.
+        Some(Place::Attribute(element)) => {
+            let own = ATTRIBUTES.iter().filter(|(of, _)| *of == element);
+            let known = own.chain(&ATTRIBUTES[..1]);
+            let mut names = known.flat_map(|(_, names)| names.iter().copied());
             // One that is there or not takes no value.
-            let body = match SWITCHES.contains(name) {
-                true => (*name).to_owned(),
+            offered(&mut names, &|name| match SWITCHES.contains(&name) {
+                true => name.to_owned(),
                 false => format!("{name}=\"$0\""),
-            };
-            completion(name, &body, Kind::Keyword)
-        });
-        return fitting.take(MAX_COMPLETIONS).collect();
-    }
-    // In a style sheet: a property at the start of a line of a block, its values after it.
-    if language.name == "CSS" {
-        let before = &text[..end];
-        let line = &before[before.rfind('\n').map_or(0, |found| found + 1)..];
-        let in_block = before.matches('{').count() > before.matches('}').count();
-        let stem = line[..line.len() - prefix.len()].trim();
-        if in_block && stem.is_empty() {
-            let fitting = CSS_PROPERTIES.iter().filter(|name| fits(name));
-            let offered =
-                fitting.map(|name| completion(name, &format!("{name}: $0;"), Kind::Keyword));
-            return offered.take(MAX_COMPLETIONS).collect();
+            })
         }
-        if let Some((property, _)) = stem.split_once(':').filter(|_| in_block) {
-            let own = CSS_VALUES.iter().filter(|(of, _)| *of == property.trim());
-            let known = own
-                .chain(&CSS_VALUES[..1])
-                .flat_map(|(_, values)| values.iter());
-            let fitting = known.filter(|value| fits(value));
-            let offered = fitting.map(|value| completion(value, value, Kind::Keyword));
-            return offered.take(MAX_COMPLETIONS).collect();
+        Some(Place::Value(attribute)) => {
+            let own = ATTRIBUTE_VALUES.iter().filter(|(of, _)| *of == attribute);
+            let mut values = own.flat_map(|(_, values)| values.iter().copied());
+            offered(&mut values, &str::to_owned)
         }
+        // In a style sheet: a property where a declaration starts, its values after it.
+        Some(Place::Style(sheet, inline)) => match declaration(sheet, inline) {
+            Some(None) => {
+                let mut names = CSS_PROPERTIES.iter().copied();
+                offered(&mut names, &|name| format!("{name}: $0;"))
+            }
+            Some(Some(property)) => {
+                let own = CSS_VALUES.iter().filter(|(of, _)| *of == property);
+                let known = own.chain(&CSS_VALUES[..1]);
+                let mut values = known.flat_map(|(_, values)| values.iter().copied());
+                offered(&mut values, &str::to_owned)
+            }
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    if !found.is_empty() {
+        return found;
     }
 
     let snippets = SNIPPETS
@@ -391,15 +406,81 @@ const CSS_VALUES: &[(&str, &[&str])] = &[
     ("list-style", &["disc", "circle", "square", "decimal"]),
 ];
 
-/// The element whose tag is being written at the end of `before`, once its name is: what
-/// is typed next is one of its attributes. Not between the quotes of a value.
-fn tag_being_written(before: &str) -> Option<&str> {
-    let tag = &before[before.rfind('<')? + 1..];
-    if tag.contains('>') || tag.starts_with(['/', '!', '?']) || tag.matches('"').count() % 2 == 1 {
+/// The values some attributes take.
+const ATTRIBUTE_VALUES: &[(&str, &[&str])] = &[
+    (
+        "type",
+        &[
+            "text", "password", "email", "number", "checkbox", "radio", "submit", "button",
+            "reset", "file", "date", "color", "range", "hidden", "search", "tel", "url",
+        ],
+    ),
+    ("target", &["_blank", "_self", "_parent", "_top"]),
+    (
+        "rel",
+        &["stylesheet", "icon", "noopener", "noreferrer", "nofollow"],
+    ),
+    ("method", &["get", "post"]),
+    ("loading", &["lazy", "eager"]),
+    ("charset", &["utf-8"]),
+    ("scope", &["col", "row"]),
+];
+
+/// Where a name is being written in markup.
+enum Place<'a> {
+    /// In the tag of this element, where its attributes go.
+    Attribute(&'a str),
+    /// Between the quotes of the value of this attribute.
+    Value(&'a str),
+    /// In a style sheet, of which this is the part before the name: the content of a
+    /// `style` element, or of a `style` attribute (`true`), which is one block.
+    Style(&'a str, bool),
+}
+
+/// Where the name that follows `before` is being written, when that says what it can be.
+fn place_in_markup(before: &str) -> Option<Place<'_>> {
+    let tag = before.rfind('<').map(|at| &before[at + 1..]);
+    if let Some(tag) = tag.filter(|tag| !tag.contains('>')) {
+        if tag.starts_with(['/', '!', '?']) {
+            return None;
+        }
+        // Its name is written once something follows it.
+        let (name, rest) = tag.split_once(char::is_whitespace)?;
+        if name.is_empty() || !name.chars().all(in_tag_name) {
+            return None;
+        }
+        if rest.matches('"').count() % 2 == 0 {
+            return Some(Place::Attribute(name));
+        }
+        let quote = rest.rfind('"')?;
+        let attribute = rest[..quote].strip_suffix('=')?;
+        let attribute = attribute.rsplit(char::is_whitespace).next()?;
+        return Some(match attribute {
+            "style" => Place::Style(&rest[quote + 1..], true),
+            attribute => Place::Value(attribute),
+        });
+    }
+    let sheet = &before[before.rfind("<style")?..];
+    if sheet.contains("</style") {
         return None;
     }
-    let (name, _) = tag.split_once(char::is_whitespace)?;
-    (!name.is_empty() && name.chars().all(in_tag_name)).then_some(name)
+    Some(Place::Style(&sheet[sheet.find('>')? + 1..], false))
+}
+
+/// What is being written at the end of `sheet`, a style sheet up to a name: a property
+/// (`Some(None)`), or a value of the property named; `None` outside a block, where
+/// selectors are. `inline`: the sheet is one block, as in a `style` attribute.
+fn declaration(sheet: &str, inline: bool) -> Option<Option<&str>> {
+    let in_block = inline || sheet.matches('{').count() > sheet.matches('}').count();
+    if !in_block {
+        return None;
+    }
+    let started = sheet.rsplit(['{', ';', '\n']).next().unwrap_or("").trim();
+    if started.is_empty() {
+        return Some(None);
+    }
+    let (property, _) = started.split_once(':')?;
+    Some(Some(property.trim()))
 }
 
 /// A tag of a text: where its name is, in bytes, whether it closes an element, and
@@ -715,6 +796,35 @@ mod tests {
         assert_eq!(offered("a {\n  display: fl", "a.css"), ["flex"]);
         assert_eq!(offered("a {\n  color: in", "a.css"), ["inherit", "initial"]);
         assert!(!offered("disp", "a.css").contains(&"display: $0;".to_owned()));
+        // A name with hyphens is offered whole and written from the word on.
+        assert_eq!(
+            offered("a {\n  font-s", "a.css"),
+            ["size: $0;", "style: $0;"]
+        );
+        assert_eq!(offered("a { display: inline-b", "a.css"), ["block"]);
+        assert_eq!(offered("<p aria-l", "a.html"), ["label=\"$0\""]);
+        // In a page: the style element is a style sheet, the style attribute a block.
+        assert_eq!(
+            offered("<style>\nbody {\n  marg", "a.html"),
+            [
+                "margin: $0;",
+                "margin-bottom: $0;",
+                "margin-left: $0;",
+                "margin-right: $0;",
+                "margin-top: $0;"
+            ]
+        );
+        assert_eq!(
+            offered("<p style=\"color: red; disp", "a.html"),
+            ["display: $0;"]
+        );
+        assert_eq!(offered("<p style=\"display: gr", "a.html"), ["grid"]);
+        assert!(
+            !offered("<style>a{}</style>\n<p>disp", "a.html").contains(&"display: $0;".to_owned())
+        );
+        // The values of an attribute, between its quotes.
+        assert_eq!(offered("<input type=\"pa", "a.html"), ["password"]);
+        assert_eq!(offered("<a target=\"_b", "a.html"), ["_blank"]);
     }
 
     #[test]

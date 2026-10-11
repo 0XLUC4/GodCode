@@ -41,9 +41,16 @@ fn opened_tag(line: &str) -> Option<&str> {
 }
 
 /// Break the line at the selection, keeping the indent of the line and adding one level
-/// after an opening bracket or a colon, and in `markup` after a tag that opens an element.
-/// Returns the caret.
-pub fn newline(text: &mut String, selection: Range<usize>, unit: &str, markup: bool) -> usize {
+/// after what opens a block in `language`: a bracket or a colon, a tag that opens an
+/// element in markup, a word like `then` or `do` where blocks end with one. Returns the
+/// caret.
+pub fn newline(
+    text: &mut String,
+    selection: Range<usize>,
+    unit: &str,
+    language: &Language,
+) -> usize {
+    let markup = language.is_markup();
     let start = byte_index(text, selection.start);
     let end = byte_index(text, selection.end);
     let line = &text[line_start(text, start)..start];
@@ -61,7 +68,8 @@ pub fn newline(text: &mut String, selection: Range<usize>, unit: &str, markup: b
     let after = text[end..].chars().next();
     let element = markup.then(|| opened_tag(line)).flatten();
     let mut inserted = format!("\n{lead}");
-    if matches!(before, Some('{' | '[' | '(' | ':')) || element.is_some() {
+    let worded = language.opens_block(line);
+    if matches!(before, Some('{' | '[' | '(' | ':')) || element.is_some() || worded {
         inserted.push_str(unit);
     }
     let caret = selection.start + inserted.chars().count();
@@ -363,7 +371,7 @@ mod tests {
     #[test]
     fn a_new_line_keeps_the_indent() {
         let mut text = "    let a = 1;".to_owned();
-        let caret = newline(&mut text, 14..14, "    ", false);
+        let caret = newline(&mut text, 14..14, "    ", Language::plain());
         assert_eq!(text, "    let a = 1;\n    ");
         assert_eq!(caret, 19);
     }
@@ -371,12 +379,12 @@ mod tests {
     #[test]
     fn a_new_line_after_a_bracket_indents_and_splits_the_pair() {
         let mut text = "fn main() {}".to_owned();
-        let caret = newline(&mut text, 11..11, "    ", false);
+        let caret = newline(&mut text, 11..11, "    ", Language::plain());
         assert_eq!(text, "fn main() {\n    \n}");
         assert_eq!(caret, 16);
 
         let mut text = "if ok:".to_owned();
-        newline(&mut text, 6..6, "  ", false);
+        newline(&mut text, 6..6, "  ", Language::plain());
         assert_eq!(text, "if ok:\n  ");
     }
 
@@ -384,7 +392,12 @@ mod tests {
     fn a_new_line_after_a_tag_indents_and_splits_the_element() {
         let broken = |text: &str, at: usize| {
             let mut text = text.to_owned();
-            let caret = newline(&mut text, at..at, "  ", true);
+            let caret = newline(
+                &mut text,
+                at..at,
+                "  ",
+                Language::of(std::path::Path::new("a.html")),
+            );
             (text, caret)
         };
         // Between the two tags of an element: the closing one goes under the opening one.
@@ -406,17 +419,37 @@ mod tests {
         assert_eq!(broken("<p></b>", 3).0, "<p>\n  </b>");
         // A comment after the bracket changes nothing; one after anything else neither.
         let mut noted = "fn a() { // why".to_owned();
-        newline(&mut noted, 15..15, "    ", false);
+        newline(&mut noted, 15..15, "    ", Language::plain());
         assert_eq!(noted, "fn a() { // why\n    ");
         let mut python = "if ok:  # sure".to_owned();
-        newline(&mut python, 14..14, "    ", false);
+        newline(&mut python, 14..14, "    ", Language::plain());
         assert_eq!(python, "if ok:  # sure\n    ");
         let mut plain = "let a = 1; // see http://x".to_owned();
-        newline(&mut plain, 26..26, "    ", false);
+        newline(&mut plain, 26..26, "    ", Language::plain());
         assert_eq!(plain, "let a = 1; // see http://x\n");
+        // Where blocks end with a word, the word that opens one indents what follows.
+        let after = |file: &str, line: &str| {
+            let mut text = line.to_owned();
+            let end = text.chars().count();
+            newline(
+                &mut text,
+                end..end,
+                "  ",
+                Language::of(std::path::Path::new(file)),
+            );
+            text[line.len()..].to_owned()
+        };
+        assert_eq!(after("a.lua", "if x then"), "\n  ");
+        assert_eq!(after("a.lua", "  local function f(a)"), "\n    ");
+        assert_eq!(after("a.lua", "if x then y() end"), "\n");
+        assert_eq!(after("a.rb", "items.each do |item|"), "\n  ");
+        assert_eq!(after("a.rb", "def name"), "\n  ");
+        assert_eq!(after("a.rb", "x = 1 if ok"), "\n");
+        assert_eq!(after("a.sh", "if [ -f a ]; then"), "\n  ");
+        assert_eq!(after("a.rs", "let then"), "\n");
         // In code a `>` ends no tag.
         let mut code = "let a: Vec<String>".to_owned();
-        newline(&mut code, 18..18, "    ", false);
+        newline(&mut code, 18..18, "    ", Language::plain());
         assert_eq!(code, "let a: Vec<String>\n");
     }
 

@@ -219,6 +219,125 @@ pub fn expand(abbreviation: &str, tags: &[&str]) -> Option<String> {
     Some(out)
 }
 
+/// Abbreviations of a style sheet that are a whole declaration.
+const CSS_WORDS: [(&str, &str); 34] = [
+    ("df", "display: flex"),
+    ("dg", "display: grid"),
+    ("db", "display: block"),
+    ("di", "display: inline"),
+    ("dib", "display: inline-block"),
+    ("dn", "display: none"),
+    ("posr", "position: relative"),
+    ("posa", "position: absolute"),
+    ("posf", "position: fixed"),
+    ("poss", "position: sticky"),
+    ("tac", "text-align: center"),
+    ("tal", "text-align: left"),
+    ("tar", "text-align: right"),
+    ("jcc", "justify-content: center"),
+    ("jcsb", "justify-content: space-between"),
+    ("jcsa", "justify-content: space-around"),
+    ("jcfs", "justify-content: flex-start"),
+    ("jcfe", "justify-content: flex-end"),
+    ("aic", "align-items: center"),
+    ("aifs", "align-items: flex-start"),
+    ("aife", "align-items: flex-end"),
+    ("ais", "align-items: stretch"),
+    ("fdc", "flex-direction: column"),
+    ("fdr", "flex-direction: row"),
+    ("fww", "flex-wrap: wrap"),
+    ("fwb", "font-weight: bold"),
+    ("fsi", "font-style: italic"),
+    ("tdn", "text-decoration: none"),
+    ("tdu", "text-decoration: underline"),
+    ("ttu", "text-transform: uppercase"),
+    ("curp", "cursor: pointer"),
+    ("ovh", "overflow: hidden"),
+    ("ova", "overflow: auto"),
+    ("bxz", "box-sizing: border-box"),
+];
+
+/// Abbreviations of the properties that take sizes or a colour, with the unit a bare
+/// number gets: none for those that count rather than measure.
+const CSS_SIZES: [(&str, &str, &str); 30] = [
+    ("m", "margin", "px"),
+    ("mt", "margin-top", "px"),
+    ("mr", "margin-right", "px"),
+    ("mb", "margin-bottom", "px"),
+    ("ml", "margin-left", "px"),
+    ("p", "padding", "px"),
+    ("pt", "padding-top", "px"),
+    ("pr", "padding-right", "px"),
+    ("pb", "padding-bottom", "px"),
+    ("pl", "padding-left", "px"),
+    ("w", "width", "px"),
+    ("h", "height", "px"),
+    ("maw", "max-width", "px"),
+    ("mah", "max-height", "px"),
+    ("miw", "min-width", "px"),
+    ("mih", "min-height", "px"),
+    ("t", "top", "px"),
+    ("r", "right", "px"),
+    ("b", "bottom", "px"),
+    ("l", "left", "px"),
+    ("g", "gap", "px"),
+    ("fz", "font-size", "px"),
+    ("bdrs", "border-radius", "px"),
+    ("fw", "font-weight", ""),
+    ("lh", "line-height", ""),
+    ("z", "z-index", ""),
+    ("op", "opacity", ""),
+    ("fx", "flex", ""),
+    ("c", "color", ""),
+    ("bgc", "background-color", ""),
+];
+
+/// A size as abbreviated: `10` in the unit of its property, `50p` a percentage, `1.5e` in
+/// em, `2r` in rem, `a` for auto.
+fn css_size(written: &str, unit: &str) -> Option<String> {
+    if written == "a" {
+        return Some("auto".to_owned());
+    }
+    let digits = written.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.');
+    let (number, suffix) = written.split_at(written.len() - digits.len());
+    number.parse::<f32>().ok()?;
+    let unit = match suffix {
+        "" => unit,
+        "p" | "%" => "%",
+        "e" => "em",
+        "r" => "rem",
+        "px" | "em" | "rem" | "vh" | "vw" => suffix,
+        _ => return None,
+    };
+    // Nothing is nothing in any unit.
+    Some(match number {
+        "0" => "0".to_owned(),
+        number => format!("{number}{unit}"),
+    })
+}
+
+/// What `abbreviation` stands for in a block of a style sheet, as a snippet: `m10-20` is
+/// `margin: 10px 20px;`, `df` is `display: flex;`, `c#333` a colour, `w` alone a width
+/// left to write. `None` when it is no abbreviation.
+pub fn expand_css(abbreviation: &str) -> Option<String> {
+    if let Some((_, whole)) = CSS_WORDS.iter().find(|(short, _)| *short == abbreviation) {
+        return Some(format!("{whole};"));
+    }
+    let value = abbreviation.trim_start_matches(|ch: char| ch.is_ascii_lowercase());
+    let short = &abbreviation[..abbreviation.len() - value.len()];
+    let (_, property, unit) = CSS_SIZES.iter().find(|(found, ..)| *found == short)?;
+    if value.is_empty() {
+        return Some(format!("{property}: $0;"));
+    }
+    if let Some(colour) = value.strip_prefix('#') {
+        let hexadecimal = colour.chars().all(|ch| ch.is_ascii_hexdigit());
+        let whole = hexadecimal && matches!(colour.len(), 3 | 4 | 6 | 8);
+        return whole.then(|| format!("{property}: #{colour};"));
+    }
+    let sizes: Option<Vec<String>> = value.split('-').map(|size| css_size(size, unit)).collect();
+    Some(format!("{property}: {};", sizes?.join(" ")))
+}
+
 /// The abbreviation `before`, the start of a line up to the caret, ends with: what follows
 /// the last white space, or the last tag. Text between braces may hold spaces.
 pub fn abbreviation(before: &str) -> Option<&str> {
@@ -309,6 +428,28 @@ mod tests {
             expanded("my-card.big").as_deref(),
             Some("<my-card class=\"big\">$0</my-card>")
         );
+    }
+
+    #[test]
+    fn an_abbreviation_writes_a_declaration_in_a_style_sheet() {
+        let written = |abbreviation: &str| expand_css(abbreviation);
+        assert_eq!(written("m10").as_deref(), Some("margin: 10px;"));
+        assert_eq!(written("p10-20").as_deref(), Some("padding: 10px 20px;"));
+        assert_eq!(written("m0-a").as_deref(), Some("margin: 0 auto;"));
+        assert_eq!(written("w100p").as_deref(), Some("width: 100%;"));
+        assert_eq!(written("fz1.5r").as_deref(), Some("font-size: 1.5rem;"));
+        assert_eq!(written("fw700").as_deref(), Some("font-weight: 700;"));
+        assert_eq!(written("c#333").as_deref(), Some("color: #333;"));
+        assert_eq!(written("df").as_deref(), Some("display: flex;"));
+        assert_eq!(
+            written("jcsb").as_deref(),
+            Some("justify-content: space-between;")
+        );
+        assert_eq!(written("w").as_deref(), Some("width: $0;"));
+        // A selector, a word, a colour that is none: left as they are.
+        for not in ["a", "body", "m10x", "c#12", "m-", "10", "color"] {
+            assert_eq!(written(not), None, "{not}");
+        }
     }
 
     #[test]

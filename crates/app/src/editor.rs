@@ -255,8 +255,7 @@ pub fn run(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>, op: Op
     let before = text.clone();
     let selection = match op {
         Op::Newline => {
-            let markup = config.language.is_markup();
-            let caret = edit::newline(text, selection, config.indent, markup);
+            let caret = edit::newline(text, selection, config.indent, config.language);
             caret..caret
         }
         Op::Indent => edit::indent(text, selection, config.indent),
@@ -394,6 +393,25 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
         && after.is_none_or(|ch| ch.is_whitespace() || ")]},;".contains(ch))
         // A quote after a word or a backslash closes or escapes, it does not open.
         && (typed != '"' || !before.is_some_and(|ch| ch.is_alphanumeric() || "\"\\".contains(ch)));
+    // A word that ends a block (`end`, `fi`), typed first on its line, goes back one level.
+    let closers = config.language.block_closers();
+    if typed.is_alphabetic() && !closers.is_empty() {
+        let at = godcode_core::byte_index(text, caret);
+        let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+        let written = text[line..at].trim_start();
+        let lead = at - written.len();
+        let word = format!("{written}{typed}");
+        let goes_on = after.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+        let unit = config.indent;
+        if closers.contains(&word.as_str()) && !goes_on && text[line..lead].ends_with(unit) {
+            take(ui, typed);
+            text.insert(at, typed);
+            text.replace_range(lead - unit.len()..lead, "");
+            let after = caret + 1 - unit.chars().count();
+            set_selection(ui.ctx(), id, &(after..after));
+            return true;
+        }
+    }
     // A closing bracket typed first on its line goes under the line of the one it closes.
     if matches!(typed, ')' | ']' | '}') && !steps_over {
         let at = godcode_core::byte_index(text, caret);
@@ -762,24 +780,39 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
         return true;
     }
     let pressed = |modifiers, key| ui.input_mut(|input| input.consume_key(modifiers, key));
-    // In markup, Tab after an abbreviation writes the elements it stands for; unless a
-    // completion was chosen with the arrows, which Tab is then for.
+    // Tab after an abbreviation writes what it stands for: elements in markup, a
+    // declaration in a block of a style sheet. Unless a completion was chosen with the
+    // arrows, which Tab is then for.
     let chosen = view
         .completion
         .as_ref()
         .is_some_and(|popup| popup.navigated);
     let tab = ui.input(|input| input.key_pressed(Key::Tab) && input.modifiers.is_none());
     let caret = selection_of(ui.ctx(), id).filter(Range::is_empty);
-    if let (true, false, Some(caret)) = (tab && config.language.is_markup(), chosen, caret) {
+    let (markup, styles) = (config.language.is_markup(), config.language.name == "CSS");
+    if let (true, false, Some(caret)) = (tab && (markup || styles), chosen, caret) {
         let caret = caret.start;
         let at = godcode_core::byte_index(text, caret);
         let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
-        let abbreviation = godcode_core::emmet::abbreviation(&text[line..at]);
-        let written = abbreviation.and_then(|abbreviation| {
-            let body = godcode_core::emmet::expand(abbreviation, config.language.keywords())?;
-            Some((caret - abbreviation.chars().count(), body))
-        });
-        if let Some((start, body)) = written {
+        let written = if markup {
+            let abbreviation = godcode_core::emmet::abbreviation(&text[line..at]);
+            abbreviation.and_then(|abbreviation| {
+                let tags = config.language.keywords();
+                Some((
+                    abbreviation,
+                    godcode_core::emmet::expand(abbreviation, tags)?,
+                ))
+            })
+        } else {
+            // Alone on its line, in a block: outside one, a short word is a selector.
+            let alone = text[line..at].trim_start();
+            let before = &text[..line];
+            let in_block = before.matches('{').count() > before.matches('}').count();
+            let abbreviation = Some(alone).filter(|_| in_block);
+            abbreviation.and_then(|alone| Some((alone, godcode_core::emmet::expand_css(alone)?)))
+        };
+        if let Some((abbreviation, body)) = written {
+            let start = caret - abbreviation.chars().count();
             pressed(Modifiers::NONE, Key::Tab);
             let after = complete::write_snippet(text, start..caret, &body, config.indent);
             set_selection(ui.ctx(), id, &(after..after));
@@ -848,8 +881,11 @@ fn refresh_completion(
         view.completion = None;
         return;
     };
+    // In markup and in style sheets a name goes on over its hyphens.
+    let hyphens = config.language.is_markup() || config.language.name == "CSS";
+    let named = move |ch: char| ch.is_alphanumeric() || ch == '_' || (hyphens && ch == '-');
     let (word, erased) = ui.input(|input| {
-        let is_word = |text: &str| text.chars().all(|ch| ch.is_alphanumeric() || ch == '_');
+        let is_word = |text: &str| text.chars().all(named);
         (
             input
                 .events
@@ -872,7 +908,8 @@ fn refresh_completion(
         });
         let known = complete::complete(text, caret, config.language);
         let items: Vec<Completion> = own.chain(known).collect();
-        let typed_chars = caret - complete::word_start(text, caret);
+        let before = &text[..godcode_core::byte_index(text, caret)];
+        let typed_chars = before.chars().rev().take_while(|ch| named(*ch)).count();
         let wanted = manual || was_open || typed_chars >= 2;
         view.completion = (wanted && !items.is_empty()).then_some(Popup {
             items,
@@ -1811,9 +1848,8 @@ mod tests {
         let mut harness = Harness::of("index.html", "hello", false);
         set_selection(&harness.ctx, editor_id(), &(5..5));
         harness.frame(Vec::new());
-        harness.key(Key::Escape, Modifiers::NONE);
         harness.key(Key::Tab, Modifiers::NONE);
-        assert!(!harness.text.contains('<'), "{}", harness.text);
+        assert_eq!(harness.text, "hello    ");
         // In code, nothing of the kind.
         let mut harness = Harness::new("div");
         set_selection(&harness.ctx, editor_id(), &(3..3));
@@ -1843,6 +1879,46 @@ mod tests {
         let out = harness.type_text("x");
         assert_eq!(harness.text, "<navx>\n  <p>a</p>\n</navx>");
         assert_eq!(out.selection, Some(end + 2..end + 2));
+    }
+
+    #[test]
+    fn style_sheets_and_worded_blocks_are_helped_too() {
+        // An abbreviation alone on a line of a block, then Tab.
+        let mut harness = Harness::of("style.css", "a {\n    \n}", false);
+        set_selection(&harness.ctx, editor_id(), &(8..8));
+        harness.frame(Vec::new());
+        harness.type_text("m10-20");
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "a {\n    margin: 10px 20px;\n}");
+        // Outside a block the same letters are a selector: Tab indents.
+        let mut harness = Harness::of("style.css", "p", false);
+        set_selection(&harness.ctx, editor_id(), &(1..1));
+        harness.frame(Vec::new());
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert!(!harness.text.contains("padding"), "{}", harness.text);
+        // A hyphenated property is offered, and Tab writes the rest of it.
+        let mut harness = Harness::of("style.css", "a {\n    \n}", false);
+        set_selection(&harness.ctx, editor_id(), &(8..8));
+        harness.frame(Vec::new());
+        for letter in ["f", "o", "n", "t", "-", "s", "i"] {
+            harness.type_text(letter);
+        }
+        assert!(harness.view.completion.is_some(), "the list is open");
+        harness.key(Key::ArrowDown, Modifiers::NONE);
+        harness.key(Key::ArrowUp, Modifiers::NONE);
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "a {\n    font-size: ;\n}");
+        // Where blocks end with a word: Enter indents after `then`, `end` comes back.
+        let mut harness = Harness::of("a.lua", "if x then", false);
+        set_selection(&harness.ctx, editor_id(), &(9..9));
+        harness.frame(Vec::new());
+        harness.key(Key::Enter, Modifiers::NONE);
+        harness.type_text("y()");
+        harness.key(Key::Enter, Modifiers::NONE);
+        for letter in ["e", "n", "d"] {
+            harness.type_text(letter);
+        }
+        assert_eq!(harness.text, "if x then\n    y()\nend");
     }
 
     #[test]

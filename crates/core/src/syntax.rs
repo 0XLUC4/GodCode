@@ -1576,6 +1576,52 @@ impl Language {
         LANGUAGES.len()
     }
 
+    /// Whether `line`, a line of code up to its end, opens a block with a word: `if x
+    /// then`, `def f`, `items.each do |item|`. What brackets and colons open is not told
+    /// here.
+    pub fn opens_block(&self, line: &str) -> bool {
+        let line = line.trim();
+        let last = line.rsplit(|ch: char| !ch.is_alphanumeric()).next();
+        let last = last.unwrap_or("");
+        let starts = |words: &[&str]| {
+            let rest = words.iter().find_map(|word| line.strip_prefix(word));
+            rest.is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '(']))
+        };
+        // A block closed on the line it opens is no block to be in.
+        let closed = last == "end" || line.contains(" end ");
+        match self.name {
+            "Lua" => {
+                let anonymous = line.ends_with(')') && line.contains("function(");
+                let named = starts(&["function", "local function"]);
+                !closed && (matches!(last, "then" | "do" | "else" | "repeat") || named || anonymous)
+            }
+            "Ruby" => {
+                let with_arguments = line.ends_with('|') && line.contains(" do |");
+                let worded = matches!(last, "do" | "then" | "else" | "begin" | "ensure" | "rescue");
+                let opening = [
+                    "def", "class", "module", "if", "unless", "while", "until", "case", "elsif",
+                    "when",
+                ];
+                !closed && (worded || with_arguments || starts(&opening))
+            }
+            "Shell" => matches!(last, "then" | "do" | "else"),
+            "Elixir" => !closed && (matches!(last, "do" | "else") || line.ends_with("->")),
+            _ => false,
+        }
+    }
+
+    /// The words that end a block, or start its next part: typed first on a line, they go
+    /// back one level.
+    pub fn block_closers(&self) -> &'static [&'static str] {
+        match self.name {
+            "Lua" => &["end", "else", "until"],
+            "Ruby" => &["end", "else", "elsif", "when", "rescue", "ensure"],
+            "Shell" => &["fi", "done", "else", "elif", "esac"],
+            "Elixir" => &["end", "else"],
+            _ => &[],
+        }
+    }
+
     /// Tags and attributes rather than statements: HTML, XML.
     pub fn is_markup(&self) -> bool {
         self.family == Family::Markup
