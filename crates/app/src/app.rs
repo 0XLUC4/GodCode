@@ -1250,6 +1250,26 @@ fn whole_address(typed: &str) -> Option<String> {
     }
 }
 
+/// The tests of a file of the project: its path from the root, then each test with the
+/// line (from 0) it starts on.
+type FileTests = (String, Vec<(usize, String)>);
+
+/// Files bigger than this are not read for their tests: they are data, or generated.
+const MAX_TESTED_BYTES: u64 = 512 * 1024;
+
+/// The tests of the files `listed` under `root`, for the files that have some.
+fn tests_under(root: &Path, listed: &[String]) -> Vec<FileTests> {
+    let of_file = |relative: &String| {
+        let path = root.join(relative);
+        let language = Language::of(&path);
+        let small = std::fs::metadata(&path).is_ok_and(|meta| meta.len() <= MAX_TESTED_BYTES);
+        let text = std::fs::read_to_string(&path).ok().filter(|_| small)?;
+        let tests = outline::tests(&text, language);
+        (!tests.is_empty()).then(|| (relative.clone(), tests))
+    };
+    listed.iter().filter_map(of_file).collect()
+}
+
 /// Whose keys the editor obeys.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keys {
@@ -1515,6 +1535,10 @@ pub struct GodApp {
     test_run: Option<Receiver<String>>,
     test_results: Vec<(String, bool)>,
     test_output: String,
+    /// The tests of the whole project, file by file, once looked for; and the search for
+    /// them while it runs.
+    project_tests: Vec<FileTests>,
+    test_scan: Option<Receiver<Vec<FileTests>>>,
     /// What picking a branch does: switch to it, merge it, rebase onto it.
     branch_action: Cmd,
 }
@@ -1675,6 +1699,8 @@ impl GodApp {
             test_run: None,
             test_results: Vec::new(),
             test_output: String::new(),
+            project_tests: Vec::new(),
+            test_scan: None,
             branch_action: Cmd::Branches,
         };
         if paths.is_empty() {
@@ -3542,8 +3568,34 @@ impl GodApp {
         self.bottom = Some(Bottom::Tests);
     }
 
+    /// Look for the tests of every file of the project, out of the way.
+    fn scan_tests(&mut self, ctx: &Context) {
+        let Some(root) = self.folder().filter(|_| self.test_scan.is_none()) else {
+            return;
+        };
+        let listed = self.index.clone();
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            // The folder may have been closed meanwhile: nobody listens then.
+            let _ = sender.send(tests_under(&root, &listed));
+            waking.request_repaint();
+        });
+        self.test_scan = Some(receiver);
+    }
+
     /// Take in what the tests run here printed, once they ended.
     fn poll_tests(&mut self) {
+        if let Some(scan) = &self.test_scan {
+            match scan.try_recv() {
+                Ok(found) => {
+                    self.project_tests = found;
+                    self.test_scan = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.test_scan = None,
+            }
+        }
         let Some(run) = &self.test_run else {
             return;
         };
@@ -3602,6 +3654,8 @@ impl GodApp {
         });
         ui.add_space(4.0);
         let mut run = None;
+        // The tests of the project are to be looked for; one of them is to be shown.
+        let (mut scan, mut go_to) = (false, None);
         // What the last run said of a test: the last word, when it ran more than once.
         let verdict = |name: &str| {
             let said = self.test_results.iter().rev().find(|(ran, _)| ran == name);
@@ -3644,6 +3698,44 @@ impl GodApp {
                             "No test found in this file (Rust, Python, Go, JavaScript, TypeScript).";
                         ui.label(RichText::new(none).color(palette.text_dim));
                     }
+                    // Every test of the project, file by file: a click goes to it.
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        let count: usize = self.project_tests.iter().map(|file| file.1.len()).sum();
+                        let title = match (self.test_scan.is_some(), count) {
+                            (true, _) => "PROJECT: looking…".to_owned(),
+                            (false, 0) => "PROJECT".to_owned(),
+                            (false, count) => format!("PROJECT: {count} tests"),
+                        };
+                        ui.label(RichText::new(title).size(11.0).strong().color(palette.text_dim));
+                        let look = Button::new("Find all").frame_when_inactive(false);
+                        let tip = "Look for the tests of every file of the folder";
+                        scan = ui.add(look).on_hover_text(tip).clicked();
+                    });
+                    for (file, tests) in &self.project_tests {
+                        list_row(ui, &palette, file, 10.0, palette.text_dim);
+                        for (line, name) in tests {
+                            let row = list_row(ui, &palette, name, 44.0, palette.text);
+                            // Told by the last run made here, when it ran this one.
+                            let said = verdict(name).map(|passed| match passed {
+                                true => (icon::CHECK_CIRCLE, PASSED),
+                                false => (icon::X_CIRCLE, FAILED),
+                            });
+                            if let Some((glyph, ink)) = said {
+                                ui.painter().text(
+                                    pos2(row.rect.min.x + 24.0, row.rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    glyph,
+                                    FontId::proportional(13.0),
+                                    ink,
+                                );
+                            }
+                            if row.on_hover_text("Go to this test").clicked() {
+                                go_to = Some((file.clone(), *line));
+                            }
+                        }
+                    }
                 });
             ScrollArea::both()
                 .id_salt("tests-output")
@@ -3657,6 +3749,16 @@ impl GodApp {
         let ctx = ui.ctx().clone();
         if run_all {
             self.start_tests(&ctx);
+        }
+        if scan {
+            self.scan_tests(&ctx);
+        }
+        if let (Some((file, line)), Some(root)) = (go_to, self.folder())
+            && self.open_file(&ctx, &root.join(file))
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            let start = godcode_core::line_start(&tab.text, line + 1);
+            tab.select(&ctx, start..start);
         }
         let command = run.and_then(|name| {
             let tab = self.tabs.get(self.active)?;
@@ -8044,6 +8146,31 @@ mod tests {
         assert_eq!(lines, [2, 4, 7]);
         // Nothing below the edit: nothing moves.
         assert!(!move_stops(&mut lines, &mut conditions, 20, 3));
+    }
+
+    #[test]
+    fn the_tests_of_a_project_are_found_file_by_file() {
+        let root = std::env::temp_dir().join(format!("godcode-tests-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).expect("folder");
+        std::fs::write(
+            root.join("src/sum.rs"),
+            "fn add() {}\n\n#[test]\nfn adds() {}\n\n#[test]\nfn breaks() {}\n",
+        )
+        .expect("file");
+        std::fs::write(root.join("test_app.py"), "def test_runs():\n    pass\n").expect("file");
+        std::fs::write(root.join("notes.md"), "# no test here\n").expect("file");
+        let listed = ["src/sum.rs", "test_app.py", "notes.md", "gone.rs"].map(str::to_owned);
+        let found = tests_under(&root, &listed);
+        let names = |file: &FileTests| file.1.iter().map(|test| test.1.clone()).collect::<Vec<_>>();
+        // The files that have tests, with them; a file without, or that is gone, not at all.
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(
+            (found[0].0.as_str(), names(&found[0])),
+            ("src/sum.rs", vec!["adds".to_owned(), "breaks".to_owned()])
+        );
+        assert_eq!(found[0].1[0].0, 3);
+        assert_eq!(names(&found[1]), ["test_runs"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
