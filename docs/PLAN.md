@@ -131,7 +131,8 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Historique d'annulation par différences : seul ce qui change est gardé (64 Mo au plus), donc autant de niveaux dans un gros fichier que dans un petit ; une frappe groupée par pauses d'une seconde ; un changement fait ailleurs (commande, Vim, serveur de langage) est trouvé par comparaison | ✅ |
 | Couleurs refaites pour les seules lignes qu'un changement peut toucher : sur 200 000 lignes, une frappe relit sa ligne (≈1 ms) au lieu de tout le texte (≈60 ms) ; ouvrir ou fermer un commentaire relit ce qui suit | ✅ |
 | Ce qui est su d'un texte coloré (débuts de lignes, retraits, crochets) suit un changement depuis les seules lignes relues : sur 200 000 lignes, une frappe au milieu coûte ≈4 ms au lieu de ≈12 ms | ✅ |
-| Gros fichiers : frappe en temps constant partout (corde ou tampon à trou au lieu d'une `String`) ; Entrée, Tab et les touches Vim relisent encore tout le texte | ⏳ |
+| Entrée, Tab, Maj+Tab, commenter, dupliquer / supprimer / déplacer une ligne, fermeture auto des crochets : ne lisent plus que les lignes autour du curseur (≈20–35 ms → ≈2 ms à 40 Mo pour leur part) | ✅ |
+| Gros fichiers, ce qui reste lié à la taille : dans un fichier coloré le champ relit encore le texte à chaque frappe (≈26 ms à 2 Mo) ; dans un texte brut de 40 Mo, Entrée et Tab coûtent ≈40 ms car le champ relit le texte après une touche traitée par l'éditeur ; les touches Vim relisent tout le texte. Une corde ou un tampon à trou à la place de la `String` n'est pas fait | ⏳ |
 
 ### Phase 4 — exécution, tests, débogage (✅)
 
