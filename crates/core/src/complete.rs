@@ -1,6 +1,7 @@
 //! Completion of the word being typed: snippets, keywords and words of the file.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use crate::byte_index;
 use crate::syntax::Language;
@@ -247,17 +248,27 @@ pub fn unclosed_tag(before: &str) -> Option<(String, usize)> {
 /// Replace the word ending at `caret` by `completion`. Returns the new caret.
 pub fn apply(text: &mut String, caret: usize, completion: &Completion, unit: &str) -> usize {
     let start = word_start(text, caret);
-    let bytes = byte_index(text, start)..byte_index(text, caret);
-    // The lines of a snippet continue the indent of the line it starts on.
+    write_snippet(text, start..caret, &completion.body, unit)
+}
+
+/// The body of the snippet `label` that comes with `language`.
+pub(crate) fn builtin(language: &str, label: &str) -> Option<&'static str> {
+    let (_, snippets) = SNIPPETS.iter().find(|(name, _)| *name == language)?;
+    let (_, body) = snippets.iter().find(|(found, _)| *found == label)?;
+    Some(body)
+}
+
+/// Write the snippet `body` over the chars `chars`: a tab in it is one `unit` of indent,
+/// its lines continue the indent of the line it starts on, `$0` is where the caret goes.
+/// Returns the caret.
+pub fn write_snippet(text: &mut String, chars: Range<usize>, body: &str, unit: &str) -> usize {
+    let bytes = byte_index(text, chars.start)..byte_index(text, chars.end);
     let line_start = text[..bytes.start].rfind('\n').map_or(0, |index| index + 1);
     let lead: String = text[line_start..]
         .chars()
         .take_while(|ch| *ch == ' ' || *ch == '\t')
         .collect();
-    let body = completion
-        .body
-        .replace('\t', unit)
-        .replace('\n', &format!("\n{lead}"));
+    let body = body.replace('\t', unit).replace('\n', &format!("\n{lead}"));
     let (body, offset) = match body.find("$0") {
         Some(at) => (body.replacen("$0", "", 1), body[..at].chars().count()),
         None => {
@@ -266,7 +277,7 @@ pub fn apply(text: &mut String, caret: usize, completion: &Completion, unit: &st
         }
     };
     text.replace_range(bytes, &body);
-    start + offset
+    chars.start + offset
 }
 
 #[cfg(test)]

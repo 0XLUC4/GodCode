@@ -5,6 +5,7 @@
 pub mod check;
 pub mod complete;
 pub mod edit;
+pub mod emmet;
 pub mod format;
 pub mod fuzzy;
 pub mod git;

@@ -735,6 +735,31 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
         return true;
     }
     let pressed = |modifiers, key| ui.input_mut(|input| input.consume_key(modifiers, key));
+    // In markup, Tab after an abbreviation writes the elements it stands for; unless a
+    // completion was chosen with the arrows, which Tab is then for.
+    let chosen = view
+        .completion
+        .as_ref()
+        .is_some_and(|popup| popup.navigated);
+    let tab = ui.input(|input| input.key_pressed(Key::Tab) && input.modifiers.is_none());
+    let caret = selection_of(ui.ctx(), id).filter(Range::is_empty);
+    if let (true, false, Some(caret)) = (tab && config.language.is_markup(), chosen, caret) {
+        let caret = caret.start;
+        let at = godcode_core::byte_index(text, caret);
+        let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
+        let abbreviation = godcode_core::emmet::abbreviation(&text[line..at]);
+        let written = abbreviation.and_then(|abbreviation| {
+            let body = godcode_core::emmet::expand(abbreviation, config.language.keywords())?;
+            Some((caret - abbreviation.chars().count(), body))
+        });
+        if let Some((start, body)) = written {
+            pressed(Modifiers::NONE, Key::Tab);
+            let after = complete::write_snippet(text, start..caret, &body, config.indent);
+            set_selection(ui.ctx(), id, &(after..after));
+            view.completion = None;
+            return true;
+        }
+    }
     if let Some(popup) = &mut view.completion {
         if pressed(Modifiers::NONE, Key::Escape) {
             view.completion = None;
@@ -1741,6 +1766,32 @@ mod tests {
         harness.type_text("<br");
         harness.type_text(">");
         assert_eq!(harness.text, "<div><br></div>");
+    }
+
+    #[test]
+    fn tab_writes_what_an_abbreviation_stands_for() {
+        let mut harness = Harness::of("index.html", "<body>\n    \n</body>", false);
+        set_selection(&harness.ctx, editor_id(), &(11..11));
+        harness.frame(Vec::new());
+        harness.type_text("ul>li.item*2");
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        let list = "    <ul>\n        <li class=\"item\"></li>\n        <li class=\"item\"></li>\n    </ul>";
+        assert_eq!(harness.text, format!("<body>\n{list}\n</body>"));
+        // The caret waits in the first item.
+        assert_eq!(out.selection, Some(41..41));
+        // A word that names no element is a word: Tab indents, as anywhere else.
+        let mut harness = Harness::of("index.html", "hello", false);
+        set_selection(&harness.ctx, editor_id(), &(5..5));
+        harness.frame(Vec::new());
+        harness.key(Key::Escape, Modifiers::NONE);
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert!(!harness.text.contains('<'), "{}", harness.text);
+        // In code, nothing of the kind.
+        let mut harness = Harness::new("div");
+        set_selection(&harness.ctx, editor_id(), &(3..3));
+        harness.frame(Vec::new());
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert!(!harness.text.contains('<'), "{}", harness.text);
     }
 
     #[test]
