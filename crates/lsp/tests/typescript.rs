@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use godcode_lsp::{Event, Server};
+use godcode_lsp::{Event, FoldKind, Server};
 
 /// Ask again until the server, once it has read the project, gives an answer worth keeping.
 fn until<T>(
@@ -237,6 +237,69 @@ fn a_real_server_writes_types_and_argument_names() {
     assert_eq!(
         found,
         [(0, 29, ": number"), (1, 10, ": number"), (1, 19, "count:")]
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore = "needs typescript-language-server"]
+fn a_real_server_says_what_folds() {
+    let root = folder("folds");
+    let file = root.join("folds.ts");
+    let lines = [
+        "/*",
+        " * The total of a cart.",
+        " */",
+        "function total(prices: number[]) {",
+        "  let sum = 0",
+        "  for (const price of prices) {",
+        "    sum += price",
+        "  }",
+        "  return sum",
+        "}",
+        "",
+        "// #region settings",
+        "const settings = {",
+        "  currency: \"EUR\",",
+        "  rounded: true,",
+        "}",
+        "// #endregion",
+        "",
+        // Two lists on one line: ranges the server gives, with nothing to fold.
+        "export const paid = [total([1, 2]), settings]",
+        "",
+    ];
+    let text = lines.join("\n");
+    std::fs::write(&file, &text).expect("file");
+
+    let mut server = Server::start(&program(), &["--stdio"], &root, "", || {}).expect("server");
+    server.open(&file, "typescript", &text);
+    let folds = until(
+        &mut server,
+        |server| server.folds(&file),
+        |id, event| match event {
+            Event::Folds { id: of, list } if of == id && !list.is_empty() => Some(list),
+            _ => None,
+        },
+    );
+    let found: Vec<_> = folds
+        .iter()
+        .map(|fold| (fold.first, fold.last, fold.kind))
+        .collect();
+    // The comment, the function and its loop, the region and the object in it. Code stops
+    // a line short, so that what closes it stays in sight; the two lists of the last line
+    // hide nothing, and are not there.
+    assert_eq!(
+        found,
+        [
+            (0, 2, Some(FoldKind::Comment)),
+            (3, 8, None),
+            (5, 6, None),
+            (11, 16, Some(FoldKind::Region)),
+            (12, 14, None),
+        ]
     );
 
     drop(server);
