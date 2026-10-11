@@ -110,14 +110,14 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Retour à la ligne (soft wrap, `Alt+Z`) : rangées coupées aux espaces, comptées sans mettre le texte en page ; haut/bas vont de rangée en rangée | ✅ |
 | Saisie par IME : texte en cours de composition, fenêtre de l'IME placée au curseur | ✅ testé par événements simulés, pas avec un vrai IME |
 | Défilement automatique pendant une sélection à la souris | ✅ |
-| Repli de code : flèche près du numéro de ligne, `Fold / Unfold Block`, `Unfold All` ; blocs trouvés par l'indentation ; un bloc s'ouvre quand le curseur y entre | ✅ |
-| Replis gardés d'une session à l'autre, repli par accolades ou par le serveur de langage | ⏳ |
-| Indices en ligne (inlay hints) : écrits dans la ligne sans faire partie du texte, redemandés à chaque changement ; le serveur TypeScript est réglé pour en donner, rust-analyzer et clangd en donnent d'eux-mêmes (non lancés ici) | ✅ |
-| Réglage pour couper les indices, indices demandés pour les seules lignes visibles (aujourd'hui : tout le fichier) | ⏳ |
+| Repli de code : flèche près du numéro de ligne, `Fold / Unfold Block`, `Unfold All` ; un bloc est ce que tient un crochet laissé ouvert (hors chaînes et commentaires), sinon ce qui est indenté plus loin ; il s'ouvre quand le curseur y entre ; les replis sont gardés d'une session à l'autre | ✅ |
+| Repli donné par le serveur de langage (`textDocument/foldingRange`) | ⏳ |
+| Indices en ligne (inlay hints) : écrits dans la ligne sans faire partie du texte ; demandés pour les lignes autour de la vue (100 au-dessus, 300 en dessous), à chaque changement et quand la vue en sort ; `Toggle Inlay Hints` les coupe. Le serveur TypeScript est réglé pour en donner, rust-analyzer et clangd en donnent d'eux-mêmes (non lancés ici) | ✅ |
+| Indices suivis pendant la frappe (aujourd'hui : les anciens restent un instant, parfois décalés, jusqu'à la réponse du serveur) | ⏳ |
 | Sélection en colonnes : `Alt+Maj+glisser` ou `Ctrl+Alt+Maj+flèches` ; ce qui est tapé remplace chaque ligne du rectangle, puis chaque ligne garde un curseur | ✅ |
-| Touches Vim (`Switch Keys`) : modes normal, insertion, visuel et visuel ligne ; déplacements `h j k l w b e 0 ^ $ gg G` avec compte ; `d c y` avec déplacement ou doublés, `x D C p P r J o O i a I A u Ctrl+R /` ; mode affiché dans la barre d'état, curseur bloc. Moteur pur et testé : `crates/core/src/modal.rs` | ✅ |
-| Touches Emacs : `Ctrl+F B N P A E`, `Alt+F B`, `Ctrl+D K Y W`, `Alt+W D`, marque `Ctrl+Espace`, `Ctrl+G`, `Ctrl+/`, `Ctrl+S` cherche, `Ctrl+X Ctrl+S` enregistre, `Ctrl+X Ctrl+F` ouvre | ✅ (moteur testé, non vu tourner à l'écran) |
-| Vim : `.`, `f t`, objets de texte (`iw`, `i(`), registres nommés, `:` | ⏳ |
+| Touches Vim (`Switch Keys`) : modes normal, insertion, visuel et visuel ligne ; déplacements `h j k l w b e 0 ^ $ gg G f F t T ; ,` avec compte ; `d c y` avec déplacement, doublés ou sur un objet de texte (`iw aw`, `i( a(`, `i{`, `i[`, `i<`, `i"`, `i'`) ; `x D C p P r J o O i a I A u Ctrl+R /` ; `.` refait le dernier changement, texte tapé compris ; mode affiché dans la barre d'état, curseur bloc. Moteur pur et testé : `crates/core/src/modal.rs` | ✅ |
+| Touches Emacs : `Ctrl+F B N P A E`, `Alt+F B`, `Ctrl+D K Y W`, `Alt+W D`, marque `Ctrl+Espace`, `Ctrl+G`, `Ctrl+/`, `Ctrl+S` cherche, `Ctrl+X Ctrl+S` enregistre, `Ctrl+X Ctrl+F` ouvre | ✅ |
+| Vim : registres nommés, marques, macros, `:`, `%`, `*`, compte devant `.` | ⏳ |
 | Fichiers jusqu'à 64 Mo (2 Mo avant). Au repos, rien n'est relu (70 µs par image à 50 Mo) ; le texte n'est relu qu'après un changement. Au-delà de 2 Mo : texte brut, sans couleurs, serveur de langage, plan, complétion par mots ni historique local. Mesuré : une frappe coûte 16 ms à 10 Mo, 80 ms à 50 Mo (`cargo test --release -p godcode typing_in_a_big -- --ignored --nocapture`) | ✅ |
 | Gros fichiers : frappe en temps constant (corde ou tampon à trou au lieu d'une `String`), couleurs refaites pour les seules lignes changées, annulation par différences au lieu de copies entières (aujourd'hui : copies plafonnées à 256 Mo) | ⏳ |
 
