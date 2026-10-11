@@ -9,7 +9,7 @@ use egui::{
     Modifiers, Order, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui,
     UiBuilder, pos2, vec2,
 };
-use godcode_core::complete::{self, Completion, Kind};
+use godcode_core::complete::{self, Completion, Expanded, Kind, Request, Source, Suggestion};
 use godcode_core::git::{Hunk, LineChange};
 use godcode_core::search::Match;
 use godcode_core::syntax::{self, Language};
@@ -86,6 +86,10 @@ pub struct Config<'a> {
     pub note: Option<&'a str>,
     /// The snippets of the user for this language: what is typed, what it becomes.
     pub snippets: &'a [(String, String)],
+    /// The texts of the other open files: their words are offered too.
+    pub others: &'a [&'a str],
+    /// The files around the one edited: their paths from its folder, with `/`.
+    pub files: &'a [String],
     /// The lines (from 0) the debugger stops on.
     pub breakpoints: &'a [usize],
     /// Those of them it stops on only under a condition.
@@ -140,6 +144,8 @@ pub struct View {
     /// What the text field worked out of the text.
     index: field::Cache,
     completion: Option<Popup>,
+    /// The snippet whose tab stops Tab is going through.
+    walk: Option<Walk>,
     /// The bracket pair at a caret, for the text of a layout key.
     pair: Option<PairAt>,
 }
@@ -158,8 +164,16 @@ impl View {
         // The snippets on offer there stay, first: the server knows names, not structures.
         let shown = self.completion.take().filter(|popup| popup.caret == caret);
         let kept = shown.into_iter().flat_map(|popup| popup.items);
-        let mut all: Vec<Completion> = kept.filter(|item| item.kind == Kind::Snippet).collect();
-        all.extend(items);
+        let mut all: Vec<Suggestion> = kept.filter(|item| item.kind == Kind::Snippet).collect();
+        // Which of them go with what is typed is told once the text is at hand (`sift`).
+        all.extend(items.into_iter().map(|item| Suggestion {
+            label: item.label,
+            body: item.body,
+            kind: item.kind,
+            source: Source::Word,
+            matched: Vec::new(),
+            replace: caret..caret,
+        }));
         self.completion = Some(Popup {
             items: all,
             selected: 0,
@@ -193,7 +207,9 @@ pub(crate) fn indents_of(text: &str) -> Vec<Option<usize>> {
 
 /// The completion list open at the caret.
 struct Popup {
-    items: Vec<Completion>,
+    /// What is offered. Of the kind `Symbol`: what a language server answered, whose
+    /// source and place in the text are not told.
+    items: Vec<Suggestion>,
     selected: usize,
     /// Where the caret was when the list was made; it closes when the caret leaves.
     caret: usize,
@@ -201,6 +217,91 @@ struct Popup {
     navigated: bool,
     /// The start of a word that the list completes, once it was read from the text.
     typed: Option<String>,
+}
+
+impl Popup {
+    /// What a language server answered is read against what is typed in `text`: those
+    /// its letters are found in stay, the best first, after the snippets.
+    fn sift(&mut self, text: &str) {
+        let word = complete::word_start(text, self.caret)..self.caret;
+        let typed = chars_of(text, &word);
+        let (mut kept, mut served) = (Vec::new(), Vec::new());
+        for mut item in std::mem::take(&mut self.items) {
+            if item.kind != Kind::Symbol {
+                kept.push(item);
+            } else if let Some(found) = complete::fuzzy(typed, &item.label) {
+                item.matched = found.positions;
+                served.push((found.score, item));
+            }
+        }
+        served.sort_by_key(|(score, item)| (std::cmp::Reverse(*score), item.label.chars().count()));
+        kept.extend(served.into_iter().map(|(_, item)| item));
+        self.items = kept;
+    }
+}
+
+/// A snippet just written, whose tab stops Tab goes through one after the other.
+struct Walk {
+    /// The snippet, its stops where they now are in the text.
+    snippet: Expanded,
+    /// The stop being filled, counted in `snippet.stops`.
+    step: usize,
+    /// The text as the stops were last placed in it: what changed since is found against
+    /// it, which no count of chars would tell from a change made elsewhere.
+    seen: String,
+}
+
+impl Walk {
+    /// The chars of the stop being filled.
+    fn place(&self) -> Option<Range<usize>> {
+        let stop = self.snippet.stops.get(self.step)?;
+        stop.ranges.first().cloned()
+    }
+
+    /// Take in what changed in `text` since it was last seen: typed in the stop being
+    /// filled, it is written wherever else the snippet has that stop. Returns whether
+    /// the text was written in; `None` when something changed outside the stop: the
+    /// snippet is left.
+    fn keep_up(&mut self, text: &mut String) -> Option<bool> {
+        if self.seen == *text {
+            return Some(false);
+        }
+        let stop = self.place()?;
+        let old = self.seen.as_str();
+        let from = godcode_core::byte_index(old, stop.start);
+        let to = from + godcode_core::byte_index(&old[from..], stop.len());
+        // What the two start with in common, no further than the stop goes: a char typed
+        // at its end may be the very char that follows it.
+        let same = old.bytes().zip(text.bytes());
+        let mut same = same.take_while(|(was, now)| was == now).count().min(to);
+        while !text.is_char_boundary(same) {
+            same -= 1;
+        }
+        if same < from {
+            return None;
+        }
+        let (was, now) = (&old[same..], &text[same..]);
+        let rest = was.bytes().rev().zip(now.bytes().rev());
+        let mut rest = rest.take_while(|(was, now)| was == now).count();
+        while !now.is_char_boundary(now.len() - rest) {
+            rest -= 1;
+        }
+        let at = stop.start + old[from..same].chars().count();
+        let removed = was[..was.len() - rest].chars().count();
+        let added = now[..now.len() - rest].chars().count();
+        if !self.snippet.follow(text, self.step, at, removed, added) {
+            return None;
+        }
+        let twins = self.snippet.stops[self.step].ranges.len() > 1;
+        self.seen.clone_from(text);
+        Some(twins)
+    }
+}
+
+/// The chars `chars` of `text`.
+fn chars_of<'a>(text: &'a str, chars: &Range<usize>) -> &'a str {
+    let start = godcode_core::byte_index(text, chars.start);
+    &text[start..start + godcode_core::byte_index(&text[start..], chars.len())]
 }
 
 pub struct Output {
@@ -1122,7 +1223,9 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
     let tab = ui.input(|input| input.key_pressed(Key::Tab) && input.modifiers.is_none());
     let caret = selection_of(ui.ctx(), id).filter(Range::is_empty);
     let (markup, styles) = (config.language.is_markup(), config.language.name == "CSS");
-    if let (true, false, Some(caret)) = (tab && (markup || styles), chosen, caret) {
+    // Nor while the stops of a snippet are gone through, which Tab is then for.
+    let short = tab && (markup || styles) && view.walk.is_none();
+    if let (true, false, Some(caret)) = (short, chosen, caret) {
         let caret = caret.start;
         let at = godcode_core::byte_index(text, caret);
         let line = text[..at].rfind('\n').map_or(0, |found| found + 1);
@@ -1173,17 +1276,32 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
             popup.navigated = true;
         } else {
             // Enter picks as Tab does, unless the one in front is the very word typed
-            // and writes nothing more: the line is then broken.
+            // and writes nothing more, or nothing is typed of it yet (the list came
+            // with a dot, which may as well end a sentence), or it merely has the
+            // letters typed somewhere: the line is then broken.
             let chosen = popup.items.get(popup.selected);
-            let start = complete::word_start(text, popup.caret);
-            let at = godcode_core::byte_index(text, popup.caret);
-            let typed = &text[godcode_core::byte_index(text, start)..at];
-            let more = chosen.is_some_and(|item| item.body != typed);
+            let more = chosen.is_some_and(|item| {
+                let typed = chars_of(text, &replaced(text, popup.caret, item));
+                !typed.is_empty() && item.body != typed && !scattered(item)
+            });
             let enter = (popup.navigated || more) && pressed(Modifiers::NONE, Key::Enter);
             if enter || pressed(Modifiers::NONE, Key::Tab) {
                 accept(ui.ctx(), id, text, config, view);
                 return true;
             }
+        }
+    }
+    // A snippet was written: Tab goes to its next stop, Shift+Tab back to the one before,
+    // Escape leaves it. Shifted first: a plain pattern also matches the shifted key.
+    if view.walk.is_some() {
+        if pressed(Modifiers::NONE, Key::Escape) {
+            view.walk = None;
+            return false;
+        }
+        let back = pressed(Modifiers::SHIFT, Key::Tab);
+        if back || pressed(Modifiers::NONE, Key::Tab) {
+            step_walk(ui.ctx(), id, view, back);
+            return false;
         }
     }
     if pair(ui, id, text, config) {
@@ -1239,22 +1357,84 @@ fn accept(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>, view: &
     let Some(popup) = view.completion.take() else {
         return;
     };
-    if let Some(item) = popup.items.get(popup.selected) {
-        let caret = complete::apply(text, popup.caret, item, config.indent);
-        set_selection(ctx, id, &(caret..caret));
-        view.focus = true;
-        view.accepted = Some(item.clone());
+    let Some(item) = popup.items.get(popup.selected) else {
+        return;
+    };
+    let over = replaced(text, popup.caret, item);
+    let written = complete::write_stops(text, over, &item.body, config.indent);
+    // What its first stop holds is selected: typing writes over it.
+    set_selection(ctx, id, &written.first());
+    view.focus = true;
+    view.accepted = Some(item.completion());
+    // A folder of a path: what it holds comes next.
+    view.complete_now = item.source == Source::Path && item.label.ends_with('/');
+    // With stops, Tab now goes through them; with none, a snippet being gone through
+    // goes on: what was picked was written in one of its stops.
+    if !written.stops.is_empty() {
+        view.walk = Some(Walk {
+            snippet: written,
+            step: 0,
+            seen: text.clone(),
+        });
     }
 }
 
-/// Open, refresh or close the completion list after this frame's typing.
+/// The chars of `text` that `item`, offered at `caret`, is written over: what was typed
+/// of it.
+fn replaced(text: &str, caret: usize, item: &Suggestion) -> Range<usize> {
+    match item.kind {
+        Kind::Symbol => complete::word_start(text, caret)..caret,
+        _ => item.replace.clone(),
+    }
+}
+
+/// Go to the stop after the one being filled of the snippet gone through, or `back` to
+/// the one before: what it holds is selected. After the last one the caret goes where the
+/// snippet ends, and the snippet is left.
+fn step_walk(ctx: &Context, id: Id, view: &mut View, back: bool) {
+    let Some(walk) = &mut view.walk else {
+        return;
+    };
+    walk.step = match back {
+        true => walk.step.saturating_sub(1),
+        false => walk.step + 1,
+    };
+    let place = walk.place().unwrap_or_else(|| walk.snippet.end.clone());
+    if walk.step >= walk.snippet.stops.len() {
+        view.walk = None;
+    }
+    set_selection(ctx, id, &place);
+    view.completion = None;
+    view.reveal = true;
+}
+
+/// After the editor showed: what was typed in the stop being filled of the snippet gone
+/// through is written in its twins, and the snippet is left when the text changed
+/// elsewhere or the caret is no longer in that stop. Returns whether the text was
+/// written in.
+fn follow_walk(ctx: &Context, id: Id, text: &mut String, view: &mut View) -> bool {
+    let Some(walk) = &mut view.walk else {
+        return false;
+    };
+    let written = walk.keep_up(text);
+    let inside = walk.place().zip(selection_of(ctx, id));
+    let inside = inside
+        .is_some_and(|(stop, selected)| stop.start <= selected.start && selected.end <= stop.end);
+    if written.is_none() || !inside {
+        view.walk = None;
+    }
+    written == Some(true)
+}
+
+/// Open, refresh or close the completion list after this frame's typing. `changed`: the
+/// text is not what it was; `wrote`: because something was typed.
 fn refresh_completion(
     ui: &Ui,
     text: &str,
     config: &Config<'_>,
     view: &mut View,
     caret: Option<usize>,
-    typed: bool,
+    (changed, wrote): (bool, bool),
 ) {
     let manual = std::mem::take(&mut view.complete_now);
     // A big text is not searched for its words at every key.
@@ -1262,73 +1442,107 @@ fn refresh_completion(
         view.completion = None;
         return;
     };
-    // In markup and in style sheets a name goes on over its hyphens.
-    let hyphens = config.language.is_markup() || config.language.name == "CSS";
-    let named = move |ch: char| ch.is_alphanumeric() || ch == '_' || (hyphens && ch == '-');
-    let (word, erased) = ui.input(|input| {
-        let is_word = |text: &str| text.chars().all(named);
-        (
-            input
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Text(text) if is_word(text))),
-            input.key_pressed(Key::Backspace),
-        )
-    });
+    let erased = ui.input(|input| input.key_pressed(Key::Backspace));
     let was_open = view.completion.is_some();
-    if manual || (typed && (word || (erased && was_open))) {
-        let start = complete::word_start(text, caret);
-        let typed: String = text.chars().skip(start).take(caret - start).collect();
-        let typed = typed.to_lowercase();
-        let fits = |label: &str| !typed.is_empty() && label.to_lowercase().starts_with(&typed);
-        let own = config.snippets.iter().filter(|(label, _)| fits(label));
-        let own = own.map(|(label, body)| Completion {
-            label: label.clone(),
-            body: body.clone(),
-            kind: Kind::Snippet,
-        });
-        let known = complete::complete(text, caret, config.language);
-        let items: Vec<Completion> = own.chain(known).collect();
-        let before = &text[..godcode_core::byte_index(text, caret)];
-        let typed_chars = before.chars().rev().take_while(|ch| named(*ch)).count();
-        let wanted = manual || was_open || typed_chars >= 2;
-        view.completion = (wanted && !items.is_empty()).then_some(Popup {
-            items,
-            selected: 0,
-            caret,
-            navigated: false,
-            typed: None,
-        });
-    } else if view
-        .completion
-        .as_ref()
-        .is_some_and(|popup| popup.caret != caret)
-    {
-        view.completion = None;
-    }
-}
-
-/// The chars of `label` that the letters `typed` are found at, in order and whatever their
-/// case: its first ones when it starts with them. None when they are not all in it.
-fn matched(label: &str, typed: &str) -> Vec<usize> {
-    let mut wanted = typed.chars().flat_map(char::to_lowercase).peekable();
-    let mut found = Vec::new();
-    for (index, ch) in label.chars().enumerate() {
-        if wanted.peek().is_some() && ch.to_lowercase().next() == wanted.peek().copied() {
-            found.push(index);
-            wanted.next();
+    // With several carets, what is picked would be written at one of them only.
+    let typed = view.extra.is_empty() && (wrote || (erased && changed && was_open));
+    if !(manual || typed) {
+        let left = |popup: &Popup| popup.caret != caret;
+        if view.completion.as_ref().is_some_and(left) {
+            view.completion = None;
         }
+        return;
     }
-    if wanted.peek().is_some() {
-        found.clear();
+    let files: Vec<&str> = config.files.iter().map(String::as_str).collect();
+    let mut items = complete::suggest(&Request {
+        text,
+        caret,
+        language: config.language,
+        snippets: config.snippets,
+        others: config.others,
+        files: &files,
+    });
+    let before = &text[..godcode_core::byte_index(text, caret)];
+    // What comes with nothing typed: the files of a path, the names that follow a dot.
+    let led = items.first().is_some_and(|item| match item.source {
+        Source::Path => true,
+        Source::Member => asks_members(before, config.language),
+        _ => false,
+    });
+    // Two letters are found somewhere in most names: those are not worth a list.
+    if !manual {
+        items.retain(|item| item.replace.len() > 2 || !scattered(item));
     }
-    found
+    let typed = typed_word(text, caret, config.language).chars().count();
+    let wanted = manual || led || typed >= 2 || (was_open && typed > 0);
+    view.completion = (wanted && !items.is_empty()).then_some(Popup {
+        items,
+        selected: 0,
+        caret,
+        navigated: false,
+        typed: None,
+    });
 }
 
-/// What a snippet writes, on one line.
+/// Whether the `.` or the `::` that ends `before`, the text up to the caret, or comes
+/// before the word that ends it, asks for the names that follow one: not the dot of a
+/// number, nor the one that ends a sentence, in prose or in a comment.
+fn asks_members(before: &str, language: &Language) -> bool {
+    let line = &before[before.rfind('\n').map_or(0, |found| found + 1)..];
+    let commented = language
+        .line_comment()
+        .is_some_and(|marker| line.contains(marker));
+    let named = line.trim_end_matches(|ch: char| ch.is_alphanumeric() || ch == '_');
+    let named = named.trim_end_matches(['.', ':']);
+    let after_name = named.ends_with(|ch: char| !ch.is_ascii_digit() && !ch.is_whitespace());
+    after_name && !commented && !is_prose(language) && !language.is_markup()
+}
+
+/// Where a completion comes from, in a word.
+fn source_word(item: &Suggestion) -> &'static str {
+    match (item.kind, item.source) {
+        (Kind::Symbol, _) => "symbol",
+        (_, Source::Snippet) => "snippet",
+        (_, Source::Keyword) => "keyword",
+        (_, Source::Builtin) => "built-in",
+        (_, Source::Member) => "member",
+        (_, Source::Path) => "path",
+        (_, Source::Word) => "word",
+        (_, Source::Other) => "other file",
+    }
+}
+
+/// Whether the letters typed are merely somewhere in the name of `item`: not one after
+/// the other, nor where its words start. Never so for a file of a path or a name that
+/// follows a dot: those are few, and asked for.
+fn scattered(item: &Suggestion) -> bool {
+    if matches!(item.source, Source::Path | Source::Member) {
+        return false;
+    }
+    let label: Vec<char> = item.label.chars().collect();
+    // A word starts after what is no letter, and at a capital after a small letter.
+    let starts_word = |at: usize| {
+        let before = at.checked_sub(1).and_then(|before| label.get(before));
+        match (before, label.get(at)) {
+            (None, _) => true,
+            (Some(before), Some(ch)) => {
+                (!before.is_alphanumeric() && ch.is_alphanumeric())
+                    || (before.is_lowercase() && ch.is_uppercase())
+            }
+            (Some(_), None) => false,
+        }
+    };
+    let mut last = None;
+    !item.matched.iter().all(|at| {
+        let follows = last.replace(*at).is_some_and(|last| last + 1 == *at);
+        follows || starts_word(*at)
+    })
+}
+
+/// What a snippet writes, on one line: its text, the tab stops left out of it.
 fn preview(body: &str) -> String {
-    let body = body.replace("$0", "");
-    body.split_whitespace().collect::<Vec<_>>().join(" ")
+    let written = complete::expand(body, "\t", "").text;
+    written.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The word being typed that ends at `caret`: what the completions there complete.
@@ -1366,7 +1580,6 @@ fn show_completion(
     let first = popup.selected.saturating_sub(POPUP_ROWS - 1);
     let rows = popup.items.len().min(POPUP_ROWS) as f32;
     let size = vec2(POPUP_ROW.x, POPUP_ROW.y * rows) + egui::Vec2::splat(2.0 * POPUP_EDGE);
-    let typed = popup.typed.as_deref().unwrap_or("");
     let font = FontId::monospace(13.0);
     Area::new(id.with("completion"))
         .order(Order::Foreground)
@@ -1385,24 +1598,17 @@ fn show_completion(
                         } else if response.hovered() {
                             painter.rect_filled(rect, CornerRadius::same(4), palette.hover);
                         }
-                        let kind = match item.kind {
-                            Kind::Snippet => "snippet",
-                            Kind::Keyword => "keyword",
-                            Kind::Word => "word",
-                            Kind::Symbol => "symbol",
-                        };
                         let kind = painter.text(
                             pos2(rect.max.x - 8.0, rect.center().y),
                             Align2::RIGHT_CENTER,
-                            kind,
+                            source_word(item),
                             FontId::proportional(11.0),
                             palette.text_dim,
                         );
                         // The letters typed stand out in the name they are found in.
-                        let found = matched(&item.label, typed);
                         let mut job = LayoutJob::default();
                         for (at, ch) in item.label.chars().enumerate() {
-                            let ink = if found.contains(&at) {
+                            let ink = if item.matched.contains(&at) {
                                 palette.accent_text
                             } else {
                                 palette.text
@@ -1495,6 +1701,16 @@ pub fn show(
     let palette = Palette::of(ui);
     let dark = ui.visuals().dark_mode;
     let font = FontId::monospace(config.font_size);
+    // The text changed since the editor last showed it: the snippet gone through may not
+    // be where it was.
+    if view.walk.as_ref().is_some_and(|walk| walk.seen != *text) {
+        view.walk = None;
+    }
+    // Looked for before the keys take what they deal with: a quote, a bracket.
+    let wrote = ui.input(|input| {
+        let mut events = input.events.iter();
+        events.any(|event| matches!(event, Event::Text(typed) if !typed.is_empty()))
+    });
     let mut changed = retag(ui, id, text, view) | keys(ui, id, text, config, view);
     let selected_before = selection_of(ui.ctx(), id);
 
@@ -1831,48 +2047,64 @@ pub fn show(
                 selection,
                 caret_index,
                 caret_screen,
-                typed,
                 jump,
                 pointed,
                 focused,
             )
         });
     ui.allocate_rect(full, Sense::hover());
-    let (
-        geometry,
-        origin,
-        caret,
-        selection,
-        caret_index,
-        caret_screen,
-        typed,
-        jump,
-        pointed,
-        focused,
-    ) = scrolled.inner;
+    let (geometry, origin, caret, selection, caret_index, caret_screen, jump, pointed, focused) =
+        scrolled.inner;
 
-    refresh_completion(ui, text, config, view, caret_index, typed);
-    let clicked = match (&mut view.completion, caret_screen) {
+    refresh_completion(
+        ui,
+        text,
+        config,
+        view,
+        caret_index,
+        (changed, changed && wrote),
+    );
+    // A list that was not read against the text yet: one a language server answered.
+    if let Some(popup) = view
+        .completion
+        .as_mut()
+        .filter(|popup| popup.typed.is_none())
+    {
+        popup.typed = Some(typed_word(text, popup.caret, config.language));
+        popup.sift(text);
+    }
+    let empty = |popup: &Popup| popup.items.is_empty();
+    if view.completion.as_ref().is_some_and(empty) {
+        view.completion = None;
+    }
+    let clicked = match (&view.completion, caret_screen) {
         (Some(popup), Some(foot)) => {
-            if popup.typed.is_none() {
-                popup.typed = Some(typed_word(text, popup.caret, config.language));
-            }
             let caret = Rect::from_min_max(foot - vec2(0.0, row_height), foot);
             show_completion(ui, id, popup, caret, &palette)
         }
         _ => None,
     };
+    let mut written = false;
     if let Some(index) = clicked {
         if let Some(popup) = &mut view.completion {
             popup.selected = index;
         }
         accept(ui.ctx(), id, text, config, view);
-        // Written after the field showed: it has not seen it.
+        written = true;
+    }
+    written |= follow_walk(ui.ctx(), id, text, view);
+    if written {
+        // Written after the field showed: it has not seen it, and shows it next.
         view.index.forget();
         changed = true;
+        ui.ctx().request_repaint();
     }
-    // Escape closes the list, or leaves one caret: it does not take the keyboard away then.
-    let held = view.completion.is_some() || !view.extra.is_empty() || view.block.is_some();
+    // Escape closes the list, leaves one caret or the snippet gone through: it does not
+    // take the keyboard away then.
+    let held = view.completion.is_some()
+        || !view.extra.is_empty()
+        || view.block.is_some()
+        || view.walk.is_some();
     if focused && held {
         ui.memory_mut(|memory| memory.set_focus_lock_filter(id, field::own_keys(true)));
     }
@@ -2197,6 +2429,11 @@ mod tests {
         file: &'static str,
         wrap: bool,
         hints: Vec<field::Hint>,
+        /// What the completions are made of besides the text: the snippets of the user,
+        /// the texts of the other open files, the files around this one.
+        snippets: Vec<(String, String)>,
+        others: Vec<String>,
+        files: Vec<String>,
         /// Bumped when the text changed, as the app does; and the size it had then.
         revision: u64,
         bytes: usize,
@@ -2227,6 +2464,8 @@ mod tests {
             sticky: true,
             note: None,
             snippets: &[],
+            others: &[],
+            files: &[],
             breakpoints: &[],
             conditional: &[],
             stopped: None,
@@ -2252,6 +2491,9 @@ mod tests {
                 file,
                 wrap,
                 hints: Vec::new(),
+                snippets: Vec::new(),
+                others: Vec::new(),
+                files: Vec::new(),
                 revision: 0,
                 bytes: text.len(),
             };
@@ -2273,7 +2515,13 @@ mod tests {
             if std::mem::replace(&mut self.bytes, self.text.len()) != self.text.len() {
                 self.revision += 1;
             }
-            let config = config_of(self.file, self.wrap, &self.hints, self.revision);
+            let others: Vec<&str> = self.others.iter().map(String::as_str).collect();
+            let config = Config {
+                snippets: &self.snippets,
+                others: &others,
+                files: &self.files,
+                ..config_of(self.file, self.wrap, &self.hints, self.revision)
+            };
             let mut output = None;
             let _ = self.ctx.run_ui(input, |ui| {
                 output = Some(show(
@@ -3770,14 +4018,347 @@ mod tests {
         );
     }
 
+    /// The names on offer, in order.
+    fn offered(harness: &Harness) -> Vec<&str> {
+        let items = harness.view.completion.iter().flat_map(|list| &list.items);
+        items.map(|item| item.label.as_str()).collect()
+    }
+
+    fn type_letters(harness: &mut Harness, letters: &str) -> Output {
+        let typed = letters.chars().map(|letter| letter.to_string());
+        let shown = typed.map(|letter| harness.type_text(&letter));
+        shown.last().expect("letters to type")
+    }
+
+    /// `text` with the caret at its end, and a snippet of the user that has the same
+    /// stop twice, written there: `left + left = sum;`.
+    fn walking(text: &str) -> Harness {
+        let end = text.chars().count();
+        let mut harness = editing("main.rs", text, end..end);
+        let body = "${1:left} + ${1:left} = ${2:sum};$0";
+        harness.snippets = vec![("pair".to_owned(), body.to_owned())];
+        type_letters(&mut harness, "pair");
+        assert_eq!(offered(&harness).first(), Some(&"pair"));
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert!(
+            harness.text.ends_with("left + left = sum;"),
+            "{}",
+            harness.text
+        );
+        harness
+    }
+
+    #[test]
+    fn letters_typed_find_a_name_by_where_its_words_start() {
+        let mut harness = editing("main.rs", "fn get_text_bounds() {}\n", 24..24);
+        type_letters(&mut harness, "gtb");
+        let list = harness.view.completion.as_ref().expect("the list is open");
+        assert_eq!(list.items[0].label, "get_text_bounds");
+        assert_eq!(list.items[0].matched, [0, 4, 9]);
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "fn get_text_bounds() {}\nget_text_bounds");
+    }
+
+    #[test]
+    fn two_letters_merely_found_in_a_name_do_not_open_the_list() {
+        let mut harness = editing("main.rs", "let length = 1;\n", 16..16);
+        type_letters(&mut harness, "gt");
+        assert!(harness.view.completion.is_none(), "{:?}", offered(&harness));
+        // A third one makes it worth offering.
+        harness.type_text("h");
+        assert_eq!(offered(&harness), ["length"]);
+        // Found that way it is Tab's to pick: Enter breaks the line, as it was meant to.
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "let length = 1;\ngth\n");
+        harness.key(Key::Backspace, Modifiers::NONE);
+        harness.key(Key::Backspace, Modifiers::NONE);
+        harness.type_text("h");
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "let length = 1;\nlength");
+        // Two that start it, or its words, are enough.
+        let mut harness = editing("main.rs", "let length = 1;\n", 16..16);
+        type_letters(&mut harness, "le");
+        assert!(
+            offered(&harness).contains(&"length"),
+            "{:?}",
+            offered(&harness)
+        );
+    }
+
+    #[test]
+    fn a_word_of_another_open_file_is_offered_after_those_of_this_one() {
+        let mut harness = editing("main.rs", "let counter_near = 0;\n", 22..22);
+        harness.others = vec!["let counter_far = 1;".to_owned()];
+        type_letters(&mut harness, "cou");
+        assert_eq!(offered(&harness)[..2], ["counter_near", "counter_far"]);
+        let list = harness.view.completion.as_ref().expect("the list is open");
+        let words: Vec<&str> = list.items.iter().map(source_word).collect();
+        assert_eq!(words[..2], ["word", "other file"]);
+        harness.key(Key::ArrowDown, Modifiers::NONE);
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "let counter_near = 0;\ncounter_far");
+    }
+
+    #[test]
+    fn a_dot_opens_the_list_of_the_names_that_follow_one() {
+        let text = "point.width = 1;\npoint";
+        let mut harness = editing("main.rs", text, 22..22);
+        harness.type_text(".");
+        assert_eq!(offered(&harness), ["width"]);
+        let list = harness.view.completion.as_ref().expect("the list is open");
+        assert_eq!(source_word(&list.items[0]), "member");
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "point.width = 1;\npoint.width");
+        // With nothing typed of it, Enter breaks the line: the dot may end a sentence.
+        let mut harness = editing("main.rs", text, 22..22);
+        harness.type_text(".");
+        assert!(harness.view.completion.is_some());
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "point.width = 1;\npoint.\n");
+        // The dot of a number asks for nothing, nor does one in a comment or in prose.
+        for (file, text) in [
+            ("main.rs", "point.width = 1;\nlet x = 3"),
+            ("main.rs", "point.width = 1;\n// the point"),
+            ("notes.md", "point.width = 1;\nthe point"),
+        ] {
+            let end = text.chars().count();
+            let mut harness = editing(file, text, end..end);
+            harness.type_text(".");
+            assert!(harness.view.completion.is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_path_in_a_string_is_completed_one_step_at_a_time() {
+        let mut harness = Harness::of("main.js", "", false);
+        harness.files = ["lib/math.js", "lib/text.js", "app.js"]
+            .map(str::to_owned)
+            .to_vec();
+        harness.type_text("import x from ");
+        // The quote that opens the string is enough: what is in the folder shows.
+        harness.type_text("\"");
+        assert_eq!(harness.text, "import x from \"\"");
+        assert_eq!(offered(&harness), ["lib/", "app.js"]);
+        let list = harness.view.completion.as_ref().expect("the list is open");
+        assert_eq!(source_word(&list.items[0]), "path");
+        // A folder picked, what it holds comes next.
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "import x from \"lib/\"");
+        assert_eq!(offered(&harness), ["math.js", "text.js"]);
+        harness.type_text("t");
+        assert_eq!(offered(&harness).first(), Some(&"text.js"));
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "import x from \"lib/text.js\"");
+        assert_eq!(out.selection, Some(26..26));
+        assert!(harness.view.completion.is_none());
+    }
+
+    #[test]
+    fn tab_goes_through_the_stops_of_a_snippet_and_what_is_typed_in_one_is_written_in_its_twins() {
+        let mut harness = walking("");
+        // What the first stop holds is selected: typing writes over it, here and there.
+        assert_eq!(harness.frame(Vec::new()).selection, Some(0..4));
+        let out = harness.type_text("x");
+        assert_eq!(harness.text, "x + x = sum;");
+        assert_eq!(out.selection, Some(1..1));
+        harness.type_text("y");
+        assert_eq!(harness.text, "xy + xy = sum;");
+        harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(harness.text, "x + x = sum;");
+        harness.type_text("y");
+        assert!(harness.view.completion.is_none(), "{:?}", offered(&harness));
+        // Tab selects the next stop, Shift+Tab the one before, as it now is.
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("xy + xy = sum;", Some(10..13))
+        );
+        let out = harness.key(Key::Tab, Modifiers::SHIFT);
+        assert_eq!(out.selection, Some(0..2));
+        let out = harness.key(Key::Tab, Modifiers::SHIFT);
+        assert_eq!(out.selection, Some(0..2), "there is none before the first");
+        harness.key(Key::Tab, Modifiers::NONE);
+        harness.type_text("z");
+        assert_eq!(harness.text, "xy + xy = z;");
+        // After the last stop, Tab goes where the snippet ends; then it indents again.
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(
+            (harness.text.as_str(), out.selection),
+            ("xy + xy = z;", Some(12..12))
+        );
+        assert!(harness.view.walk.is_none());
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "xy + xy = z;    ");
+    }
+
+    #[test]
+    fn a_snippet_is_left_with_escape_or_when_the_caret_leaves_its_stop() {
+        // Escape: the keyboard stays, and Tab indents as anywhere.
+        let mut harness = walking("");
+        let out = harness.key(Key::Escape, Modifiers::NONE);
+        assert!(harness.view.walk.is_none() && out.focused);
+        assert_eq!(out.selection, Some(0..4));
+        harness.key(Key::Home, Modifiers::NONE);
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "    left + left = sum;");
+        // An arrow inside the stop keeps it, one that takes the caret out leaves it.
+        let mut harness = walking("");
+        harness.key(Key::ArrowRight, Modifiers::NONE);
+        assert!(harness.view.walk.is_some());
+        harness.key(Key::End, Modifiers::NONE);
+        assert!(harness.view.walk.is_none());
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "left + left = sum;    ");
+        // A click elsewhere.
+        let mut harness = walking("");
+        let pos = pos2(600.0, 10.0);
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        harness.frame(vec![Event::PointerMoved(pos)]);
+        harness.frame(vec![button(true)]);
+        harness.frame(vec![button(false)]);
+        assert_eq!(harness.frame(Vec::new()).selection, Some(18..18));
+        assert!(harness.view.walk.is_none());
+        // What is typed outside the stop: its twins are left as they are.
+        let mut harness = walking("");
+        set_selection(&harness.ctx, editor_id(), &(18..18));
+        harness.type_text("!");
+        assert_eq!(harness.text, "left + left = sum;!");
+        assert!(harness.view.walk.is_none());
+        // The text changed from elsewhere.
+        let mut harness = walking("");
+        harness.text.insert_str(0, "// note\n");
+        harness.frame(Vec::new());
+        assert!(harness.view.walk.is_none());
+        assert_eq!(harness.text, "// note\nleft + left = sum;");
+    }
+
+    #[test]
+    fn what_is_typed_in_a_stop_and_in_its_twins_is_taken_back_together() {
+        let mut harness = walking("");
+        harness.time += 5.0;
+        harness.type_text("x");
+        assert_eq!(harness.text, "x + x = sum;");
+        undo(&mut harness);
+        assert_eq!(harness.text, "left + left = sum;");
+        // The stops are not where they were: the snippet is left.
+        assert!(harness.view.walk.is_none());
+        harness.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(harness.text, "x + x = sum;");
+    }
+
+    #[test]
+    fn a_completion_picked_in_a_stop_is_written_in_its_twins_too() {
+        let mut harness = walking("let counter = 1;\n");
+        type_letters(&mut harness, "cou");
+        assert_eq!(offered(&harness).first(), Some(&"counter"));
+        harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "let counter = 1;\ncounter + counter = sum;");
+        // The snippet goes on: Tab is for its next stop again.
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(out.selection, Some(37..40));
+    }
+
+    #[test]
+    fn a_snippet_is_gone_through_after_line_ends_and_chars_of_any_width() {
+        let above = "// héllo ✓ wörld\r\nlet añb = \"日本\";\r\n";
+        let mut harness = walking(above);
+        let start = above.chars().count();
+        assert_eq!(harness.frame(Vec::new()).selection, Some(start..start + 4));
+        harness.type_text("é");
+        assert_eq!(harness.text, format!("{above}é + é = sum;"));
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(out.selection, Some(start + 8..start + 11));
+        harness.type_text("日");
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, format!("{above}é + é = 日;"));
+        assert_eq!(out.selection, Some(start + 10..start + 10));
+        // A snippet that comes with the language, its lines indented as the line it is on.
+        let mut harness = editing("main.rs", "// ✓\r\n    ", 10..10);
+        type_letters(&mut harness, "fn");
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "// ✓\r\n    fn name() {\n        \n    }");
+        assert_eq!(out.selection, Some(13..17));
+        harness.type_text("a");
+        harness.key(Key::Tab, Modifiers::NONE);
+        let out = harness.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(harness.text, "// ✓\r\n    fn a() {\n        \n    }");
+        assert_eq!(out.selection, Some(27..27));
+    }
+
+    #[test]
+    fn what_a_language_server_offers_is_found_by_its_letters_after_the_snippets() {
+        let mut harness = editing("main.rs", "", 0..0);
+        type_letters(&mut harness, "ma");
+        let snippets = harness.view.completion.as_ref().map_or(0, |list| {
+            let snippets = list.items.iter().filter(|item| item.kind == Kind::Snippet);
+            snippets.count()
+        });
+        assert!(snippets > 0, "{:?}", offered(&harness));
+        let served = ["other_thing", "my_map", "make_all"].map(|label| Completion {
+            label: label.to_owned(),
+            body: label.to_owned(),
+            kind: Kind::Symbol,
+        });
+        harness.view.offer(2, served.to_vec());
+        harness.frame(Vec::new());
+        let list = harness.view.completion.as_ref().expect("the list is open");
+        let kinds = list.items.iter().map(|item| item.kind);
+        let first: Vec<Kind> = kinds.take(snippets).collect();
+        assert_eq!(first, vec![Kind::Snippet; snippets]);
+        // The one that starts with what is typed, then the one that has its letters.
+        assert_eq!(offered(&harness)[snippets..], ["make_all", "my_map"]);
+        assert_eq!(list.items[snippets].matched, [0, 1]);
+        assert_eq!(source_word(&list.items[snippets]), "symbol");
+        // Picked, it is told to the app, which may have an import to write for it.
+        for _ in 0..=snippets {
+            harness.key(Key::ArrowDown, Modifiers::NONE);
+        }
+        harness.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(harness.text, "my_map");
+        let accepted = harness.view.accepted.take().expect("one was picked");
+        assert_eq!(
+            (accepted.label.as_str(), accepted.kind),
+            ("my_map", Kind::Symbol)
+        );
+    }
+
     #[test]
     fn a_completion_shows_what_was_typed_of_it_and_what_it_writes() {
         // The start of a name, whatever the case; or its letters, in order.
-        assert_eq!(matched("Counter", "cou"), [0, 1, 2]);
-        assert_eq!(matched("set_counter", "sc"), [0, 4]);
-        assert!(matched("counter", "cox").is_empty());
-        assert!(matched("counter", "").is_empty());
+        let text = "let Counter = 0;\nlet set_counter = 1;\n";
+        let shown = |typed: &str| {
+            let mut harness = editing("main.rs", text, 38..38);
+            for letter in typed.chars() {
+                harness.type_text(&letter.to_string());
+            }
+            let items = harness.view.completion.map(|list| list.items);
+            let items = items.unwrap_or_default().into_iter();
+            let shown = items.map(|item| (item.label, item.matched, item.source));
+            shown.collect::<Vec<_>>()
+        };
+        let word =
+            |label: &str, matched: &[usize]| (label.to_owned(), matched.to_vec(), Source::Word);
+        assert_eq!(
+            shown("cou")[..2],
+            [word("Counter", &[0, 1, 2]), word("set_counter", &[4, 5, 6])]
+        );
+        assert_eq!(shown("sc"), [word("set_counter", &[0, 4])]);
+        assert!(shown("cox").is_empty());
+        // Where each comes from is told in a word.
+        let mut harness = editing("main.rs", text, 38..38);
+        harness.type_text("f");
+        harness.type_text("n");
+        let list = harness.view.completion.as_ref().expect("the list is open");
+        let words: Vec<&str> = list.items.iter().map(source_word).collect();
+        assert_eq!(words[..2], ["snippet", "built-in"], "{:?}", list.items);
+        // What a snippet writes is shown without its tab stops.
         assert_eq!(preview("fn $0() {\n\t\n}"), "fn () { }");
+        assert_eq!(preview("fn ${1:name}($2) {\n\t$0\n}"), "fn name() { }");
         // A name goes on over its hyphens in a style sheet, not in code.
         let css = Language::of(std::path::Path::new("a.css"));
         let rust = Language::of(std::path::Path::new("a.rs"));

@@ -61,6 +61,12 @@ const TODO_MARKS: [&str; 2] = ["TODO", "FIXME"];
 const AUTOSAVE_DELAY: f64 = 1.0;
 /// Completions of a language server shown at once.
 const MAX_SERVED: usize = 60;
+/// The other open files whose words are offered as completions: how many of them, and
+/// how big each may be.
+const MAX_OTHERS: usize = 20;
+const OTHER_BYTES: usize = 512 * 1024;
+/// The files around the one edited that are offered where a path is written.
+const MAX_AROUND: usize = 2000;
 /// The pointer rests this many seconds on a name before its documentation is asked for.
 const HOVER_DELAY: f64 = 0.6;
 /// Versions of a file kept by the local history.
@@ -1808,6 +1814,9 @@ pub struct GodApp {
     log_graph: bool,
     /// The snippets of the user, by language.
     snippets: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// The files around the file in front, for the paths written in it: that file, how
+    /// many files the folder had, and their paths from the folder of the file.
+    around: (Option<PathBuf>, usize, Vec<String>),
     /// What the last HTTP request answered, and the answer still awaited.
     response: String,
     requesting: Option<Receiver<Result<String, String>>>,
@@ -2044,6 +2053,7 @@ impl GodApp {
             log: None,
             log_graph: false,
             snippets: load_snippets(),
+            around: (None, 0, Vec::new()),
             response: String::new(),
             requesting: None,
             requested: String::new(),
@@ -2119,6 +2129,22 @@ impl GodApp {
         self.explorer
             .as_ref()
             .map(|explorer| explorer.root().to_path_buf())
+    }
+
+    /// Work out the files around the file of tab `index`, unless they are known: for the
+    /// same file, in a folder that has as many files.
+    fn look_around(&mut self, index: usize) {
+        let path = self.tabs.get(index).and_then(|tab| tab.path.as_deref());
+        if self.around.0.as_deref() == path && self.around.1 == self.index.len() {
+            return;
+        }
+        let root = self.folder();
+        // The folder of the file, from the root; a file outside it has none around.
+        let folder = path.and_then(Path::parent).zip(root.as_deref());
+        let folder = folder.and_then(|(folder, root)| folder.strip_prefix(root).ok());
+        let folder = folder.map(|folder| folder.to_string_lossy().replace('\\', "/"));
+        let files = folder.map_or_else(Vec::new, |folder| files_around(&self.index, &folder));
+        self.around = (path.map(Path::to_path_buf), self.index.len(), files);
     }
 
     fn font_size(&self) -> f32 {
@@ -3385,7 +3411,8 @@ impl GodApp {
                     let typed = typed.to_lowercase();
                     let offered = items
                         .into_iter()
-                        .filter(|item| item.label.to_lowercase().starts_with(&typed))
+                        // Found by its letters in order, as everything else on offer is.
+                        .filter(|item| complete::fuzzy(&typed, &item.label).is_some())
                         .filter(|item| item.label.len() > typed.len())
                         .take(MAX_SERVED);
                     self.served = offered.collect();
@@ -6996,6 +7023,8 @@ impl GodApp {
             sticky: false,
             note: None,
             snippets: &[],
+            others: &[],
+            files: &[],
             breakpoints: &[],
             conditional: &[],
             stopped: None,
@@ -9244,6 +9273,11 @@ impl GodApp {
         // The same file in both editors: only one of them has the keyboard.
         let twin = self.right == Some(self.left);
         let front = index == self.active && (!twin || second == self.right_front);
+        // Paths are completed in the editor that has the keyboard alone.
+        if front {
+            self.look_around(index);
+        }
+        let files: &[String] = if front { &self.around.2 } else { &[] };
         let font_size = self.font_size();
         let current_mark = self.current_match().filter(|_| front);
         let note = self.note.clone().filter(|_| front);
@@ -9292,7 +9326,15 @@ impl GodApp {
                 .map_or(&[][..], |file| &file.lines),
             _ => &[],
         };
-        let tab = &mut self.tabs[index];
+        let (before, rest) = self.tabs.split_at_mut(index);
+        let Some((tab, after)) = rest.split_first_mut() else {
+            return;
+        };
+        // The other open files, for their words: borrowed, and not the biggest of them.
+        let others = before.iter().chain(after.iter());
+        let others = others.map(|other| other.text.as_str());
+        let others = others.filter(|text| text.len() <= OTHER_BYTES);
+        let others: Vec<&str> = others.take(MAX_OTHERS).collect();
         // The view of this editor is the one put aside: it is brought in to be shown.
         let borrowed = twin && second != tab.in_second;
         if borrowed {
@@ -9323,6 +9365,8 @@ impl GodApp {
             sticky: self.sticky,
             note: note.as_deref(),
             snippets,
+            others: &others,
+            files,
             breakpoints: &tab.breakpoints,
             conditional: &conditional,
             stopped,
@@ -10891,6 +10935,27 @@ fn debug_settings(
     (!adapter.is_empty()).then_some((adapter, launch))
 }
 
+/// The files `index` lists from the root of a project, with `/`, as paths from `folder`,
+/// one of its folders (empty for the root): those in it and under it first, then, with
+/// `../`, those of the folder above. No more than `MAX_AROUND`.
+fn files_around(index: &[String], folder: &str) -> Vec<String> {
+    // What is left of a path under a folder; `None` when it is elsewhere.
+    fn under<'a>(path: &'a str, folder: &str) -> Option<&'a str> {
+        match folder {
+            "" => Some(path),
+            _ => path.strip_prefix(folder)?.strip_prefix('/'),
+        }
+    }
+    let own = index.iter().filter_map(|path| under(path, folder));
+    let above = folder.rsplit_once('/').map_or("", |(above, _)| above);
+    let beside = index.iter().filter(|path| under(path, folder).is_none());
+    let beside = beside.filter(|_| !folder.is_empty());
+    let beside = beside.filter_map(|path| under(path, above));
+    let beside = beside.map(|path| format!("../{path}"));
+    let around = own.map(str::to_owned).chain(beside);
+    around.take(MAX_AROUND).collect()
+}
+
 /// The file the snippets of the user are written in.
 fn snippets_file() -> Option<PathBuf> {
     Some(eframe::storage_dir(APP_NAME)?.join("snippets.json"))
@@ -11439,5 +11504,32 @@ mod tests {
             ..problem
         };
         assert_eq!(squiggle("ab\ncd\nef", &far).start, 5);
+    }
+
+    #[test]
+    fn the_files_around_a_file_are_told_from_its_folder() {
+        let index = [
+            "main.rs",
+            "src/app.rs",
+            "src/ui/list.rs",
+            "src/ui/deep/x.rs",
+        ];
+        let index = index.map(str::to_owned);
+        // Those of the folder and under it, then those of the folder above, no further.
+        assert_eq!(
+            files_around(&index, "src/ui"),
+            ["list.rs", "deep/x.rs", "../app.rs"]
+        );
+        assert_eq!(
+            files_around(&index, "src"),
+            ["app.rs", "ui/list.rs", "ui/deep/x.rs", "../main.rs"]
+        );
+        // From the root they are as listed; and a folder is not one whose name it starts.
+        assert_eq!(files_around(&index, ""), index);
+        assert!(
+            files_around(&index, "sr")
+                .iter()
+                .all(|file| file.starts_with("../"))
+        );
     }
 }

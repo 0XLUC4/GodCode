@@ -142,6 +142,8 @@ entière collée va au-dessus ; Entrée continue un commentaire `///` ou `/* */`
 sur une ligne vide ; dans la liste de complétion, Entrée accepte comme Tab, Échap ferme, les lettres
 trouvées ressortent, un snippet montre ce qu'il écrit.
 
+Complétion : recherche floue (`gtb` trouve `get_text_bounds`), classée ; mots des autres fichiers ouverts, noms courants de chaque langage, membres après un point, chemins de fichiers dans les chaînes ; snippets à arrêts de tabulation au format VS Code (`${1:nom}`) : le premier champ est sélectionné, `Tab` / `Maj+Tab` passent de l'un à l'autre, un nom répété suit ce qu'on tape.
+
 ### Phase 4 — exécution, tests, débogage (✅)
 
 | Fonction | État |
