@@ -171,6 +171,9 @@ enum Cmd {
     EnvFile,
     Docker,
     Postgres,
+    Plugins,
+    PluginsFolder,
+    PluginsReload,
     CaretAbove,
     CaretBelow,
     Tasks,
@@ -575,6 +578,9 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::EnvFile, icon::ROWS, "Choose .env File…", ""),
     spec(Cmd::Docker, icon::ROWS, "Docker…", ""),
     spec(Cmd::Postgres, icon::ROWS, "Connect to PostgreSQL…", ""),
+    spec(Cmd::Plugins, icon::ROWS, "Plugins: Run Command…", ""),
+    spec(Cmd::PluginsFolder, icon::ROWS, "Plugins: Open Folder", ""),
+    spec(Cmd::PluginsReload, icon::ROWS, "Plugins: Reload", ""),
     spec(
         Cmd::CaretAbove,
         icon::ARROW_UP,
@@ -863,6 +869,10 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Suggest),
             Some(Cmd::AutoSuggest),
             Some(Cmd::EditMcp),
+            None,
+            Some(Cmd::Plugins),
+            Some(Cmd::PluginsFolder),
+            Some(Cmd::PluginsReload),
             Some(Cmd::Check),
             None,
             Some(Cmd::ToggleTerminal),
@@ -1572,6 +1582,10 @@ pub struct GodApp {
     docker: Option<Docker>,
     /// The PostgreSQL server being asked questions.
     postgres: Option<Postgres>,
+    /// The plugins of the user; and what is typed to narrow their commands, with the
+    /// one chosen, while they are picked from.
+    plugins: Vec<crate::plugins::Plugin>,
+    plugin_pick: Option<(String, usize)>,
     /// The servers that lend tools to the assistant, once started; and their tools,
     /// each with the name the model knows it by and the place of its server here.
     mcp: Vec<crate::mcp::Server>,
@@ -1819,6 +1833,9 @@ impl GodApp {
             env_pick: None,
             docker: None,
             postgres: None,
+            // One that cannot be read is told when they are next reloaded.
+            plugins: load_plugins().0,
+            plugin_pick: None,
             mcp: Vec::new(),
             mcp_tools: Vec::new(),
             mcp_started: false,
@@ -4204,6 +4221,64 @@ impl GodApp {
                 ));
             }
             Some(None) => {}
+        }
+    }
+
+    /// The commands of the plugins: the one picked is run on what is selected in the
+    /// file in front, or on all of it when nothing is.
+    fn plugins_dialog(&mut self, ctx: &Context) {
+        let Some((mut typed, mut selected)) = self.plugin_pick.take() else {
+            return;
+        };
+        let wanted = typed.to_lowercase();
+        let mut offered = Vec::new();
+        for (plugin, loaded) in self.plugins.iter().enumerate() {
+            for (command, name) in loaded.commands().iter().enumerate() {
+                let row = format!("{}: {name}", loaded.name());
+                if row.to_lowercase().contains(&wanted) {
+                    offered.push((plugin, command, row));
+                }
+            }
+        }
+        let rows: Vec<String> = offered.iter().map(|(_, _, row)| row.clone()).collect();
+        let answer = list_dialog(
+            ctx,
+            "Plugin command",
+            &rows,
+            &mut selected,
+            Some(&mut typed),
+        );
+        let Some(picked) = answer else {
+            self.plugin_pick = Some((typed, selected));
+            return;
+        };
+        let Some((plugin, command, _)) = picked.and_then(|row| offered.get(row)) else {
+            return;
+        };
+        let (Some(loaded), Some(tab)) = (self.plugins.get(*plugin), self.tabs.get_mut(self.active))
+        else {
+            return;
+        };
+        let (start, end) = (tab.selection.start, tab.selection.end);
+        let chars = start.min(end)..start.max(end);
+        let bytes = match chars.is_empty() {
+            true => 0..tab.text.len(),
+            false => {
+                let place = |at| godcode_core::byte_index(&tab.text, at);
+                place(chars.start)..place(chars.end)
+            }
+        };
+        // Shut in and stopped when it runs too long: a few seconds at the very most.
+        match loaded.run(*command, &tab.text[bytes.clone()]) {
+            Ok(written) => {
+                let end = chars.start + written.chars().count();
+                tab.text.replace_range(bytes, &written);
+                tab.touched();
+                if !chars.is_empty() {
+                    tab.select(ctx, chars.start..end);
+                }
+            }
+            Err(why) => self.toasts.error(why),
         }
     }
 
@@ -6907,6 +6982,32 @@ impl GodApp {
                     self.env_pick = Some((rows, selected.unwrap_or(0)));
                 }
             }
+            Cmd::Plugins => match self.plugins.is_empty() {
+                true => self.toasts.error(
+                    "No plugin: put .wasm files in the folder of Plugins: Open Folder, then \
+                     Plugins: Reload",
+                ),
+                false => self.plugin_pick = Some((String::new(), 0)),
+            },
+            Cmd::PluginsFolder => match settings_file("plugins") {
+                Some(folder) => {
+                    let _ = std::fs::create_dir_all(&folder);
+                    self.reveal(&folder);
+                }
+                None => self
+                    .toasts
+                    .error("No place to keep the plugins on this system"),
+            },
+            Cmd::PluginsReload => {
+                let (plugins, refused) = load_plugins();
+                self.plugins = plugins;
+                match refused.into_iter().next() {
+                    Some(why) => self.toasts.error(why),
+                    None => self
+                        .toasts
+                        .success(format!("{} plugins", self.plugins.len())),
+                }
+            }
             Cmd::Postgres => {
                 // The address the project keeps for itself is the one most likely meant.
                 let kept = self.env_values().into_iter();
@@ -9517,6 +9618,7 @@ impl eframe::App for GodApp {
         self.env_dialog(&ctx);
         self.docker_window(&ctx);
         self.postgres_window(&ctx);
+        self.plugins_dialog(&ctx);
         self.merge_window(&ctx);
         self.database_window(&ctx);
         self.log_dialog(&ctx);
@@ -9922,6 +10024,20 @@ impl Browsing {
             None => (0, Vec::new(), None),
         };
     }
+}
+
+/// The plugins kept in the `plugins` folder of the settings, and why the others could
+/// not be read.
+fn load_plugins() -> (Vec<crate::plugins::Plugin>, Vec<String>) {
+    let read = settings_file("plugins").map(|folder| crate::plugins::load_folder(&folder));
+    let (mut plugins, mut refused) = (Vec::new(), Vec::new());
+    for plugin in read.into_iter().flatten() {
+        match plugin {
+            Ok(plugin) => plugins.push(plugin),
+            Err(why) => refused.push(why),
+        }
+    }
+    (plugins, refused)
 }
 
 fn settings_file(name: &str) -> Option<PathBuf> {

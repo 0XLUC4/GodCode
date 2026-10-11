@@ -228,8 +228,13 @@ Dark/Light) ; enregistré, il est relu, listé dans `Color Theme…` et appliqu�
 Dispositions : `Save Layout…` garde sous un nom ce qui se montre (panneau de côté, panneau du bas,
 minimap, sticky scroll, zen), `Layout…` en remet une ; gardées d'une session à l'autre.
 L'interface est en anglais, et le reste : pas d'autres langues.
-Reste :
-API de plugins (WASM isolé) une fois le cœur stable.
+Plugins : des modules WebAssembly posés dans le dossier `plugins` des réglages (`Plugins: Open Folder`, puis
+`Plugins: Reload`) ajoutent des commandes qui transforment la sélection, ou tout le fichier ; `Plugins: Run
+Command…` les liste. Ils tournent enfermés : aucun import ne leur est donné (ni fichiers, ni réseau, ni
+horloge), calcul et mémoire (64 Mo) sont bornés, chaque lancement repart de zéro. L'interface à écrire est
+décrite en tête de `plugins.rs`, avec un exemple. Passe par `wasmi`, interpréteur en Rust pur : la seconde
+dépendance de ce poids après `wry`.
+Reste : des plugins qui font plus que transformer du texte (panneaux, touches, accès au projet).
 
 ### Phase 8 — IA (⏳, volontairement en dernier)
 

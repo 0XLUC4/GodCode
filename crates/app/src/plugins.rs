@@ -121,7 +121,6 @@ const FUNCTIONS: [(&str, &[ValType], ValType, bool); 4] = [
 ];
 
 /// A plugin read from its file, ready to run.
-#[allow(dead_code)]
 pub struct Plugin {
     name: String,
     commands: Vec<String>,
@@ -138,7 +137,6 @@ pub struct Command {
     pub name: String,
 }
 
-#[allow(dead_code)]
 impl Plugin {
     /// Read and check the module in `bytes`, named after `file`; refused when it asks for
     /// anything from outside or lacks what a plugin must have.
@@ -233,7 +231,6 @@ impl Plugin {
 
 /// The plugins of `folder` (its `.wasm` files, sorted by name), each loaded or told why
 /// not. None when there is no such folder.
-#[allow(dead_code)]
 pub fn load_folder(folder: &Path) -> Vec<Result<Plugin, String>> {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return Vec::new();
