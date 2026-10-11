@@ -44,6 +44,22 @@ const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 const PATIENCE: &str = "120";
 /// How much of a file the model is given, in characters.
 const MOST_OF_A_FILE: usize = 60_000;
+/// How much of the code before the caret a completion is given, in characters.
+const BEFORE_THE_CARET: usize = 6_000;
+/// How much of the code after the caret a completion is given, in characters.
+const AFTER_THE_CARET: usize = 2_000;
+/// How long a completion may be, in tokens.
+const TOKENS_OF_A_COMPLETION: u32 = 256;
+/// How long a completion may be, in lines.
+const LINES_OF_A_COMPLETION: usize = 40;
+/// How much of what the model said about an edit is kept, in characters.
+const MOST_SAID_OF_AN_EDIT: usize = 300;
+/// What stands for the caret in the code a completion is asked for.
+const CARET: &str = "<caret/>";
+/// What the model answers when it has nothing to write at the caret.
+const NOTHING: &str = "<nothing/>";
+/// The longest name Anthropic takes for a tool, in characters.
+const LONGEST_TOOL_NAME: usize = 64;
 
 impl Provider {
     pub fn name(self) -> &'static str {
@@ -152,10 +168,9 @@ fn understood(provider: Provider, answer: &str) -> Result<Value, String> {
     }
 }
 
-/// What the model said, read in the `answer` of its provider.
-fn reply(provider: Provider, answer: &str) -> Result<String, String> {
-    let answer = understood(provider, answer)?;
-    let said: String = match provider {
+/// The words of the model in the `answer` of its provider: none when it said nothing.
+fn words(provider: Provider, answer: &Value) -> String {
+    match provider {
         Provider::Ollama => answer["message"]["content"]
             .as_str()
             .unwrap_or_default()
@@ -167,7 +182,12 @@ fn reply(provider: Provider, answer: &str) -> Result<String, String> {
             .filter(|block| block["type"] == "text")
             .filter_map(|block| block["text"].as_str())
             .collect(),
-    };
+    }
+}
+
+/// What the model said, read in the `answer` of its provider.
+fn reply(provider: Provider, answer: &str) -> Result<String, String> {
+    let said = words(provider, &understood(provider, answer)?);
     match said.trim().is_empty() {
         true => Err(format!("{} gave no answer.", provider.name())),
         false => Ok(said),
@@ -302,8 +322,17 @@ pub fn models(provider: Provider) -> Result<Vec<String>, String> {
 /// Ask `messages`, the conversation so far, of the model of `settings`, told `system`
 /// first, and wait for what it answers: up to two minutes.
 pub fn ask(settings: &Settings, system: &str, messages: &[Message]) -> Result<String, String> {
+    post(settings, &body(settings, system, messages), reply)
+}
+
+/// Send `body` to the provider of `settings` and `read` what it answers. Nothing is sent
+/// when the user says nothing in it.
+fn post<T>(
+    settings: &Settings,
+    body: &Value,
+    read: impl Fn(Provider, &str) -> Result<T, String>,
+) -> Result<T, String> {
     let provider = settings.provider;
-    let body = body(settings, system, messages);
     if body["messages"]
         .as_array()
         .is_none_or(|turns| turns.iter().all(|it| it["role"] != "user"))
@@ -315,7 +344,7 @@ pub fn ask(settings: &Settings, system: &str, messages: &[Message]) -> Result<St
     match provider {
         Provider::Ollama => {
             let url = format!("{}/api/chat", ollama());
-            reply(
+            read(
                 provider,
                 &fetch(provider, &config(&url, &[json], Some(&body)))?,
             )
@@ -329,7 +358,7 @@ pub fn ask(settings: &Settings, system: &str, messages: &[Message]) -> Result<St
             ];
             let answer = fetch(provider, &config(ANTHROPIC_URL, &headers, Some(&body)));
             // Nothing is known to repeat the key, and nothing may.
-            let answer = answer.and_then(|answer| reply(provider, &answer));
+            let answer = answer.and_then(|answer| read(provider, &answer));
             answer.map_err(|err| err.replace(&key, "(the key)"))
         }
     }
@@ -346,10 +375,16 @@ fn beginning(text: &str, most: usize) -> (&str, bool) {
 /// What the model is told before the conversation: who it is, and the file in front,
 /// named `file`, written in `language`, holding `text`, with what is selected in it.
 pub fn system(file: Option<&str>, language: &str, text: &str, selection: Option<&str>) -> String {
+    let who = "You are the assistant of GodCode, a code editor. Answer briefly and to the point. \
+               Show code in fenced blocks, with the name of the language.";
+    format!("{who}\n\n{}", shown(file, language, text, selection))
+}
+
+/// The file in front as a model is shown it: its name, its language, what is selected in
+/// it and its text, cut when it is too long.
+fn shown(file: Option<&str>, language: &str, text: &str, selection: Option<&str>) -> String {
     let mut told = format!(
-        "You are the assistant of GodCode, a code editor. Answer briefly and to the point. \
-         Show code in fenced blocks, with the name of the language.\n\n\
-         The user is looking at the file `{}`, written in {language}.\n",
+        "The user is looking at the file `{}`, written in {language}.\n",
         file.unwrap_or("untitled")
     );
     let mut give = |what: &str, tag: &str, text: &str| {
@@ -366,6 +401,543 @@ pub fn system(file: Option<&str>, language: &str, text: &str, selection: Option<
     }
     give("The text of the file", "file", text);
     told
+}
+
+/// The end of `text`, up to `most` characters, from the start of a line when some is
+/// left out and a line starts there.
+fn ending(text: &str, most: usize) -> &str {
+    let Some((at, left_out)) = text.char_indices().rev().nth(most) else {
+        return text;
+    };
+    let end = &text[at + left_out.len_utf8()..];
+    match end.split_once('\n') {
+        Some((_, lines)) if left_out != '\n' => lines,
+        _ => end,
+    }
+}
+
+/// The beginning of `text`, up to `most` characters, up to the end of a line when some
+/// is left out and a line ends there.
+fn opening(text: &str, most: usize) -> &str {
+    match beginning(text, most) {
+        (start, true) => start.rfind('\n').map_or(start, |end| &start[..=end]),
+        (whole, false) => whole,
+    }
+}
+
+/// What a model completing code is told first.
+fn completion_system() -> String {
+    format!(
+        "You complete code in GodCode, a code editor. The user gives a file with {CARET} \
+         where the caret is. Answer with only the code to write at {CARET}: no explanation, \
+         no fenced block, and nothing of what is already before or after {CARET}. Keep it \
+         short: finish the statement or the block being written. If there is nothing to \
+         write there, answer {NOTHING}."
+    )
+}
+
+/// The code around the caret as a model completing it is shown it.
+fn completion_prompt(file: Option<&str>, language: &str, before: &str, after: &str) -> String {
+    format!(
+        "The file `{}`, written in {language}:\n<file>\n{}{CARET}{}\n</file>",
+        file.unwrap_or("untitled"),
+        ending(before, BEFORE_THE_CARET),
+        opening(after, AFTER_THE_CARET)
+    )
+}
+
+/// What is sent to ask the model of `settings` what to write at the caret.
+fn completion_body(
+    settings: &Settings,
+    file: Option<&str>,
+    language: &str,
+    before: &str,
+    after: &str,
+) -> Value {
+    let system = completion_system();
+    let asked = json!({
+        "role": "user",
+        "content": completion_prompt(file, language, before, after),
+    });
+    match settings.provider {
+        Provider::Ollama => json!({
+            "model": settings.model,
+            "messages": [{ "role": "system", "content": system }, asked],
+            "stream": false,
+            "options": { "temperature": 0, "num_predict": TOKENS_OF_A_COMPLETION },
+        }),
+        // No temperature: the recent models of Anthropic refuse one.
+        Provider::Anthropic => json!({
+            "model": settings.model,
+            "max_tokens": TOKENS_OF_A_COMPLETION,
+            "system": system,
+            "messages": [asked],
+        }),
+    }
+}
+
+/// `answer` without the fence around it, when it is given in a fenced block.
+fn unfenced(answer: &str) -> &str {
+    let inside = answer.trim();
+    if !inside.starts_with("```") {
+        return answer;
+    }
+    match inside.split_once('\n') {
+        Some((_, code)) => code.strip_suffix("```").unwrap_or(code),
+        None => inside.trim_matches('`'),
+    }
+}
+
+/// `answer` without the line the caret is on, when the model typed it again before going
+/// on: the whole of it, or all of it but its indentation.
+fn without_the_line_typed_again<'a>(answer: &'a str, before: &str) -> &'a str {
+    let line = before.rsplit('\n').next().unwrap_or_default();
+    let typed = line.trim_start();
+    // One character is too little to tell a repetition from code that starts the same.
+    if typed.chars().count() == 1 {
+        return answer;
+    }
+    let unindented = || answer.trim_start().strip_prefix(typed);
+    let again = answer
+        .strip_prefix(line)
+        .or_else(|| unindented().filter(|_| !typed.is_empty()));
+    again.unwrap_or(answer)
+}
+
+/// `answer` without its end, when that end is the beginning of what follows the caret:
+/// more than one character of it, not all white space.
+fn without_what_follows<'a>(answer: &'a str, after: &str) -> &'a str {
+    let kept = |answer: &'a str| {
+        (1..=answer.len().min(after.len()))
+            .rev()
+            .filter(|&length| after.is_char_boundary(length))
+            .map(|length| &after[..length])
+            .filter(|follows| follows.chars().nth(1).is_some() && !follows.trim().is_empty())
+            .find_map(|follows| answer.strip_suffix(follows))
+    };
+    kept(answer)
+        .or_else(|| kept(answer.trim_end()))
+        .unwrap_or(answer)
+}
+
+/// What is to be written at the caret, from the `answer` of a model: without the fence
+/// around it, without the line before the caret typed again, without the code after the
+/// caret repeated, without white space at its end, and not longer than forty lines.
+/// Nothing when the model said it had nothing to write.
+fn completion(answer: &str, before: &str, after: &str) -> String {
+    let answer = answer.replace(CARET, "");
+    let answer = unfenced(&answer);
+    if answer.trim() == NOTHING {
+        return String::new();
+    }
+    let answer = without_the_line_typed_again(answer, before);
+    let answer = without_what_follows(answer, after);
+    let kept: String = answer
+        .split_inclusive('\n')
+        .take(LINES_OF_A_COMPLETION)
+        .collect();
+    kept.trim_end().to_owned()
+}
+
+/// What a model would write at the caret, given the code before and after it; empty when
+/// it has nothing to add.
+#[allow(dead_code)]
+pub fn complete(
+    settings: &Settings,
+    file: Option<&str>,
+    language: &str,
+    before: &str,
+    after: &str,
+) -> Result<String, String> {
+    let body = completion_body(settings, file, language, before, after);
+    let answer = post(settings, &body, |provider, answer| {
+        Ok(words(provider, &understood(provider, answer)?))
+    })?;
+    Ok(completion(&answer, before, after))
+}
+
+/// Whether `text` is too long for a model to be given it whole, and so to answer with
+/// the whole of it changed.
+#[allow(dead_code)]
+pub fn too_long_to_edit(text: &str) -> bool {
+    beginning(text, MOST_OF_A_FILE).1
+}
+
+/// The instructions for a model asked to change the file in front: it answers with the
+/// whole new text of the file in one fenced block, after one short sentence saying what
+/// it changed.
+#[allow(dead_code)]
+pub fn edit_system(
+    file: Option<&str>,
+    language: &str,
+    text: &str,
+    selection: Option<&str>,
+) -> String {
+    let how = match too_long_to_edit(text) {
+        false => {
+            "The user asks for a change to the file in front. Answer with one short sentence \
+             saying what you changed, then the whole new text of the file in one fenced \
+             block: every line of it, changed or not, nothing left out, nothing summarised. \
+             Open and close that block with four backticks (````), so that a fence inside \
+             the file does not end it. Change only what is asked. If nothing is to be \
+             changed, answer in words, without any fenced block."
+        }
+        true => {
+            "The user asks for a change to the file in front, but the file is too long to \
+             be given whole. Do NOT answer with the whole text of a file, and use no fenced \
+             block: say in one short sentence that the file is too long to be changed here."
+        }
+    };
+    format!(
+        "You are the assistant of GodCode, a code editor. {how}\n\n{}",
+        shown(file, language, text, selection)
+    )
+}
+
+/// The fence `line` opens or closes: its mark, how many times it is written, and what
+/// follows it on the line.
+fn fence(line: &str) -> Option<(char, usize, &str)> {
+    let line = line.trim();
+    let mark = line.chars().next().filter(|it| matches!(it, '`' | '~'))?;
+    let count = line.chars().take_while(|&it| it == mark).count();
+    // The mark is one byte long.
+    let rest = &line[count..];
+    // Backticks after the fence: code within a line, not a fence.
+    (count >= 3 && !(mark == '`' && rest.contains('`'))).then_some((mark, count, rest))
+}
+
+/// The new text of the file an answer proposes, with what the model said about it;
+/// `None` when the answer holds no whole-file block.
+///
+/// The text is what the last fenced block of the answer holds, as it is written there.
+/// Any fenced block is taken for a whole file: nothing here knows the file.
+#[allow(dead_code)]
+pub fn proposed(answer: &str) -> Option<(String, String)> {
+    // The fence that is open: its mark, its length, where its line starts and ends.
+    let mut open = None;
+    // The last block closed: where it starts and ends, and where its content does.
+    let mut last = None;
+    let mut at = 0;
+    for line in answer.split_inclusive('\n') {
+        let end = at + line.len();
+        match (open, fence(line)) {
+            (None, Some((mark, count, _))) => open = Some((mark, count, at, end)),
+            (Some((mark, count, start, content)), Some((closing, closed, "")))
+                if closing == mark && closed >= count =>
+            {
+                last = Some((start, end, content, at));
+                open = None;
+            }
+            _ => {}
+        }
+        at = end;
+    }
+    if open.is_some() {
+        return None;
+    }
+    let (start, end, content, content_end) = last?;
+    let around = [answer[..start].trim(), answer[end..].trim()];
+    let said = around.into_iter().filter(|it| !it.is_empty());
+    let said = said.collect::<Vec<_>>().join("\n\n");
+    Some((
+        beginning(&said, MOST_SAID_OF_AN_EDIT).0.to_owned(),
+        answer[content..content_end].to_owned(),
+    ))
+}
+
+/// A tool the model may ask for: its name, what it does, and the JSON schema of what it
+/// takes.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub schema: Value,
+}
+
+/// One step of a talk in which the model may use tools.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Turn {
+    User(String),
+    Said(String),
+    /// The model asked for tools to be run (with what it said before asking, possibly
+    /// empty).
+    Asked {
+        said: String,
+        calls: Vec<Call>,
+    },
+    /// What the tools answered, in the order asked.
+    Results(Vec<ToolResult>),
+}
+
+/// One tool the model asked to be run, and what to give it.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    pub id: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+/// What a tool answered to the call `id`, or why it failed.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolResult {
+    pub id: String,
+    pub tool: String,
+    pub text: String,
+    pub failed: bool,
+}
+
+/// The name a model knows the `tool` of the MCP `server` by: `server__tool`, with `_` for
+/// every character a name cannot hold, cut to 64 characters.
+///
+/// A name cannot be turned back into its server and tool: whoever offers the tools keeps
+/// each name with the server and the tool it stands for, and looks it up there.
+#[allow(dead_code)]
+pub fn tool_name(server: &str, tool: &str) -> String {
+    let allowed = |it: char| it.is_ascii_alphanumeric() || it == '_' || it == '-';
+    format!("{server}__{tool}")
+        .chars()
+        .map(|it| if allowed(it) { it } else { '_' })
+        .take(LONGEST_TOOL_NAME)
+        .collect()
+}
+
+/// `value` as the JSON object a tool takes: itself when it is one, what it holds when it
+/// is one written as a text, an empty one otherwise.
+fn object(value: &Value) -> Value {
+    let written = value.as_str().and_then(|it| serde_json::from_str(it).ok());
+    match written.as_ref().unwrap_or(value) {
+        Value::Object(fields) => Value::Object(fields.clone()),
+        _ => json!({}),
+    }
+}
+
+/// Add `text`, said by `role`, to `messages`: joined to what the same side just said in
+/// words, left out when it is empty.
+fn spoken(messages: &mut Vec<Value>, role: &str, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    match messages.last_mut() {
+        Some(last) if last["role"] == role && last["content"].is_string() => {
+            let said = last["content"].as_str().unwrap_or_default();
+            last["content"] = format!("{said}\n\n{text}").into();
+        }
+        _ => messages.push(json!({ "role": role, "content": text })),
+    }
+}
+
+/// `turns` as the messages Anthropic takes: the tools asked for are blocks of what the
+/// model said, their results blocks of what the user says next.
+fn anthropic_messages<'a>(turns: impl Iterator<Item = &'a Turn>) -> Vec<Value> {
+    let mut messages = Vec::new();
+    for turn in turns {
+        match turn {
+            Turn::User(text) => spoken(&mut messages, "user", text),
+            Turn::Said(text) => spoken(&mut messages, "assistant", text),
+            Turn::Asked { said, calls } if calls.is_empty() => {
+                spoken(&mut messages, "assistant", said);
+            }
+            Turn::Asked { said, calls } => {
+                let mut blocks = Vec::new();
+                if !said.trim().is_empty() {
+                    blocks.push(json!({ "type": "text", "text": said }));
+                }
+                blocks.extend(calls.iter().map(|call| {
+                    json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.tool,
+                        "input": object(&call.arguments),
+                    })
+                }));
+                messages.push(json!({ "role": "assistant", "content": blocks }));
+            }
+            Turn::Results(results) if results.is_empty() => {}
+            Turn::Results(results) => {
+                let blocks: Vec<Value> = results
+                    .iter()
+                    .map(|result| {
+                        json!({
+                            "type": "tool_result",
+                            "tool_use_id": result.id,
+                            "content": result.text,
+                            "is_error": result.failed,
+                        })
+                    })
+                    .collect();
+                messages.push(json!({ "role": "user", "content": blocks }));
+            }
+        }
+    }
+    messages
+}
+
+/// `turns` as the messages Ollama takes: the tools asked for go with what the model
+/// said, each result is a message of its own, said by the tool.
+fn ollama_messages<'a>(turns: impl Iterator<Item = &'a Turn>) -> Vec<Value> {
+    let mut messages = Vec::new();
+    for turn in turns {
+        match turn {
+            Turn::User(text) => spoken(&mut messages, "user", text),
+            Turn::Said(text) => spoken(&mut messages, "assistant", text),
+            Turn::Asked { said, calls } if calls.is_empty() => {
+                spoken(&mut messages, "assistant", said);
+            }
+            Turn::Asked { said, calls } => {
+                let calls: Vec<Value> = calls
+                    .iter()
+                    .map(|call| {
+                        let arguments = object(&call.arguments);
+                        json!({ "function": { "name": call.tool, "arguments": arguments } })
+                    })
+                    .collect();
+                messages.push(json!({ "role": "assistant", "content": said, "tool_calls": calls }));
+            }
+            Turn::Results(results) => messages.extend(results.iter().map(|result| {
+                // Ollama has no word for a failure: the text says it.
+                let text = match result.failed {
+                    true => format!("The tool failed: {}", result.text),
+                    false => result.text.clone(),
+                };
+                json!({ "role": "tool", "tool_name": result.tool, "content": text })
+            })),
+        }
+    }
+    messages
+}
+
+/// What is sent to ask `turns` of the model of `settings`, told `system` first, with
+/// `tools` on offer. What comes before the user first speaks is left out.
+fn tool_body(settings: &Settings, system: &str, turns: &[Turn], tools: &[ToolSpec]) -> Value {
+    let speaks = |turn: &&Turn| matches!(turn, Turn::User(text) if !text.trim().is_empty());
+    let turns = turns.iter().skip_while(|turn| !speaks(turn));
+    let mut body = match settings.provider {
+        Provider::Ollama => {
+            let mut messages = ollama_messages(turns);
+            if !system.is_empty() {
+                messages.insert(0, json!({ "role": "system", "content": system }));
+            }
+            json!({ "model": settings.model, "messages": messages, "stream": false })
+        }
+        Provider::Anthropic => {
+            let messages = anthropic_messages(turns);
+            let mut body =
+                json!({ "model": settings.model, "max_tokens": 4096, "messages": messages });
+            if !system.is_empty() {
+                body["system"] = system.into();
+            }
+            body
+        }
+    };
+    if !tools.is_empty() {
+        let offered = |tool: &ToolSpec| {
+            // A tool that says nothing of what it takes takes nothing.
+            let schema = match &tool.schema {
+                Value::Object(_) => tool.schema.clone(),
+                _ => json!({ "type": "object", "properties": {} }),
+            };
+            match settings.provider {
+                Provider::Ollama => json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": schema,
+                    },
+                }),
+                Provider::Anthropic => json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": schema,
+                }),
+            }
+        };
+        body["tools"] = tools.iter().map(offered).collect();
+    }
+    body
+}
+
+/// What the model answered when it could ask for tools, read in the `answer` of its
+/// provider: its words, or the tools it wants run. Ollama gives its calls nothing to
+/// answer them by: they are numbered, after the `asked_before` of the talk so far.
+fn tool_reply(provider: Provider, answer: &str, asked_before: usize) -> Result<Turn, String> {
+    let name = provider.name();
+    let answer = understood(provider, answer)?;
+    let said = words(provider, &answer);
+    let calls: Vec<Call> = match provider {
+        Provider::Ollama => answer["message"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|call| &call["function"])
+            .filter_map(|function| Some((function["name"].as_str()?, &function["arguments"])))
+            .enumerate()
+            .map(|(at, (tool, arguments))| Call {
+                id: format!("call-{}", asked_before + at + 1),
+                tool: tool.to_owned(),
+                arguments: object(arguments),
+            })
+            .collect(),
+        Provider::Anthropic => answer["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"] == "tool_use")
+            .filter_map(|block| {
+                Some(Call {
+                    id: block["id"].as_str()?.to_owned(),
+                    tool: block["name"].as_str()?.to_owned(),
+                    arguments: object(&block["input"]),
+                })
+            })
+            .collect(),
+    };
+    if calls.is_empty() {
+        return match said.trim().is_empty() {
+            true => Err(format!("{name} gave no answer.")),
+            false => Ok(Turn::Said(said)),
+        };
+    }
+    // Cut short, what a tool is to be given may be missing its end.
+    if answer["stop_reason"] == "max_tokens" || answer["done_reason"] == "length" {
+        return Err(format!("{name} was cut short while asking for a tool."));
+    }
+    Ok(Turn::Asked { said, calls })
+}
+
+/// `error` in clearer words when it is Ollama saying its model takes no tools.
+fn tool_failure(error: String) -> String {
+    match error.contains("does not support tools") {
+        true => "This model cannot use tools: choose another one.".to_owned(),
+        false => error,
+    }
+}
+
+/// Ask with tools on offer: the answer is either words (`Turn::Said`) or a request to
+/// run tools (`Turn::Asked`).
+#[allow(dead_code)]
+pub fn ask_with_tools(
+    settings: &Settings,
+    system: &str,
+    turns: &[Turn],
+    tools: &[ToolSpec],
+) -> Result<Turn, String> {
+    let asked_before: usize = turns
+        .iter()
+        .map(|turn| match turn {
+            Turn::Asked { calls, .. } => calls.len(),
+            _ => 0,
+        })
+        .sum();
+    let body = tool_body(settings, system, turns, tools);
+    let answer = post(settings, &body, |provider, answer| {
+        tool_reply(provider, answer, asked_before)
+    });
+    answer.map_err(tool_failure)
 }
 
 #[cfg(test)]
@@ -775,5 +1347,654 @@ mod tests {
         );
         let whole = "é".repeat(MOST_OF_A_FILE);
         assert!(!system(None, "Plain Text", &whole, None).contains("Cut"));
+    }
+
+    #[test]
+    fn what_is_before_the_caret_is_given_from_its_end_and_from_the_start_of_a_line() {
+        let text = "ab\ncd\nef";
+        assert_eq!(ending(text, 100), text);
+        assert_eq!(ending(text, 8), text);
+        // Cut inside a line: from the next one.
+        assert_eq!(ending(text, 4), "ef");
+        // Cut where a line starts: nothing more is left out.
+        assert_eq!(ending(text, 5), "cd\nef");
+        // No line starts in what is kept.
+        assert_eq!(ending("abcdef", 3), "def");
+        assert_eq!(ending(&"é".repeat(10), 3), "ééé");
+        assert_eq!(ending(text, 0), "");
+    }
+
+    #[test]
+    fn what_follows_the_caret_is_given_from_its_start_and_up_to_the_end_of_a_line() {
+        let text = "ab\ncd\nef";
+        assert_eq!(opening(text, 100), text);
+        assert_eq!(opening(text, 4), "ab\n");
+        assert_eq!(opening(text, 3), "ab\n");
+        // No line ends in what is kept.
+        assert_eq!(opening(text, 2), "ab");
+        assert_eq!(opening(&"é".repeat(10), 3), "ééé");
+    }
+
+    #[test]
+    fn a_completion_is_asked_with_the_caret_marked_in_the_code_around_it() {
+        let prompt = completion_prompt(
+            Some("main.rs"),
+            "Rust",
+            "fn main() {\n    let x = ",
+            ";\n}\n",
+        );
+        assert_eq!(
+            prompt,
+            "The file `main.rs`, written in Rust:\n<file>\nfn main() {\n    let x = <caret/>;\n}\n\n</file>"
+        );
+        // Of a long file, only whole lines near the caret: 6,000 characters before it at
+        // most, 2,000 after.
+        let before = "let a;\n".repeat(2_000);
+        let after = "what follows\n".repeat(1_000);
+        let prompt = completion_prompt(None, "Rust", &before, &after);
+        assert!(prompt.starts_with("The file `untitled`"), "{prompt}");
+        assert_eq!(prompt.matches("let a;\n").count(), 857);
+        assert_eq!(prompt.matches("what follows\n").count(), 153);
+        assert!(prompt.contains("<file>\nlet a;\n"));
+        assert!(prompt.contains("let a;\n<caret/>what follows\n"));
+        assert!(prompt.ends_with("what follows\n\n</file>"));
+    }
+
+    #[test]
+    fn a_model_completing_is_told_to_answer_with_the_code_alone() {
+        let told = completion_system();
+        assert!(
+            told.contains("only the code to write at <caret/>"),
+            "{told}"
+        );
+        assert!(told.contains("no explanation"), "{told}");
+        assert!(told.contains("no fenced block"), "{told}");
+        assert!(told.contains("before or after <caret/>"), "{told}");
+        assert!(told.contains("answer <nothing/>."), "{told}");
+    }
+
+    #[test]
+    fn ollama_is_asked_a_short_completion_with_no_chance_in_it() {
+        let ollama = settings(Provider::Ollama);
+        assert_eq!(
+            completion_body(&ollama, Some("a.py"), "Python", "x = ", "\n"),
+            json!({
+                "model": "a-model",
+                "messages": [
+                    { "role": "system", "content": completion_system() },
+                    {
+                        "role": "user",
+                        "content": "The file `a.py`, written in Python:\n<file>\nx = <caret/>\n\n</file>",
+                    },
+                ],
+                "stream": false,
+                "options": { "temperature": 0, "num_predict": 256 },
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_is_asked_a_short_completion_and_no_temperature() {
+        let anthropic = settings(Provider::Anthropic);
+        assert_eq!(
+            completion_body(&anthropic, Some("a.py"), "Python", "x = ", "\n"),
+            json!({
+                "model": "a-model",
+                "max_tokens": 256,
+                "system": completion_system(),
+                "messages": [{
+                    "role": "user",
+                    "content": "The file `a.py`, written in Python:\n<file>\nx = <caret/>\n\n</file>",
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_model_that_says_nothing_has_no_words_and_that_is_no_error() {
+        let silent = json!({ "content": [], "stop_reason": "end_turn" });
+        assert_eq!(words(Provider::Anthropic, &silent), "");
+        let silent = json!({ "message": { "role": "assistant", "content": "" } });
+        assert_eq!(words(Provider::Ollama, &silent), "");
+        assert_eq!(completion("", "x = ", "\n"), "");
+    }
+
+    #[test]
+    fn a_completion_is_kept_as_written_but_for_the_space_at_its_end() {
+        assert_eq!(completion("foo();\n  \n", "", ""), "foo();");
+        assert_eq!(completion("\n    foo();", "", ""), "\n    foo();");
+        assert_eq!(completion("   \n", "x", "y"), "");
+    }
+
+    #[test]
+    fn the_fence_around_a_completion_is_taken_off() {
+        assert_eq!(completion("```rust\nlet x = 1;\n```", "", ""), "let x = 1;");
+        assert_eq!(
+            completion("```\n    indented\n```\n", "", ""),
+            "    indented"
+        );
+        assert_eq!(
+            completion("```python\r\nprint(1)\r\n```\r\n", "", ""),
+            "print(1)"
+        );
+        // Cut before the fence was closed.
+        assert_eq!(completion("```rust\nlet x = 1;", "", ""), "let x = 1;");
+        assert_eq!(completion("```x```", "", ""), "x");
+    }
+
+    #[test]
+    fn a_model_with_nothing_to_write_gives_an_empty_completion() {
+        assert_eq!(completion("<nothing/>", "a", "b"), "");
+        assert_eq!(completion(" <nothing/>\n", "a", "b"), "");
+        assert_eq!(completion("```\n<nothing/>\n```", "a", "b"), "");
+        // The mark of the caret is not code.
+        assert_eq!(completion("foo(<caret/>)", "", ""), "foo()");
+        // A word that is code somewhere is kept.
+        assert_eq!(completion("None", "return ", ""), "None");
+    }
+
+    #[test]
+    fn the_line_before_the_caret_typed_again_is_taken_off() {
+        let before = "fn main() {\n    let total = pri";
+        assert_eq!(
+            completion("    let total = price * 2;", before, ""),
+            "ce * 2;"
+        );
+        assert_eq!(completion("let total = price * 2;", before, ""), "ce * 2;");
+        assert_eq!(completion("ce * 2;", before, ""), "ce * 2;");
+        // The indentation alone, typed again.
+        assert_eq!(
+            completion("    done();\n    more();", "{\n    ", ""),
+            "done();\n    more();"
+        );
+        // One character is not enough to tell.
+        assert_eq!(completion("xx = 1", "x", ""), "xx = 1");
+        // Nothing is typed yet on the line.
+        assert_eq!(completion("  let a;", "x\n", ""), "  let a;");
+    }
+
+    #[test]
+    fn the_code_after_the_caret_repeated_is_taken_off() {
+        assert_eq!(completion("a, b);", "call(", ");\n}"), "a, b");
+        assert_eq!(
+            completion("x += 1;\n}\n", "{\n    ", "\n}\nfn next() {}"),
+            "x += 1;"
+        );
+        // Whatever white space the model ended with.
+        assert_eq!(completion("x += 1;\n}  \n", "", "\n}"), "x += 1;");
+        // One character may as well be code of its own.
+        assert_eq!(completion("inner(x)", "outer(", ")"), "inner(x)");
+        assert_eq!(completion("é", "", "é"), "é");
+        // White space alone is nothing repeated.
+        assert_eq!(completion("a\n\n", "", "\n\nb"), "a");
+    }
+
+    #[test]
+    fn a_completion_is_never_longer_than_forty_lines() {
+        let kept = completion(&"line\n".repeat(100), "", "");
+        assert_eq!(kept.lines().count(), 40);
+        assert!(kept.ends_with("line"), "{kept}");
+    }
+
+    #[test]
+    fn a_model_changing_the_file_is_told_to_answer_with_the_whole_of_it() {
+        let told = edit_system(Some("main.rs"), "Rust", "fn main() {}", Some("main"));
+        assert!(
+            told.starts_with("You are the assistant of GodCode"),
+            "{told}"
+        );
+        assert!(
+            told.contains("the whole new text of the file in one fenced block"),
+            "{told}"
+        );
+        assert!(told.contains("four backticks"), "{told}");
+        // The file is shown as it is in a conversation.
+        assert!(
+            told.contains("the file `main.rs`, written in Rust."),
+            "{told}"
+        );
+        assert!(told.contains("<selection>\nmain\n</selection>"), "{told}");
+        assert!(told.contains("<file>\nfn main() {}\n</file>"), "{told}");
+        assert!(!told.contains("Do NOT"), "{told}");
+        assert!(!too_long_to_edit("fn main() {}"));
+    }
+
+    #[test]
+    fn a_file_too_long_to_be_given_whole_is_not_to_be_answered_whole() {
+        let long = "é".repeat(MOST_OF_A_FILE + 1);
+        assert!(too_long_to_edit(&long));
+        assert!(!too_long_to_edit(&"é".repeat(MOST_OF_A_FILE)));
+        let told = edit_system(None, "Plain Text", &long, None);
+        assert!(
+            told.contains("Do NOT answer with the whole text of a file"),
+            "{}",
+            &told[..400]
+        );
+        assert!(!told.contains("four backticks"));
+        assert!(told.contains("(Cut: only the first 60000 characters are given.)"));
+    }
+
+    fn proposal(said: &str, text: &str) -> Option<(String, String)> {
+        Some((said.to_owned(), text.to_owned()))
+    }
+
+    #[test]
+    fn the_file_proposed_is_what_the_fenced_block_of_the_answer_holds() {
+        assert_eq!(
+            proposed("I renamed the function.\n\n```rust\nfn start() {}\n```\n"),
+            proposal("I renamed the function.", "fn start() {}\n")
+        );
+        // Tildes, no language, words after the block, blank lines and indentation kept.
+        assert_eq!(
+            proposed("~~~\na\n\n  b\n\n\n~~~\nDone."),
+            proposal("Done.", "a\n\n  b\n\n\n")
+        );
+        assert_eq!(proposed("Emptied.\n```\n```"), proposal("Emptied.", ""));
+    }
+
+    #[test]
+    fn the_last_block_of_several_is_the_file_and_the_others_are_what_was_said() {
+        let answer = "First:\n```sh\nls\n```\nthen the file:\n````md\nnew\n````\nbye";
+        assert_eq!(
+            proposed(answer),
+            proposal("First:\n```sh\nls\n```\nthen the file:\n\nbye", "new\n")
+        );
+    }
+
+    #[test]
+    fn a_longer_fence_holds_the_fences_of_the_file() {
+        let file = "# Title\n\n```rust\nfn a() {}\n```\n\n~~~\nplain\n~~~\n";
+        let answer = format!("Added an example.\n````markdown\n{file}````\n");
+        assert_eq!(proposed(&answer), proposal("Added an example.", file));
+        // Backticks do not close tildes, and a longer fence closes a shorter one.
+        assert_eq!(
+            proposed("~~~\n```\nx\n```\n~~~~"),
+            proposal("", "```\nx\n```\n")
+        );
+    }
+
+    #[test]
+    fn the_ends_of_line_of_the_file_proposed_are_kept() {
+        assert_eq!(
+            proposed("Changed.\r\n```c\r\nint a;\r\n\r\nint b;\r\n```\r\n"),
+            proposal("Changed.", "int a;\r\n\r\nint b;\r\n")
+        );
+    }
+
+    #[test]
+    fn an_answer_without_a_closed_block_proposes_nothing() {
+        assert_eq!(proposed("Nothing to change."), None);
+        assert_eq!(proposed(""), None);
+        // Cut before the end of the file.
+        assert_eq!(proposed("Here:\n```rust\nfn a() {}\n"), None);
+        assert_eq!(proposed("```\na\n```\nand\n```\nb"), None);
+        // A shorter fence does not close a longer one.
+        assert_eq!(proposed("````\na\n```\n"), None);
+        // Code within a line is not a block.
+        assert_eq!(proposed("```x``` is the fix."), None);
+    }
+
+    #[test]
+    fn what_was_said_about_an_edit_is_kept_short() {
+        let answer = format!("{}\n```\nx\n```", "é".repeat(400));
+        let (said, text) = proposed(&answer).expect("a block");
+        assert_eq!(said, "é".repeat(300));
+        assert_eq!(text, "x\n");
+    }
+
+    #[test]
+    fn a_tool_is_named_after_its_server_in_the_letters_a_model_takes() {
+        assert_eq!(tool_name("postgres", "query"), "postgres__query");
+        assert_eq!(tool_name("git-hub", "list_PRs2"), "git-hub__list_PRs2");
+        assert_eq!(
+            tool_name("my server", "read.file/é"),
+            "my_server__read_file__"
+        );
+        let long = tool_name(&"s".repeat(60), "tool-name");
+        assert_eq!(long.len(), 64);
+        assert!(long.ends_with("s__to"), "{long}");
+        assert_eq!(tool_name("", ""), "__");
+    }
+
+    // What the providers answer below is written from the shapes their documentation
+    // gives, not captured from real calls.
+    const ANTHROPIC_ASKS: &str = r#"{"id":"msg_01Aq9w938a90dw8q","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[{"type":"text","text":"I will count them."},{"type":"tool_use","id":"toolu_01A09q90qw90lq917835lq9","name":"postgres__query","input":{"sql":"select count(*) from users"}},{"type":"tool_use","id":"toolu_01B7xTq3","name":"files__read","input":{}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":472,"output_tokens":89}}"#;
+    const OLLAMA_ASKS: &str = r#"{"model":"qwen3:8b","created_at":"2025-07-07T20:32:53.844124Z","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"postgres__query","arguments":{"sql":"select count(*) from users"}}},{"function":{"name":"files__read","arguments":{"path":"a.txt"}}}]},"done_reason":"stop","done":true,"total_duration":3244883583,"prompt_eval_count":169,"eval_count":44}"#;
+
+    fn offered() -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "postgres__query".to_owned(),
+            description: "Run a read-only SQL query.".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": { "sql": { "type": "string" } },
+                "required": ["sql"],
+            }),
+        }]
+    }
+
+    fn call(id: &str, tool: &str, arguments: Value) -> Call {
+        Call {
+            id: id.to_owned(),
+            tool: tool.to_owned(),
+            arguments,
+        }
+    }
+
+    fn result(id: &str, text: &str, failed: bool) -> ToolResult {
+        ToolResult {
+            id: id.to_owned(),
+            tool: "postgres__query".to_owned(),
+            text: text.to_owned(),
+            failed,
+        }
+    }
+
+    /// The user asks, the model asks for a tool, the tool answers.
+    fn talk() -> Vec<Turn> {
+        let count = json!({ "sql": "select count(*) from users" });
+        vec![
+            Turn::User("How many users?".to_owned()),
+            Turn::Asked {
+                said: "I will count them.".to_owned(),
+                calls: vec![call("toolu_01", "postgres__query", count)],
+            },
+            Turn::Results(vec![result("toolu_01", "42", false)]),
+        ]
+    }
+
+    #[test]
+    fn anthropic_is_given_the_tools_and_what_was_asked_and_answered_as_blocks() {
+        let body = tool_body(
+            &settings(Provider::Anthropic),
+            "be brief",
+            &talk(),
+            &offered(),
+        );
+        assert_eq!(
+            body,
+            json!({
+                "model": "a-model",
+                "max_tokens": 4096,
+                "system": "be brief",
+                "messages": [
+                    { "role": "user", "content": "How many users?" },
+                    { "role": "assistant", "content": [
+                        { "type": "text", "text": "I will count them." },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01",
+                            "name": "postgres__query",
+                            "input": { "sql": "select count(*) from users" },
+                        },
+                    ] },
+                    { "role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01",
+                        "content": "42",
+                        "is_error": false,
+                    }] },
+                ],
+                "tools": [{
+                    "name": "postgres__query",
+                    "description": "Run a read-only SQL query.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "sql": { "type": "string" } },
+                        "required": ["sql"],
+                    },
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn ollama_is_given_the_tools_as_functions_and_each_result_as_a_message() {
+        let body = tool_body(&settings(Provider::Ollama), "be brief", &talk(), &offered());
+        assert_eq!(
+            body,
+            json!({
+                "model": "a-model",
+                "stream": false,
+                "messages": [
+                    { "role": "system", "content": "be brief" },
+                    { "role": "user", "content": "How many users?" },
+                    {
+                        "role": "assistant",
+                        "content": "I will count them.",
+                        "tool_calls": [{ "function": {
+                            "name": "postgres__query",
+                            "arguments": { "sql": "select count(*) from users" },
+                        } }],
+                    },
+                    { "role": "tool", "tool_name": "postgres__query", "content": "42" },
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "postgres__query",
+                        "description": "Run a read-only SQL query.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "sql": { "type": "string" } },
+                            "required": ["sql"],
+                        },
+                    },
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_is_told_and_what_is_not_an_object_is_never_sent_as_one() {
+        let turns = [
+            Turn::User("go".to_owned()),
+            Turn::Asked {
+                said: " ".to_owned(),
+                calls: vec![
+                    call("a", "one", json!("{\"n\": 1}")),
+                    call("b", "two", Value::Null),
+                ],
+            },
+            Turn::Results(vec![
+                result("a", "no such table", true),
+                result("b", "", false),
+            ]),
+        ];
+        let tools = [ToolSpec {
+            name: "one".to_owned(),
+            description: String::new(),
+            schema: Value::Null,
+        }];
+        let body = tool_body(&settings(Provider::Anthropic), "", &turns, &tools);
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([
+                { "type": "tool_use", "id": "a", "name": "one", "input": { "n": 1 } },
+                { "type": "tool_use", "id": "b", "name": "two", "input": {} },
+            ])
+        );
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([
+                { "type": "tool_result", "tool_use_id": "a", "content": "no such table", "is_error": true },
+                { "type": "tool_result", "tool_use_id": "b", "content": "", "is_error": false },
+            ])
+        );
+        assert_eq!(
+            body["tools"][0]["input_schema"],
+            json!({ "type": "object", "properties": {} })
+        );
+        let body = tool_body(&settings(Provider::Ollama), "", &turns, &tools);
+        assert_eq!(
+            body["messages"][2],
+            json!({
+                "role": "tool",
+                "tool_name": "postgres__query",
+                "content": "The tool failed: no such table",
+            })
+        );
+        assert_eq!(
+            body["messages"][1]["tool_calls"][1]["function"]["arguments"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn without_tools_what_is_sent_is_what_a_plain_question_sends() {
+        let messages = [
+            said(false, "Hello, ask me."),
+            said(true, "one"),
+            said(true, "two"),
+            said(false, "  "),
+            said(false, "answer"),
+            said(true, "three"),
+        ];
+        let turns: Vec<Turn> = messages
+            .iter()
+            .map(|message| match message.from_user {
+                true => Turn::User(message.text.clone()),
+                false => Turn::Said(message.text.clone()),
+            })
+            .collect();
+        for provider in [Provider::Ollama, Provider::Anthropic] {
+            for system in ["", "be brief"] {
+                assert_eq!(
+                    tool_body(&settings(provider), system, &turns, &[]),
+                    body(&settings(provider), system, &messages)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_asked_with_tools_when_the_user_said_nothing() {
+        let nothing = Err("There is nothing to ask.".to_owned());
+        assert_eq!(
+            ask_with_tools(&settings(Provider::Ollama), "system", &[], &offered()),
+            nothing
+        );
+        // What the model said and what tools answered before the user spoke is not a
+        // question.
+        let turns = [
+            Turn::Said("Hello".to_owned()),
+            Turn::Results(vec![result("a", "42", false)]),
+            Turn::User(" ".to_owned()),
+        ];
+        assert_eq!(
+            ask_with_tools(&settings(Provider::Anthropic), "system", &turns, &offered()),
+            nothing
+        );
+    }
+
+    #[test]
+    fn the_tools_anthropic_asks_for_are_read_with_what_it_said_first() {
+        let count = json!({ "sql": "select count(*) from users" });
+        assert_eq!(
+            tool_reply(Provider::Anthropic, ANTHROPIC_ASKS, 0),
+            Ok(Turn::Asked {
+                said: "I will count them.".to_owned(),
+                calls: vec![
+                    call("toolu_01A09q90qw90lq917835lq9", "postgres__query", count),
+                    call("toolu_01B7xTq3", "files__read", json!({})),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn the_tools_ollama_asks_for_are_numbered_after_those_asked_before() {
+        let count = json!({ "sql": "select count(*) from users" });
+        assert_eq!(
+            tool_reply(Provider::Ollama, OLLAMA_ASKS, 2),
+            Ok(Turn::Asked {
+                said: String::new(),
+                calls: vec![
+                    call("call-3", "postgres__query", count),
+                    call("call-4", "files__read", json!({ "path": "a.txt" })),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn an_answer_in_words_is_what_the_model_said_whatever_tools_were_offered() {
+        let words = r#"{"id":"msg_01","type":"message","role":"assistant","content":[{"type":"text","text":"There are 42."}],"stop_reason":"end_turn"}"#;
+        assert_eq!(
+            tool_reply(Provider::Anthropic, words, 1),
+            Ok(Turn::Said("There are 42.".to_owned()))
+        );
+        let words = r#"{"model":"qwen3:8b","message":{"role":"assistant","content":"There are 42."},"done_reason":"stop","done":true}"#;
+        assert_eq!(
+            tool_reply(Provider::Ollama, words, 1),
+            Ok(Turn::Said("There are 42.".to_owned()))
+        );
+        assert_eq!(
+            tool_reply(Provider::Anthropic, r#"{"content":[]}"#, 0),
+            Err("Anthropic gave no answer.".to_owned())
+        );
+        assert_eq!(
+            tool_reply(Provider::Ollama, "<html>", 0),
+            Err("Ollama did not answer in JSON.".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_request_for_a_tool_cut_short_is_an_error() {
+        let cut = ANTHROPIC_ASKS.replace(
+            r#""stop_reason":"tool_use""#,
+            r#""stop_reason":"max_tokens""#,
+        );
+        assert_eq!(
+            tool_reply(Provider::Anthropic, &cut, 0),
+            Err("Anthropic was cut short while asking for a tool.".to_owned())
+        );
+        let cut = OLLAMA_ASKS.replace(r#""done_reason":"stop""#, r#""done_reason":"length""#);
+        assert_eq!(
+            tool_reply(Provider::Ollama, &cut, 0),
+            Err("Ollama was cut short while asking for a tool.".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_model_of_ollama_that_takes_no_tools_is_told_in_clear_words() {
+        let refused =
+            r#"{"error":"registry.ollama.ai/library/gemma3:latest does not support tools"}"#;
+        let refused = tool_reply(Provider::Ollama, refused, 0).map_err(tool_failure);
+        assert_eq!(
+            refused,
+            Err("This model cannot use tools: choose another one.".to_owned())
+        );
+        // Any other error is told as it is.
+        let other = tool_reply(Provider::Ollama, r#"{"error":"model 'm' not found"}"#, 0);
+        assert_eq!(
+            other.map_err(tool_failure),
+            Err("Ollama: model 'm' not found".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_talk_with_tools_goes_through_curl_and_the_tools_asked_for_come_back() {
+        if !curl_is_here() {
+            return;
+        }
+        let (url, asked) = listener(OLLAMA_ASKS);
+        let body = tool_body(&settings(Provider::Ollama), "be brief", &talk(), &offered());
+        let headers = ["content-type: application/json".to_owned()];
+        let answer = fetch(
+            Provider::Ollama,
+            &config(&url, &headers, Some(&body.to_string())),
+        );
+        let asked = asked.join().expect("listener");
+        let (_, sent) = asked.split_once("\r\n\r\n").expect("a request");
+        assert_eq!(serde_json::from_str::<Value>(sent).ok(), Some(body));
+        let Ok(Turn::Asked { said, calls }) =
+            tool_reply(Provider::Ollama, &answer.unwrap_or_default(), 1)
+        else {
+            panic!("no tool was asked for");
+        };
+        assert_eq!(said, "");
+        let ids: Vec<_> = calls.iter().map(|call| call.id.as_str()).collect();
+        assert_eq!(ids, ["call-2", "call-3"]);
     }
 }
