@@ -21,10 +21,16 @@ rfd = "0.17"
 egui-phosphor = { version = "0.13", features = ["fill"] }
 # Deleted files go to the recycle bin instead of being lost.
 trash = "5"
+# Runs the plugins: a WebAssembly interpreter in pure Rust, with nothing lent to what it runs.
+wasmi = { version = "1.1", default-features = false, features = ["std"] }
 
 # The web view of the system (WebView2), for a page to show inside the window.
 [target.'cfg(windows)'.dependencies]
 wry = { version = "0.57", features = ["devtools"] }
+
+[dev-dependencies]
+# The plugins of the tests, written as WebAssembly text.
+wat = "1"
 
 [build-dependencies]
 winresource = "0.1"
