@@ -4,6 +4,7 @@
 
 pub mod check;
 pub mod complete;
+pub mod coverage;
 pub mod edit;
 pub mod emmet;
 pub mod format;
@@ -11,9 +12,11 @@ pub mod fuzzy;
 pub mod git;
 pub mod http;
 pub mod markdown;
+pub mod merge;
 pub mod modal;
 pub mod outline;
 pub mod search;
+pub mod sqlite;
 pub mod syntax;
 
 /// Line end a file uses on disk.
