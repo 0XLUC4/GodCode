@@ -20,6 +20,7 @@ use crate::theme;
 
 /// What is known of a text once it is read through: where its lines start, how it is
 /// coloured. Made again only when the text or its colours change.
+#[derive(Clone)]
 pub struct Index {
     pub key: u64,
     /// The byte each line starts at, then one past the end of the text: line `n` is the
@@ -95,6 +96,73 @@ impl Index {
         }
     }
 
+    /// Chars of the text.
+    fn total(&self) -> usize {
+        self.chars[self.lines()] - 1
+    }
+
+    /// It is all one colour: only where its lines are is known of it, and that can follow
+    /// an edit without the text being read through again.
+    fn plain(&self) -> bool {
+        self.spans.len() <= 1
+    }
+
+    /// The byte of the char `index`, found by reading its line alone.
+    fn byte_of(&self, text: &str, index: usize) -> usize {
+        let line = self.line_of(index);
+        let (from, to) = (self.starts[line], self.starts[line + 1] - 1);
+        match text.get(from..to) {
+            Some(content) => from + byte(content, index - self.chars[line]),
+            None => byte(text, index),
+        }
+    }
+
+    /// Follow an edit of a plain text: `removed` bytes at the byte `at` gave way to
+    /// `written` ones, and `text` is the result. Only the lines touched are read.
+    fn splice(&mut self, text: &str, at: usize, removed: usize, written: usize) {
+        let lines = self.lines();
+        let line_at = |byte: usize| {
+            let after = self.starts[..lines].partition_point(|start| *start <= byte);
+            after.saturating_sub(1)
+        };
+        let (first, last) = (line_at(at), line_at(at + removed));
+        let grown = written as isize - removed as isize;
+        // The lines touched, as they are now.
+        let from = self.starts[first];
+        let to = (self.starts[last + 1] - 1).saturating_add_signed(grown);
+        let region = text.get(from..to).unwrap_or("");
+        let before = self.chars[last + 1] - self.chars[first];
+        let (mut starts, mut chars) = (Vec::new(), Vec::new());
+        let (mut byte, mut count) = (from, self.chars[first]);
+        for content in region.split('\n') {
+            starts.push(byte);
+            chars.push(count);
+            let length = content.chars().count();
+            self.widest = self.widest.max(length);
+            byte += content.len() + 1;
+            count += length + 1;
+        }
+        let moved = (count - self.chars[first]) as isize - before as isize;
+        let added = starts.len();
+        self.starts.splice(first..=last, starts);
+        self.chars.splice(first..=last, chars);
+        self.indents
+            .splice(first..=last, crate::editor::indents_of(region));
+        self.closes
+            .splice(first..=last, std::iter::repeat_n(None, added));
+        // What follows moves along.
+        for start in &mut self.starts[first + added..] {
+            *start = start.saturating_add_signed(grown);
+        }
+        for start in &mut self.chars[first + added..] {
+            *start = start.saturating_add_signed(moved);
+        }
+        self.spans = vec![Span {
+            end: text.len(),
+            token: syntax::Token::Plain,
+        }];
+    }
+
     /// The char `line` starts at.
     pub fn start_of(&self, line: usize) -> usize {
         self.chars[line.min(self.lines() - 1)]
@@ -136,7 +204,7 @@ impl Index {
     }
 
     /// The line the char `index` is on.
-    fn line_of(&self, index: usize) -> usize {
+    pub fn line_of(&self, index: usize) -> usize {
         let after = self.chars.partition_point(|start| *start <= index);
         after.saturating_sub(1).min(self.lines() - 1)
     }
@@ -378,13 +446,44 @@ pub struct Cache {
     capped: bool,
 }
 
-/// What reading a text through told of it, and the revision it was read at.
+/// The text as it last showed: the revision it is expected to come back with, its size,
+/// and a number that names it, its hash when it was read through.
 #[derive(Clone, Copy)]
 struct Seen {
     revision: u64,
     bytes: usize,
-    chars: usize,
     hash: u64,
+}
+
+/// Writes in the text for the keyboard, and keeps what is known of the text in step when
+/// that can be done without reading it all.
+struct Pen<'a> {
+    index: Option<&'a mut Index>,
+    edited: bool,
+}
+
+impl Pen<'_> {
+    /// Chars of the text.
+    fn len(&self, text: &str) -> usize {
+        match &self.index {
+            Some(index) => index.total(),
+            None => text.chars().count(),
+        }
+    }
+
+    /// Write `written` over the selection. Returns the caret after it.
+    fn write(&mut self, text: &mut String, caret: Caret, written: &str) -> Caret {
+        let chars = caret.sorted();
+        // Writing nothing over nothing changes nothing.
+        self.edited |= !written.is_empty() || !chars.is_empty();
+        let Some(index) = &mut self.index else {
+            return replace(text, caret, written);
+        };
+        let bytes = index.byte_of(text, chars.start)..index.byte_of(text, chars.end);
+        text.replace_range(bytes.clone(), written);
+        index.splice(text, bytes.start, bytes.len(), written.len());
+        Caret::at(chars.start + written.chars().count())
+    }
 }
 
 /// The copies of the text the history keeps take no more than this.
@@ -393,6 +492,11 @@ const HISTORY_BYTES: usize = 256 * 1024 * 1024;
 const SETTLE_SECONDS: f64 = 1.05;
 
 impl Cache {
+    /// The text may have changed in a way the revision will not tell: read it again.
+    pub fn forget(&mut self) {
+        self.seen = None;
+    }
+
     /// The row `line` showed on the last time, keeping its fraction.
     pub fn row_of(&self, line: f32) -> f32 {
         match self.rows.as_ref().and_then(|(_, rows)| rows.as_ref()) {
@@ -754,28 +858,27 @@ fn typed(
     mut caret: Caret,
     page: usize,
     wrap: Option<usize>,
+    index: Option<&mut Index>,
 ) -> (Caret, bool) {
-    let mut edited = false;
-    // Writing nothing over nothing changes nothing.
-    let mut replace = |text: &mut String, caret: Caret, written: &str| {
-        edited |= !written.is_empty() || !caret.sorted().is_empty();
-        replace(text, caret, written)
+    let mut pen = Pen {
+        index,
+        edited: false,
     };
     let events = ui.input(|input| input.events.clone());
     for event in events {
-        let len = text.chars().count();
+        let len = pen.len(text);
         match event {
             Event::Text(written) | Event::Paste(written) => {
                 let written = written.replace("\r\n", "\n");
-                caret = replace(text, caret, &written);
+                caret = pen.write(text, caret, &written);
             }
             Event::Ime(egui::ImeEvent::Commit(written)) => {
-                caret = replace(text, caret, &written);
+                caret = pen.write(text, caret, &written);
             }
             // What is being composed shows selected: what comes next takes its place.
             Event::Ime(egui::ImeEvent::Preedit { text: composed, .. }) => {
                 let start = caret.sorted().start;
-                let head = replace(text, caret, &composed).head;
+                let head = pen.write(text, caret, &composed).head;
                 caret = Caret {
                     head,
                     anchor: start,
@@ -789,7 +892,7 @@ fn typed(
                 let bytes = byte(text, chars.start)..byte(text, chars.end);
                 ui.ctx().copy_text(text[bytes].to_owned());
                 if event == Event::Cut {
-                    caret = replace(text, caret, "");
+                    caret = pen.write(text, caret, "");
                 }
             }
             Event::Key {
@@ -864,7 +967,7 @@ fn typed(
                             };
                             caret.anchor = to;
                         }
-                        caret = replace(text, caret, "");
+                        caret = pen.write(text, caret, "");
                     }
                     _ => {}
                 }
@@ -872,7 +975,7 @@ fn typed(
             _ => {}
         }
     }
-    (caret, edited)
+    (caret, pen.edited)
 }
 
 /// Show `text` over the rest of `ui`, which is expected to scroll. `cache` holds what was
@@ -914,8 +1017,13 @@ pub fn show(
     // The text as it last showed, when nothing can have changed it since.
     let known = cache
         .seen
-        .filter(|seen| seen.revision == look.revision && seen.bytes == text.len());
-    let len = known.map_or_else(|| text.chars().count(), |seen| seen.chars);
+        .filter(|seen| seen.revision == look.revision && seen.bytes == text.len())
+        .zip(cache.index.as_ref());
+    let len = match &known {
+        Some((_, index)) => index.total(),
+        None => text.chars().count(),
+    };
+    let known = known.map(|(seen, _)| seen);
     let stored = state.cursor.char_range();
     let mut caret = stored.map(|range| Caret::of(range, len));
     let focused = ui.memory(|memory| memory.has_focus(id));
@@ -924,7 +1032,15 @@ pub fn show(
         caret = Some(Caret::at(len));
     }
     let before = (caret, text.len());
+    // What the folds are told of the text as it was: its key, its lines, the line of the
+    // caret.
+    let old = known.zip(cache.index.as_ref()).map(|(_, index)| {
+        let line = caret.map(|caret| index.line_of(caret.head));
+        (index.key, index.lines(), line)
+    });
     let mut changed = false;
+    // What is known of the text was kept in step with what was typed.
+    let mut followed = false;
     if focused && let Some(old) = caret {
         // The arrows and Tab are the field's, not a way to another widget.
         let filter = EventFilter {
@@ -940,19 +1056,31 @@ pub fn show(
                 input.consume_key(shifted, Key::Z) || input.consume_key(Modifiers::COMMAND, Key::Y);
             (input.consume_key(Modifiers::COMMAND, Key::Z), redo)
         });
-        let (mut new, mut edited) = typed(ui, text, old, page, wrap);
+        // A plain text that is known as it is: the lines touched alone are read again.
+        let live = match &mut cache.index {
+            Some(index) if known.is_some() && index.plain() && !undo && !redo => {
+                Some(Arc::make_mut(index))
+            }
+            _ => None,
+        };
+        followed = live.is_some();
+        let (mut new, mut edited) = typed(ui, text, old, page, wrap, live);
         if undo || redo {
             let mut undoer = state.undoer();
-            let current = (new.range(), text.clone());
+            // Lent to the history, not copied for it.
+            let current = (new.range(), std::mem::take(text));
             let step = if undo {
                 undoer.undo(&current)
             } else {
                 undoer.redo(&current)
             };
-            if let Some((range, restored)) = step.cloned() {
-                *text = restored;
-                new = Caret::of(range, text.chars().count());
-                edited = true;
+            match step.cloned() {
+                Some((range, restored)) => {
+                    *text = restored;
+                    new = Caret::of(range, text.chars().count());
+                    edited = true;
+                }
+                None => *text = current.1,
             }
             state.set_undoer(undoer);
         }
@@ -960,20 +1088,35 @@ pub fn show(
         caret = Some(new);
     }
 
-    // What is known of the text, made again when it changed.
-    let seen = known.filter(|_| !changed).unwrap_or_else(|| {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut hasher);
-        Seen {
-            revision: look.revision,
-            bytes: text.len(),
-            chars: text.chars().count(),
-            hash: hasher.finish(),
+    // What is known of the text, made again when it changed. Once the field itself changed
+    // it, the caller is expected to say so by moving its revision on by one.
+    let seen = match known {
+        Some(seen) if !changed => seen,
+        Some(seen) if followed => {
+            // Not read through: a name of its own, made from the one it had.
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (seen.hash, text.len(), caret.map(|caret| caret.head)).hash(&mut hasher);
+            Seen {
+                revision: look.revision.wrapping_add(1),
+                bytes: text.len(),
+                hash: hasher.finish(),
+            }
         }
-    });
+        _ => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            Seen {
+                revision: look.revision.wrapping_add(u64::from(changed)),
+                bytes: text.len(),
+                hash: hasher.finish(),
+            }
+        }
+    };
     cache.seen = Some(seen);
     let key = key_of(seen.hash, look);
-    let previous = cache.index.clone();
+    if let (true, true, Some(index)) = (followed, changed, &mut cache.index) {
+        Arc::make_mut(index).key = key;
+    }
     let index = match cache.index.as_ref().filter(|index| index.key == key) {
         Some(index) => Arc::clone(index),
         None => {
@@ -985,11 +1128,10 @@ pub fn show(
 
     // The folds follow the text: lines typed above them push them down; a text changed
     // from elsewhere gives no way to tell where they went.
-    if let Some(old) = previous.filter(|old| old.key != index.key) {
-        let grown = index.lines() as isize - old.lines() as isize;
-        match before.0 {
-            Some(caret) if changed => {
-                let edited = old.line_of(caret.head);
+    if let Some((_, lines, line)) = old.filter(|(key, ..)| *key != index.key) {
+        let grown = index.lines() as isize - lines as isize;
+        match line {
+            Some(edited) if changed => {
                 let below = folded.iter_mut().filter(|header| **header > edited);
                 below.for_each(|header| *header = header.saturating_add_signed(grown));
             }
@@ -1227,7 +1369,10 @@ pub fn show(
             && !*settled
         {
             let mut undoer = state.undoer();
-            undoer.feed_state(time, &(range, text.clone()));
+            // Lent to the history, which copies the text only when it keeps it.
+            let current = (range, std::mem::take(text));
+            undoer.feed_state(time, &current);
+            *text = current.1;
             state.set_undoer(undoer);
             *settled = time - *since >= SETTLE_SECONDS;
         }
@@ -1416,6 +1561,47 @@ mod tests {
         // Prose is folded by its indentation alone.
         let prose = Index::new(0, "a (\n  b\nc)\n", Language::plain());
         assert_eq!(prose.block(0), Some(1..2));
+    }
+
+    #[test]
+    fn what_is_known_of_a_plain_text_follows_an_edit() {
+        let plain = Language::plain();
+        let mut text = "one\n  two é\n\nfour\n".to_owned();
+        let mut index = Index::new(0, &text, plain);
+        assert!(index.plain());
+        // Each edit: the chars written over, and what is written.
+        let edits: [(Range<usize>, &str); 8] = [
+            (0..0, "X"),
+            (5..5, "\n\t"),
+            (2..9, ""),
+            (0..3, "a\nb\nc"),
+            (4..4, "é😀"),
+            (7..9, "\n\n\n"),
+            (0..0, ""),
+            (3..3, "end"),
+        ];
+        for (chars, written) in edits {
+            let chars = chars.start.min(index.total())..chars.end.min(index.total());
+            let bytes = index.byte_of(&text, chars.start)..index.byte_of(&text, chars.end);
+            assert_eq!(bytes.start, byte(&text, chars.start));
+            text.replace_range(bytes.clone(), written);
+            index.splice(&text, bytes.start, bytes.len(), written.len());
+            let read = Index::new(0, &text, plain);
+            assert_eq!(index.starts, read.starts, "{text:?}");
+            assert_eq!(index.chars, read.chars, "{text:?}");
+            assert_eq!(index.indents, read.indents, "{text:?}");
+            assert_eq!(index.closes.len(), read.closes.len());
+            assert!(index.widest >= read.widest);
+            assert_eq!(index.total(), text.chars().count());
+        }
+        // To the very end, and everything gone.
+        let end = text.len();
+        text.push_str("\nlast");
+        index.splice(&text, end, 0, 5);
+        assert_eq!(index.starts, Index::new(0, &text, plain).starts);
+        text.clear();
+        index.splice(&text, 0, end + 5, 0);
+        assert_eq!((index.lines(), index.total()), (1, 0));
     }
 
     #[test]

@@ -160,16 +160,9 @@ impl View {
     }
 }
 
-/// What the guides, the pinned lines and the strip read of the text, kept while it does
-/// not change.
-struct Layout {
-    key: u64,
-    /// Columns of white space leading each line; `None` for a blank line.
-    indents: Vec<Option<usize>>,
-    /// The byte each line starts at, then one past the end of the text: line `n` is the
-    /// bytes `starts[n]..starts[n + 1] - 1`.
-    starts: Vec<usize>,
-}
+/// What the guides, the pinned lines and the strip read of the text: what the field worked
+/// out of it, held from the end of a frame to the start of the next.
+type Layout = std::sync::Arc<field::Index>;
 
 pub(crate) fn indents_of(text: &str) -> Vec<Option<usize>> {
     text.split('\n')
@@ -211,6 +204,8 @@ pub struct Output {
     pub focused: bool,
     /// A line whose number was clicked: its breakpoint is to be toggled.
     pub gutter: Option<usize>,
+    /// Line and column, from 1, of the start and of the end of the selection.
+    pub places: Option<((usize, usize), (usize, usize))>,
 }
 
 /// A code-aware edit at the selection.
@@ -738,7 +733,8 @@ fn refresh_completion(
     typed: bool,
 ) {
     let manual = std::mem::take(&mut view.complete_now);
-    let Some(caret) = caret else {
+    // A big text is not searched for its words at every key.
+    let Some(caret) = caret.filter(|_| text.len() <= LARGE_BYTES) else {
         view.completion = None;
         return;
     };
@@ -764,9 +760,7 @@ fn refresh_completion(
             body: body.clone(),
             kind: Kind::Snippet,
         });
-        let small = text.len() <= LARGE_BYTES;
-        let known = small.then(|| complete::complete(text, caret, config.language));
-        let known = known.into_iter().flatten();
+        let known = complete::complete(text, caret, config.language);
         let items: Vec<Completion> = own.chain(known).collect();
         let typed_chars = caret - complete::word_start(text, caret);
         let wanted = manual || was_open || typed_chars >= 2;
@@ -895,7 +889,9 @@ pub fn show(
     let selected_before = selection_of(ui.ctx(), id);
 
     // Counted when the text was last read through: it only tells how wide the numbers are.
-    let lines = match &view.layout {
+    // Given back before the field shows: alone to hold it, the field can follow what is
+    // typed in it instead of making it again.
+    let lines = match view.layout.take() {
         Some(layout) => layout.starts.len() - 1,
         None => text.bytes().filter(|byte| *byte == b'\n').count() + 1,
     };
@@ -947,18 +943,7 @@ pub fn show(
             let (index, folded) = (&mut view.index, &mut view.folded);
             let shown = field::show(ui, id, text, &look, index, folded);
             // What the guides, the pinned lines and the strip read of the text.
-            let index = shown.lines.index();
-            if view
-                .layout
-                .as_ref()
-                .is_none_or(|layout| layout.key != index.key)
-            {
-                view.layout = Some(Layout {
-                    key: index.key,
-                    indents: index.indents.clone(),
-                    starts: index.starts.clone(),
-                });
-            }
+            view.layout = Some(std::sync::Arc::clone(shown.lines.index()));
             let (response, cursor_range, galley_pos, typed) =
                 (shown.response, shown.cursor, shown.origin, shown.changed);
             // Where the chars of the text are, counted from its top left.
@@ -1240,6 +1225,8 @@ pub fn show(
             popup.selected = index;
         }
         accept(ui.ctx(), id, text, config, view);
+        // Written after the field showed: it has not seen it.
+        view.index.forget();
         changed = true;
     }
 
@@ -1456,7 +1443,16 @@ pub fn show(
         view.scroll_to_line = go_to;
         ui.ctx().request_repaint();
     }
+    // Found from where the lines are known to start, not by reading the text up to them.
+    let place = |index: usize| {
+        let line = geometry.index().line_of(index);
+        (line + 1, index - geometry.index().start_of(line) + 1)
+    };
+    let places = selection
+        .as_ref()
+        .map(|selection| (place(selection.start), place(selection.end)));
     Output {
+        places,
         changed,
         selection,
         jump,
@@ -1877,10 +1873,17 @@ mod tests {
             let start = std::time::Instant::now();
             harness.frame(Vec::new());
             let rest = start.elapsed();
+            // At the end of the text too, where finding the caret by reading would be slowest.
+            let end = harness.text.chars().count();
+            set_selection(&harness.ctx, editor_id(), &(end..end));
+            harness.frame(Vec::new());
+            let start = std::time::Instant::now();
+            harness.frame(vec![Event::Text("y".to_owned())]);
+            let last = start.elapsed();
             println!(
-                "{megabytes} MB  a key: {key:?}, the frame after: {after:?}, at rest: {rest:?}"
+                "{megabytes} MB  a key: {key:?}, the frame after: {after:?}, at rest: {rest:?}, a key at the end: {last:?}"
             );
-            assert!(harness.text.starts_with("xa line"));
+            assert!(harness.text.starts_with("xa line") && harness.text.ends_with('y'));
         }
     }
 
@@ -1901,6 +1904,47 @@ mod tests {
         harness.type_text(" second");
         harness.key(Key::Z, Modifiers::COMMAND);
         assert_eq!(harness.text, "first");
+    }
+
+    #[test]
+    fn the_editor_says_where_the_selection_is() {
+        let mut harness = Harness::new("one\ntwo é\nthree");
+        set_selection(&harness.ctx, editor_id(), &(5..9));
+        let out = harness.frame(Vec::new());
+        assert_eq!(out.places, Some(((2, 2), (2, 6))));
+        harness.key(Key::End, Modifiers::COMMAND);
+        assert_eq!(harness.frame(Vec::new()).places, Some(((3, 6), (3, 6))));
+    }
+
+    #[test]
+    fn a_plain_text_is_followed_key_by_key() {
+        // Typed, erased, pasted over lines, undone: the lines are where reading says.
+        let mut harness = Harness::of("notes.txt", "one\ntwo\nthree\n", false);
+        set_selection(&harness.ctx, editor_id(), &(4..4));
+        harness.frame(Vec::new());
+        harness.type_text("2");
+        harness.key(Key::End, Modifiers::NONE);
+        harness.frame(vec![Event::Paste(" and\nmore\nlines".to_owned())]);
+        harness.frame(Vec::new());
+        harness.key(Key::Backspace, Modifiers::NONE);
+        harness.key(Key::ArrowUp, Modifiers::NONE);
+        harness.key(Key::Backspace, Modifiers::COMMAND);
+        let out = harness.type_text("!");
+        assert_eq!(harness.text, "one\n2two and\n!\nline\nthree\n");
+        assert_eq!(out.selection, Some(14..14));
+        let starts = |text: &str| {
+            let mut starts = vec![0];
+            starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
+            starts.push(text.len() + 1);
+            starts
+        };
+        let layout = harness.view.layout.as_ref().expect("read");
+        assert_eq!(layout.starts, starts(&harness.text));
+        // A text of code is read again whole, as before.
+        let mut code = Harness::new("fn a() {}\n");
+        code.type_text("// ");
+        let layout = code.view.layout.as_ref().expect("read");
+        assert_eq!(layout.starts, starts(&code.text));
     }
 
     #[test]

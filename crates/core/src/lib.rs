@@ -117,9 +117,26 @@ pub fn encode(text: &str, ending: LineEnding, bom: bool) -> Vec<u8> {
 
 /// Byte offset of the char at `index` (the end of the text when past it).
 pub fn byte_index(text: &str, index: usize) -> usize {
-    text.char_indices()
-        .nth(index)
-        .map_or(text.len(), |(byte, _)| byte)
+    // A char starts at every byte that does not continue one: whole blocks of them are
+    // counted at once, which is many times faster than going char by char.
+    const BLOCK: usize = 4096;
+    let starts_char = |byte: &u8| (*byte as i8) >= -0x40;
+    let bytes = text.as_bytes();
+    let (mut at, mut left) = (0, index);
+    while let Some(block) = bytes.get(at..at + BLOCK) {
+        let starts = block.iter().filter(|byte| starts_char(byte)).count();
+        if starts > left {
+            break;
+        }
+        left -= starts;
+        at += BLOCK;
+    }
+    // From here the `left`-th char that starts is the one.
+    let rest = bytes[at..].iter().enumerate();
+    let mut starting = rest.filter(|(_, byte)| starts_char(byte));
+    starting
+        .nth(left)
+        .map_or(text.len(), |(found, _)| at + found)
 }
 
 /// Line and column of the char at `index`, both counted from 1.
@@ -189,5 +206,19 @@ mod tests {
         assert_eq!(line_start(text, 3), 10);
         assert_eq!(line_start(text, 99), 10);
         assert_eq!(byte_index(text, 1), 2);
+        // Long enough to be counted by blocks, with chars of every width across them.
+        let long = "aé😀\n€z".repeat(3000);
+        let slow = |index: usize| {
+            long.char_indices()
+                .nth(index)
+                .map_or(long.len(), |(at, _)| at)
+        };
+        let chars = long.chars().count();
+        for index in [0, 1, 4095, 4096, 4097, 9000, chars - 1, chars, chars + 5] {
+            assert_eq!(byte_index(&long, index), slow(index), "char {index}");
+        }
+        for index in (0..chars).step_by(617) {
+            assert_eq!(byte_index(&long, index), slow(index), "char {index}");
+        }
     }
 }

@@ -1354,6 +1354,9 @@ pub struct GodApp {
     fixes: Option<(Vec<godcode_lsp::Action>, usize)>,
     /// The call being written: its line, its signature, the chars of the argument typed.
     signature: Option<Call>,
+    /// Line and column (from 1) of the start and of the end of the selection, and what
+    /// they were found for: a tab, its revision, its selection.
+    caret_place: ((u64, u64, Range<usize>), (usize, usize), (usize, usize)),
     /// The foot of the caret on screen.
     caret_pos: Option<egui::Pos2>,
     /// The editor in front had the keyboard the last time it showed.
@@ -1514,6 +1517,7 @@ impl GodApp {
             tip: None,
             fixes: None,
             signature: None,
+            caret_place: ((0, u64::MAX, 0..0), (1, 1), (1, 1)),
             caret_pos: None,
             editor_focused: false,
             project_symbols: Vec::new(),
@@ -4072,7 +4076,17 @@ impl GodApp {
             self.symbols = (0, Vec::new());
             return;
         };
-        self.caret_line = godcode_core::line_col(&tab.text, tab.selection.start).0 - 1;
+        // Where the caret is, found again only when it or the text moved.
+        let at = (tab.id, tab.revision, tab.selection.clone());
+        if self.caret_place.0 != at {
+            let start = godcode_core::line_col(&tab.text, tab.selection.start);
+            let end = match tab.selection.is_empty() {
+                true => start,
+                false => godcode_core::line_col(&tab.text, tab.selection.end),
+            };
+            self.caret_place = (at, start, end);
+        }
+        self.caret_line = self.caret_place.1.0 - 1;
         let key = hash_of((tab.id, tab.revision, tab.language.name));
         // A big text is not read through at every key for what it defines.
         let small = tab.text.len() <= editor::LARGE_BYTES;
@@ -5183,7 +5197,7 @@ impl GodApp {
                 ui.label(dim("Checking…".to_owned()));
             }
             if let Some(tab) = tab {
-                let (line, column) = godcode_core::line_col(&tab.text, tab.selection.end);
+                let (line, column) = self.caret_place.2;
                 let mut place = format!("Ln {line}, Col {column}");
                 if !tab.selection.is_empty() {
                     place.push_str(&format!("  ({} selected)", tab.selection.len()));
@@ -5931,18 +5945,28 @@ impl GodApp {
         }
         self.top_line = output.top_line;
         self.caret_pos = output.caret_pos;
+        // Where the caret is, as the editor knows it: not looked for in the text again.
+        if let Some((start, end)) = output.places {
+            let at = (tab.id, tab.revision, tab.selection.clone());
+            self.caret_place = (at, start, end);
+        }
         self.editor_focused = focused;
         let pointed = output.pointed;
         // After a letter, a dot or a colon, the language server says what can follow; after
         // a bracket or a comma, which argument is being written.
         let caret = tab.selection.start;
-        let before = tab.text[..godcode_core::byte_index(&tab.text, caret)]
-            .chars()
-            .next_back();
         let typed = output.changed && tab.selection.is_empty();
         // A completion just picked is not typing: asking again would have the server
         // forget the list it is about to be asked about.
         let typed = typed && tab.view.accepted.is_none();
+        // The char before the caret: looked for only when something was typed.
+        let before = typed
+            .then(|| {
+                tab.text[..godcode_core::byte_index(&tab.text, caret)]
+                    .chars()
+                    .next_back()
+            })
+            .flatten();
         let completes =
             typed && before.is_some_and(|ch| ch.is_alphanumeric() || "_.:".contains(ch));
         let calls = typed && matches!(before, Some('(' | ','));
