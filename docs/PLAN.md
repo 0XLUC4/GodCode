@@ -165,7 +165,8 @@ le commit. `Conflict: Open Merge View` montre les conflits du fichier
 sur trois colonnes (le mien, le résultat, le leur) : `Mine` / `Both` / `Theirs` par conflit, `All mine`,
 `All theirs`, `Apply` écrit le résultat. Monorepos : `Run Task…` liste aussi les tâches des projets rangés dans le projet (ses dossiers et ceux de
 `packages`, `apps`, `crates`, `services`, `libs`, `modules` qui ont un `package.json`, `Cargo.toml`,
-`go.mod` ou `pyproject.toml`), chacune lancée dans son dossier. Reste : variables d'environnement. Fait : `New Project…` crée un projet depuis un
+`go.mod` ou `pyproject.toml`), chacune lancée dans son dossier. Variables d'environnement : `Choose .env File…` prend un `.env` du dossier ; ses valeurs vont aux tests
+lancés ici, au débogueur Python et au prochain terminal. Fait : `New Project…` crée un projet depuis un
 modèle (page web, Node/TypeScript, Python, Rust).
 
 ### Phase 6 — outils (⏳)
@@ -198,7 +199,9 @@ HTML du dossier servi, mise en avant, prend la place de celle affichée.
 Bases de données : ouvrir un fichier SQLite montre ses tables et leurs lignes, page par page (lecture
 seule, lecteur maison sans dépendance ; pas de requêtes SQL, pas de tables `WITHOUT ROWID`, le journal
 `-wal` n'est pas lu et c'est dit).
-Reste : requêtes SQL, PostgreSQL, Docker.
+Docker : `Docker…` liste conteneurs et images (par la commande `docker`), démarre, arrête, relance un
+conteneur, suit ses logs dans le terminal ; rien n'y supprime quoi que ce soit.
+Reste : requêtes SQL, PostgreSQL, shell dans un conteneur, docker compose.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 

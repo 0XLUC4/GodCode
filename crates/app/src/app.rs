@@ -168,6 +168,8 @@ enum Cmd {
     Zen,
     SaveLayout,
     Layouts,
+    EnvFile,
+    Docker,
     CaretAbove,
     CaretBelow,
     Tasks,
@@ -565,6 +567,8 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::Zen, icon::EYE, "Toggle Zen Mode", "Ctrl+Alt+Z"),
     spec(Cmd::SaveLayout, icon::ROWS, "Save Layout…", ""),
     spec(Cmd::Layouts, icon::ROWS, "Layout…", ""),
+    spec(Cmd::EnvFile, icon::ROWS, "Choose .env File…", ""),
+    spec(Cmd::Docker, icon::ROWS, "Docker…", ""),
     spec(
         Cmd::CaretAbove,
         icon::ARROW_UP,
@@ -825,6 +829,8 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::TestResults),
             Some(Cmd::TestAtCaret),
             Some(Cmd::RunCoverage),
+            Some(Cmd::EnvFile),
+            Some(Cmd::Docker),
             Some(Cmd::Coverage),
             Some(Cmd::Tasks),
             Some(Cmd::RunLast),
@@ -1525,6 +1531,12 @@ pub struct GodApp {
     diff: Option<(String, Vec<git::Row>)>,
     /// The file whose conflicts are being settled side by side.
     merging: Option<Merging>,
+    /// The `.env` file whose values go to what is run from here, by its name in the
+    /// folder; and the ones to pick from, with the one chosen.
+    env_file: Option<String>,
+    env_pick: Option<(Vec<String>, usize)>,
+    /// What Docker has, while it is looked at.
+    docker: Option<Docker>,
     /// The layouts kept under a name; and the one chosen while they are picked from.
     layouts: Vec<Arrangement>,
     layout_pick: Option<usize>,
@@ -1751,6 +1763,9 @@ impl GodApp {
             merging: None,
             layouts: layouts_of(&get("layouts").unwrap_or_default()),
             layout_pick: None,
+            env_file: get("env_file").filter(|name| !name.is_empty()),
+            env_pick: None,
+            docker: None,
             database: None,
             last_task: None,
             log: None,
@@ -2485,7 +2500,7 @@ impl GodApp {
             .or_else(beside_file)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
-        match Terminal::start(&folder, ctx) {
+        match Terminal::start(&folder, ctx, &self.env_values()) {
             Ok(terminal) => {
                 self.terminal = Some(terminal);
                 true
@@ -3417,6 +3432,7 @@ impl GodApp {
                     "cwd": folder,
                     "console": "internalConsole",
                     "justMyCode": true,
+                    "env": self.env_values().into_iter().collect::<std::collections::HashMap<_, _>>(),
                 }),
                 "pip install debugpy",
             ),
@@ -3755,11 +3771,12 @@ impl GodApp {
     /// Run `command`, which runs tests, in `root`: what it prints is read when it ends.
     fn capture_tests(&mut self, ctx: &Context, root: PathBuf, command: String) {
         self.test_output = format!("$ {command}\n");
+        let values = self.env_values();
         let (sender, receiver) = channel();
         let waking = ctx.clone();
         std::thread::spawn(move || {
             // The window may be gone when the tests end: there is then no one to tell.
-            let _ = sender.send(tools::run_captured(&root, &command));
+            let _ = sender.send(tools::run_captured(&root, &command, &values));
             waking.request_repaint();
         });
         self.test_run = Some(receiver);
@@ -4024,6 +4041,156 @@ impl GodApp {
             }
         } else if open {
             self.merging = Some(merging);
+        }
+    }
+
+    /// The values of the `.env` file chosen, for what is run from here; none when none is
+    /// chosen or it cannot be read.
+    fn env_values(&self) -> Vec<(String, String)> {
+        let file = self.run_root().zip(self.env_file.as_ref());
+        let written = file.and_then(|(root, name)| std::fs::read_to_string(root.join(name)).ok());
+        written.map_or_else(Vec::new, |text| godcode_core::dotenv::values(&text))
+    }
+
+    /// The `.env` files of the folder: pick the one whose values are given to what runs.
+    fn env_dialog(&mut self, ctx: &Context) {
+        let Some((rows, mut selected)) = self.env_pick.take() else {
+            return;
+        };
+        match list_dialog(ctx, "Environment file", &rows, &mut selected, None) {
+            None => self.env_pick = Some((rows, selected)),
+            Some(Some(row)) => {
+                // The first row is for none of them.
+                self.env_file = rows.get(row).filter(|_| row > 0).cloned();
+                let count = self.env_values().len();
+                self.toasts.success(format!(
+                    "{count} values for the tests run here, the debugger and the next terminal"
+                ));
+            }
+            Some(None) => {}
+        }
+    }
+
+    /// Ask Docker what it has, after doing `first` (the arguments of a docker command)
+    /// when there is something to do.
+    fn ask_docker(&mut self, ctx: &Context, first: Option<String>) {
+        let Some(docker) = &mut self.docker else {
+            return;
+        };
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            let done = first.map(|command| {
+                let args: Vec<&str> = command.split_whitespace().skip(1).collect();
+                tools::docker(&args)
+            });
+            let containers = tools::docker(&["ps", "-a", "--format", "{{json .}}"]);
+            let images = tools::docker(&["images", "--format", "{{json .}}"]);
+            // The window may have been closed: nobody listens then.
+            let _ = sender.send((done.unwrap_or_default(), containers, images));
+            waking.request_repaint();
+        });
+        docker.asking = Some(receiver);
+    }
+
+    /// The containers and the images of Docker: start, stop, restart, read the logs.
+    fn docker_window(&mut self, ctx: &Context) {
+        use godcode_core::docker::{self, Action};
+        let Some(mut shown) = self.docker.take() else {
+            return;
+        };
+        if let Some(Ok((done, containers, images))) = shown.asking.as_ref().map(Receiver::try_recv)
+        {
+            shown.asking = None;
+            shown.containers = docker::containers(&containers);
+            shown.images = docker::images(&images);
+            // Nothing listed: what docker printed says why (it is not running, not there).
+            let nothing = shown.containers.is_empty() && shown.images.is_empty();
+            shown.said = match nothing {
+                true => format!("{done}{containers}").trim().to_owned(),
+                false => done.trim().to_owned(),
+            };
+        }
+        let palette = Palette::of_ctx(ctx);
+        let mut open = true;
+        let mut refresh = false;
+        let mut wanted = None;
+        egui::Window::new("Docker")
+            .id(Id::new("docker-window"))
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_size(vec2(980.0, 600.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    refresh = ui.button("Refresh").clicked();
+                    if shown.asking.is_some() {
+                        ui.spinner();
+                    }
+                });
+                if !shown.said.is_empty() {
+                    ui.colored_label(palette.text_dim, &shown.said);
+                }
+                let idle = shown.asking.is_none();
+                ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    ui.add_space(6.0);
+                    ui.strong(format!("Containers ({})", shown.containers.len()));
+                    egui::Grid::new("docker-containers")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for container in &shown.containers {
+                                let (state, ink) = match container.running {
+                                    true => ("running", palette.success),
+                                    false => ("stopped", palette.text_dim),
+                                };
+                                ui.colored_label(ink, state);
+                                ui.label(&container.name);
+                                ui.label(&container.image);
+                                ui.label(&container.status);
+                                ui.label(&container.ports);
+                                let offered: &[(&str, Action)] = match container.running {
+                                    true => &[
+                                        ("Stop", Action::Stop),
+                                        ("Restart", Action::Restart),
+                                        ("Logs", Action::Logs),
+                                    ],
+                                    false => &[("Start", Action::Start), ("Logs", Action::Logs)],
+                                };
+                                ui.horizontal(|ui| {
+                                    for (label, action) in offered {
+                                        if ui.add_enabled(idle, Button::new(*label)).clicked() {
+                                            wanted = Some((*action, container.id.clone()));
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(12.0);
+                    ui.strong(format!("Images ({})", shown.images.len()));
+                    egui::Grid::new("docker-images")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for image in &shown.images {
+                                ui.label(&image.name);
+                                ui.label(&image.size);
+                                ui.label(&image.created);
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        if open {
+            self.docker = Some(shown);
+        }
+        match wanted.map(|(action, id)| (action, docker::command(action, &id))) {
+            // The logs go on as long as the container runs: they are for the terminal.
+            Some((Action::Logs, command)) if !command.is_empty() => {
+                self.docker = None;
+                self.run_task(ctx, command);
+            }
+            Some((_, command)) if !command.is_empty() => self.ask_docker(ctx, Some(command)),
+            _ if refresh => self.ask_docker(ctx, None),
+            _ => {}
         }
     }
 
@@ -5804,6 +5971,30 @@ impl GodApp {
                 self.toasts.success("Code is drawn with the built-in font");
             }
             Cmd::Zen => self.zen = !self.zen,
+            Cmd::EnvFile => {
+                let listed = self
+                    .run_root()
+                    .and_then(|root| std::fs::read_dir(root).ok());
+                let names = listed.into_iter().flatten().flatten();
+                let names: Vec<String> = names
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect();
+                let files = godcode_core::dotenv::files(&names);
+                if files.is_empty() {
+                    self.toasts.error("No .env file in this folder");
+                } else {
+                    let rows: Vec<String> = std::iter::once("No .env file".to_owned())
+                        .chain(files)
+                        .collect();
+                    let chosen = self.env_file.as_ref();
+                    let selected = rows.iter().position(|row| Some(row) == chosen);
+                    self.env_pick = Some((rows, selected.unwrap_or(0)));
+                }
+            }
+            Cmd::Docker => {
+                self.docker = Some(Docker::default());
+                self.ask_docker(ctx, None);
+            }
             Cmd::SaveLayout => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Layout,
@@ -8303,6 +8494,8 @@ impl eframe::App for GodApp {
         self.tasks_dialog(&ctx);
         self.environments_dialog(&ctx);
         self.layouts_dialog(&ctx);
+        self.env_dialog(&ctx);
+        self.docker_window(&ctx);
         self.merge_window(&ctx);
         self.database_window(&ctx);
         self.log_dialog(&ctx);
@@ -8320,6 +8513,7 @@ impl eframe::App for GodApp {
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
         storage.set_string("layouts", layouts_text(&self.layouts));
+        storage.set_string("env_file", self.env_file.clone().unwrap_or_default());
         storage.set_string("environment", self.environment.clone().unwrap_or_default());
         let watched: Vec<&str> = self
             .watches
@@ -8428,6 +8622,16 @@ fn load_themes() -> Result<(), String> {
     let themes = written.map_or(Ok(Vec::new()), |text| theme::parse_user_themes(&text))?;
     theme::set_user_themes(themes);
     Ok(())
+}
+
+/// What Docker has, as it last said; what its last command printed; and the answer awaited
+/// (what a command printed, the containers, the images).
+#[derive(Default)]
+struct Docker {
+    containers: Vec<godcode_core::docker::Container>,
+    images: Vec<godcode_core::docker::Image>,
+    said: String,
+    asking: Option<Receiver<(String, String, String)>>,
 }
 
 /// A file with conflicts laid out in three columns: mine, the result, theirs.

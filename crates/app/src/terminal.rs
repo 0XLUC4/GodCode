@@ -65,8 +65,12 @@ fn shell() -> Command {
 }
 
 impl Terminal {
-    /// Start a shell in `folder`.
-    pub fn start(folder: &Path, ctx: &Context) -> Result<Self, String> {
+    /// Start a shell in `folder`, with `values` added to its environment.
+    pub fn start(
+        folder: &Path,
+        ctx: &Context,
+        values: &[(String, String)],
+    ) -> Result<Self, String> {
         let mut command = shell();
         command
             .current_dir(folder)
@@ -76,7 +80,8 @@ impl Terminal {
             // Colours would arrive as escape codes; unbuffered so prints show at once.
             .env("NO_COLOR", "1")
             .env("PYTHONUNBUFFERED", "1")
-            .env("PYTHONUTF8", "1");
+            .env("PYTHONUTF8", "1")
+            .envs(values.iter().map(|(name, value)| (name, value)));
         tools::hidden(&mut command);
         let mut child = command
             .spawn()
@@ -400,7 +405,7 @@ mod tests {
     fn the_shell_runs_what_it_is_sent() {
         let ctx = Context::default();
         let folder = std::env::temp_dir();
-        let mut terminal = Terminal::start(&folder, &ctx).expect("a shell");
+        let mut terminal = Terminal::start(&folder, &ctx, &[]).expect("a shell");
         // The answer differs from the command, which the shell may echo.
         terminal.send("echo (40+2)");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -434,7 +439,7 @@ mod tests {
     #[test]
     fn typing_in_the_panel_writes_the_command_line() {
         let ctx = Context::default();
-        let mut terminal = Terminal::start(&std::env::temp_dir(), &ctx).expect("a shell");
+        let mut terminal = Terminal::start(&std::env::temp_dir(), &ctx, &[]).expect("a shell");
         frame(&ctx, &mut terminal, 0.0, Vec::new());
         frame(
             &ctx,
@@ -468,7 +473,7 @@ mod tests {
     #[test]
     fn output_is_cleaned_of_escape_codes() {
         let ctx = Context::default();
-        let mut terminal = Terminal::start(&std::env::temp_dir(), &ctx).expect("a shell");
+        let mut terminal = Terminal::start(&std::env::temp_dir(), &ctx, &[]).expect("a shell");
         terminal.stop();
         terminal.clear();
         terminal.feed(b"\x1b[31mred\x1b[0m\r\n10%\r50%\r\ncaf\xC3");

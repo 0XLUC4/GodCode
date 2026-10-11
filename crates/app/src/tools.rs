@@ -433,9 +433,25 @@ pub fn with_results(command: &str) -> String {
     command.to_owned()
 }
 
-/// Run `command` through the shell in `folder`, without a window, and return all it
+/// Run `docker` with `args`, without a window and without a shell, and return all it
 /// printed; or why it could not run.
-pub fn run_captured(folder: &Path, command: &str) -> String {
+pub fn docker(args: &[&str]) -> String {
+    let mut run = Command::new("docker");
+    run.args(args);
+    hidden(&mut run);
+    match run.output() {
+        Ok(output) => {
+            let printed = String::from_utf8_lossy(&output.stdout);
+            let complained = String::from_utf8_lossy(&output.stderr);
+            format!("{printed}{complained}")
+        }
+        Err(err) => format!("Cannot run docker: {err}\n"),
+    }
+}
+
+/// Run `command` through the shell in `folder`, without a window, and return all it
+/// printed; or why it could not run. `values` are added to its environment.
+pub fn run_captured(folder: &Path, command: &str, values: &[(String, String)]) -> String {
     let (shell, flag) = if cfg!(windows) {
         ("cmd", "/C")
     } else {
@@ -443,6 +459,7 @@ pub fn run_captured(folder: &Path, command: &str) -> String {
     };
     let mut run = Command::new(shell);
     run.args([flag, command]).current_dir(folder);
+    run.envs(values.iter().map(|(name, value)| (name, value)));
     hidden(&mut run);
     match run.output() {
         Ok(output) => {
@@ -682,7 +699,7 @@ mod tests {
 
     #[test]
     fn a_command_is_run_and_what_it_printed_is_kept() {
-        let printed = run_captured(&std::env::temp_dir(), "echo hello there");
+        let printed = run_captured(&std::env::temp_dir(), "echo hello there", &[]);
         assert!(printed.contains("hello there"), "{printed}");
         assert_eq!(with_results("pytest"), "pytest -v");
         assert_eq!(with_results("cargo test"), "cargo test");
