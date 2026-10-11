@@ -26,7 +26,6 @@ const NO_COPY: &str = "COPY is not possible here: only rows can be read";
 const UNREADABLE: &str = "The server answered the password exchange with something unreadable";
 
 /// Where a server is and who asks: read from `postgres://user:password@host:port/database`.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct Target {
     pub host: String,
@@ -49,7 +48,6 @@ impl fmt::Debug for Target {
     }
 }
 
-#[allow(dead_code)]
 impl Target {
     /// Read an address: `postgres://` or `postgresql://`, then `user:password@host:port/database`.
     /// The port is 5432 and the database is named like the user when they are not given.
@@ -142,7 +140,6 @@ fn unescaped(text: &str) -> Result<String, String> {
 }
 
 /// What a question answered.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Answer {
     pub columns: Vec<String>,
@@ -155,7 +152,6 @@ pub struct Answer {
 }
 
 /// A session with a server, logged in.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
@@ -164,7 +160,6 @@ pub struct Connection {
     lost: bool,
 }
 
-#[allow(dead_code)]
 impl Connection {
     /// Reach the server of `target` and log in. It may take 10 seconds to accept the
     /// connection, then 30 to say each thing.
@@ -377,7 +372,6 @@ impl Drop for Connection {
 }
 
 /// The SQL `tables` runs: one column, `schema.name`, quoted where a query would need it.
-#[allow(dead_code)]
 pub const LIST_TABLES: &str = "\
 SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname)
 FROM pg_catalog.pg_class c

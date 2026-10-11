@@ -170,6 +170,7 @@ enum Cmd {
     Layouts,
     EnvFile,
     Docker,
+    Postgres,
     CaretAbove,
     CaretBelow,
     Tasks,
@@ -571,6 +572,7 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::Layouts, icon::ROWS, "Layout…", ""),
     spec(Cmd::EnvFile, icon::ROWS, "Choose .env File…", ""),
     spec(Cmd::Docker, icon::ROWS, "Docker…", ""),
+    spec(Cmd::Postgres, icon::ROWS, "Connect to PostgreSQL…", ""),
     spec(
         Cmd::CaretAbove,
         icon::ARROW_UP,
@@ -840,6 +842,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::RunCoverage),
             Some(Cmd::EnvFile),
             Some(Cmd::Docker),
+            Some(Cmd::Postgres),
             Some(Cmd::Coverage),
             Some(Cmd::Tasks),
             Some(Cmd::RunLast),
@@ -1198,6 +1201,8 @@ enum PromptKind {
     Value(Option<u64>, String),
     /// The name to keep the layout on show under.
     Layout,
+    /// The address of a PostgreSQL server: `postgres://user:password@host/database`.
+    Postgres,
 }
 
 /// A question about a file of the tree.
@@ -1360,6 +1365,9 @@ fn stroke_of(key: Key, modifiers: Modifiers, vim: bool, commands: bool) -> Optio
         return Some(match key {
             Key::Escape if modifiers.is_none() => Typed::Escape,
             Key::R if commands && ctrl && !alt && !modifiers.shift => Typed::Ctrl('r'),
+            // Back and forth through the places jumped from; Open File keeps its menu.
+            Key::O if commands && ctrl && !alt && !modifiers.shift => Typed::Ctrl('o'),
+            Key::I if commands && ctrl && !alt && !modifiers.shift => Typed::Ctrl('i'),
             _ if !commands || !modifiers.is_none() => return None,
             Key::Enter => Typed::Enter,
             Key::Backspace => Typed::Backspace,
@@ -1551,6 +1559,8 @@ pub struct GodApp {
     env_pick: Option<(Vec<String>, usize)>,
     /// What Docker has, while it is looked at.
     docker: Option<Docker>,
+    /// The PostgreSQL server being asked questions.
+    postgres: Option<Postgres>,
     /// What was said with the assistant, and to which model.
     chat: Chat,
     /// What the model would write at the caret, shown until it is taken or left; and
@@ -1787,6 +1797,7 @@ impl GodApp {
             env_file: get("env_file").filter(|name| !name.is_empty()),
             env_pick: None,
             docker: None,
+            postgres: None,
             ghost: None,
             suggesting: None,
             chat: Chat::new(
@@ -4163,6 +4174,180 @@ impl GodApp {
         }
     }
 
+    /// Open a connection to the PostgreSQL server at `address`, held by a thread of its
+    /// own that answers one question after the other until the window is closed.
+    fn connect_postgres(&mut self, ctx: &Context, address: &str) {
+        let target = match crate::postgres::Target::parse(address) {
+            Ok(target) => target,
+            Err(err) => {
+                self.toasts.error(err);
+                return;
+            }
+        };
+        let name = format!("{}@{}/{}", target.user, target.host, target.database);
+        let (ask, asked) = channel();
+        let (answer, said) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            let mut connection = crate::postgres::Connection::open(&target);
+            // What it has is told first; a server that could not be reached says why there.
+            let tables = match &mut connection {
+                Ok(connection) => connection.tables(),
+                Err(err) => Err(err.clone()),
+            };
+            let _ = answer.send(PostgresSaid::Tables(tables));
+            waking.request_repaint();
+            let Ok(mut connection) = connection else {
+                return;
+            };
+            // Ends when the window is closed: nothing is asked any more.
+            for wanted in asked {
+                let said = match wanted {
+                    PostgresAsk::Tables => PostgresSaid::Tables(connection.tables()),
+                    PostgresAsk::Query(sql) => {
+                        PostgresSaid::Answer(connection.query(&sql, DATABASE_ANSWER))
+                    }
+                };
+                if answer.send(said).is_err() {
+                    return;
+                }
+                waking.request_repaint();
+            }
+        });
+        self.postgres = Some(Postgres {
+            name,
+            ask,
+            said,
+            waiting: 1,
+            tables: Vec::new(),
+            asked: String::new(),
+            answer: None,
+            error: None,
+        });
+    }
+
+    /// The tables of a PostgreSQL server, the question asked of it and what it answered.
+    fn postgres_window(&mut self, ctx: &Context) {
+        let Some(mut server) = self.postgres.take() else {
+            return;
+        };
+        while let Ok(said) = server.said.try_recv() {
+            server.waiting = server.waiting.saturating_sub(1);
+            server.error = None;
+            match said {
+                PostgresSaid::Tables(Ok(tables)) => server.tables = tables,
+                PostgresSaid::Answer(Ok(answer)) => server.answer = Some(answer),
+                PostgresSaid::Tables(Err(err)) | PostgresSaid::Answer(Err(err)) => {
+                    server.error = Some(err);
+                }
+            }
+        }
+        let palette = Palette::of_ctx(ctx);
+        let mut open = true;
+        // The question to send; the tables to list again.
+        let (mut run, mut refresh) = (false, false);
+        egui::Window::new(format!("PostgreSQL: {}", server.name))
+            .id(Id::new("postgres-window"))
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_size(vec2(1180.0, 640.0))
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(220.0);
+                        refresh = ui.button("Refresh").clicked();
+                        let list = ScrollArea::vertical().id_salt("postgres-tables");
+                        list.auto_shrink(false).show(ui, |ui| {
+                            for table in &server.tables {
+                                if ui.selectable_label(false, table).clicked() {
+                                    server.asked = format!("SELECT * FROM {table} LIMIT 200");
+                                    run = true;
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            let field = TextEdit::singleline(&mut server.asked)
+                                .margin(crate::widgets::FIELD_MARGIN)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("SELECT …")
+                                .desired_width(ui.available_width() - 70.0);
+                            let field = ui.add(field);
+                            let entered = field.lost_focus()
+                                && ui.input(|input| input.key_pressed(Key::Enter));
+                            run |= ui.button("Run").clicked() || entered;
+                        });
+                        ui.horizontal(|ui| {
+                            if server.waiting > 0 {
+                                ui.spinner();
+                            }
+                            if let Some(answer) = &server.answer {
+                                let more = match answer.cut {
+                                    true => ", more were left out",
+                                    false => "",
+                                };
+                                let rows = answer.rows.len();
+                                ui.label(format!("{}  ({rows} rows shown{more})", answer.done));
+                            }
+                        });
+                        if let Some(error) = &server.error {
+                            ui.colored_label(palette.error, error);
+                        }
+                        let grid = ScrollArea::both().id_salt("postgres-rows");
+                        grid.auto_shrink(false).show(ui, |ui| {
+                            let Some(answer) = &server.answer else {
+                                return;
+                            };
+                            egui::Grid::new("postgres-grid")
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for column in &answer.columns {
+                                        ui.strong(column);
+                                    }
+                                    ui.end_row();
+                                    for row in &answer.rows {
+                                        for value in row {
+                                            let Some(value) = value else {
+                                                ui.colored_label(palette.text_dim, "NULL");
+                                                continue;
+                                            };
+                                            // One line of it, and not all of a long one.
+                                            let mut shown: String = value
+                                                .chars()
+                                                .take(DATABASE_CELL)
+                                                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                                                .collect();
+                                            if shown.len() < value.len() {
+                                                shown.push('…');
+                                            }
+                                            ui.label(shown);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    });
+                });
+            });
+        let wanted = match (run && !server.asked.trim().is_empty(), refresh) {
+            (true, _) => Some(PostgresAsk::Query(server.asked.clone())),
+            (false, true) => Some(PostgresAsk::Tables),
+            (false, false) => None,
+        };
+        if let Some(wanted) = wanted {
+            match server.ask.send(wanted) {
+                Ok(()) => server.waiting += 1,
+                Err(_) => server.error = Some("The connection to the server is closed".to_owned()),
+            }
+        }
+        // Closed, its thread has nothing more to wait for and lets the connection go.
+        if open {
+            self.postgres = Some(server);
+        }
+    }
+
     /// Ask Docker what it has, after doing `first` (the arguments of a docker command)
     /// when there is something to do.
     fn ask_docker(&mut self, ctx: &Context, first: Option<String>) {
@@ -6444,6 +6629,18 @@ impl GodApp {
                     self.env_pick = Some((rows, selected.unwrap_or(0)));
                 }
             }
+            Cmd::Postgres => {
+                // The address the project keeps for itself is the one most likely meant.
+                let kept = self.env_values().into_iter();
+                let address = kept.filter(|(name, _)| name == "DATABASE_URL");
+                let address = address.map(|(_, value)| value);
+                let mut address = address.filter(|value| value.starts_with("postgres"));
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Postgres,
+                    name: address.next_back().unwrap_or_default(),
+                    focus: true,
+                });
+            }
             Cmd::Docker => {
                 // The services the folder says it is made of, when it has a compose file.
                 let written = self.folder().and_then(|root| {
@@ -8620,6 +8817,7 @@ impl GodApp {
             PromptKind::Condition(_) => ("Stop here when… (empty: always)", "Set"),
             PromptKind::Value(..) => ("New value", "Set"),
             PromptKind::Layout => ("Save this layout as", "Save"),
+            PromptKind::Postgres => ("postgres://user:password@host:5432/database", "Connect"),
             PromptKind::Delete(_) => ("Delete", "Move to recycle bin"),
         };
         let mut confirmed = false;
@@ -8659,6 +8857,8 @@ impl GodApp {
             }
         } else if confirmed && matches!(prompt.kind, PromptKind::Layout) {
             self.save_layout(prompt.name.trim());
+        } else if confirmed && matches!(prompt.kind, PromptKind::Postgres) {
+            self.connect_postgres(ctx, prompt.name.trim());
         } else if confirmed {
             match self.file_operation(ctx, &prompt) {
                 Ok(created) => {
@@ -8692,7 +8892,8 @@ impl GodApp {
             PromptKind::Word(_)
             | PromptKind::Condition(_)
             | PromptKind::Value(..)
-            | PromptKind::Layout => Ok(None),
+            | PromptKind::Layout
+            | PromptKind::Postgres => Ok(None),
             PromptKind::Delete(path) => {
                 trash::delete(path).map_err(|err| format!("Cannot delete {name}: {err}"))?;
                 // Unchanged editors of what is gone close; edited ones keep their text.
@@ -9009,6 +9210,7 @@ impl eframe::App for GodApp {
         self.layouts_dialog(&ctx);
         self.env_dialog(&ctx);
         self.docker_window(&ctx);
+        self.postgres_window(&ctx);
         self.merge_window(&ctx);
         self.database_window(&ctx);
         self.log_dialog(&ctx);
@@ -9230,6 +9432,32 @@ impl Chat {
             proposal: None,
         }
     }
+}
+
+/// What is asked of the thread that holds the connection to a PostgreSQL server.
+enum PostgresAsk {
+    Tables,
+    Query(String),
+}
+
+/// What that thread answers.
+enum PostgresSaid {
+    Tables(Result<Vec<String>, String>),
+    Answer(Result<crate::postgres::Answer, String>),
+}
+
+/// A PostgreSQL server asked questions: its tables, the question written, its answer.
+struct Postgres {
+    /// Who asks whom, without the password.
+    name: String,
+    ask: std::sync::mpsc::Sender<PostgresAsk>,
+    said: Receiver<PostgresSaid>,
+    /// Answers still awaited.
+    waiting: usize,
+    tables: Vec<String>,
+    asked: String,
+    answer: Option<crate::postgres::Answer>,
+    error: Option<String>,
 }
 
 /// What Docker has, as it last said; what its last command printed; and the answer awaited

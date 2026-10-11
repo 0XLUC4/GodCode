@@ -125,7 +125,8 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Touches Emacs : `Ctrl+F B N P A E`, `Alt+F B`, `Ctrl+D K Y W`, `Alt+W D`, marque `Ctrl+Espace`, `Ctrl+G`, `Ctrl+/`, `Ctrl+S` cherche, `Ctrl+X Ctrl+S` enregistre, `Ctrl+X Ctrl+F` ouvre | ✅ |
 | Vim : registres nommés (`"a`–`"z`, majuscule pour ajouter, `"0`, `"_`), macros (`q{a-z}`, `@{a-z}`, `@@`, compte), `recording @a` dans la barre d'état ; une macro s'arrête à une touche qui demande quelque chose à l'éditeur (annuler, chercher, enregistrer) | ✅ |
 | Vim : marques (`m{a-z}`, `'a`, `` `a ``, `''`, après un opérateur, propres à chaque onglet), `:s` avec plage, drapeaux `g` `i` et groupes (expressions de la bibliothèque `regex` : groupes `( )`), `:N,Md`, `:$`, `&`, compte devant `.`, registres `"1`–`"9` et `"-` | ✅ |
-| Vim : marques de fichier `A`–`Z`, liste des sauts (`Ctrl-O`), `:g`, adresses relatives (`:.+2`), drapeau `c` de `:s` | ⏳ |
+| Vim : liste des sauts (`Ctrl-O`, `Ctrl-I`), adresses relatives et par motif (`:.+2`, `:/foo/`), `:g` et `:v`, `:m`, `:t`, `:>`, `:<`, `:y`, `:normal` | ✅ |
+| Vim : marques de fichier `A`–`Z`, drapeau `c` de `:s` | ⏳ |
 | Fichiers jusqu'à 64 Mo (2 Mo avant). Au-delà de 2 Mo : texte brut, sans couleurs, serveur de langage, plan, complétion par mots ni historique local. Au repos rien n'est relu ; pendant la frappe, seules les lignes touchées le sont. Mesuré à 50 Mo : une frappe en fin de fichier coûte 50 µs, 21 ms tout au début (le texte est une `String` : ce qui suit le curseur est déplacé) ; 82 ms avant (`cargo test --release -p godcode typing_in_a_big -- --ignored --nocapture`) | ✅ |
 | Historique d'annulation par différences : seul ce qui change est gardé (64 Mo au plus), donc autant de niveaux dans un gros fichier que dans un petit ; une frappe groupée par pauses d'une seconde ; un changement fait ailleurs (commande, Vim, serveur de langage) est trouvé par comparaison | ✅ |
 | Gros fichiers : frappe en temps constant partout (corde ou tampon à trou au lieu d'une `String`) ; Entrée, Tab et les touches Vim relisent encore tout le texte ; couleurs refaites pour les seules lignes changées | ⏳ |
@@ -211,7 +212,10 @@ Requêtes : la fenêtre a un champ de question — un `SELECT` sur une table (`W
 `DISTINCT`, `count` / `sum` / `avg` / `min` / `max`, `LIKE`, `IN`, `BETWEEN`, quelques fonctions), vérifié contre le
 vrai SQLite sur 250 requêtes ; ni `JOIN` ni `GROUP BY`, et un nombre n'y égale jamais un texte (pas
 d'affinité de type). 1 000 lignes gardées au plus.
-Reste : PostgreSQL.
+PostgreSQL : `Connect to PostgreSQL…` prend une adresse `postgres://…` (celle de `DATABASE_URL` du `.env`
+choisi est proposée), liste tables et vues, envoie une requête, montre les lignes. Client écrit à la main
+(protocole v3, mots de passe en clair, MD5 et SCRAM-SHA-256), **sans chiffrement** : pour un serveur local
+ou de développement. Jamais lancé contre un vrai serveur : seulement contre un faux, dans les tests.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 
