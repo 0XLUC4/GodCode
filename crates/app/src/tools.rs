@@ -109,11 +109,47 @@ pub fn check(checker: &Checker) -> Result<String, String> {
     Ok(printed)
 }
 
+/// Where a project keeps the commands it runs, by name: a JSON object, from its root.
+pub const RUN_FILE: &str = ".godcode/run.json";
+
+/// `command` with what stands for the file in front (`${file}`, `${fileName}`) and for
+/// the project (`${folder}`) written in. A path with spaces is quoted.
+pub fn with_places(command: &str, file: Option<&Path>, folder: Option<&Path>) -> String {
+    let quoted = |path: &Path| {
+        let path = path.display().to_string();
+        match path.contains(' ') {
+            true => format!("\"{path}\""),
+            false => path,
+        }
+    };
+    let name = file.and_then(Path::file_name).map(Path::new);
+    let places = [
+        ("${fileName}", name),
+        ("${file}", file),
+        ("${folder}", folder),
+    ];
+    let mut command = command.to_owned();
+    for (place, path) in places {
+        if let Some(path) = path {
+            command = command.replace(place, &quoted(path));
+        }
+    }
+    command
+}
+
 /// What the project in `root` can run, as (what it is called, the command): the scripts
 /// of `package.json`, the usual commands of Cargo and Go, the targets of a `Makefile`.
 pub fn tasks(root: &Path) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+    // The commands the project wrote down for itself come first.
+    let own = read(RUN_FILE).and_then(|text| serde_json::from_str(&text).ok());
+    let own: Option<serde_json::Value> = own;
+    for (name, command) in own.iter().filter_map(|own| own.as_object()).flatten() {
+        if let Some(command) = command.as_str() {
+            found.push((format!("run: {name}"), command.to_owned()));
+        }
+    }
     let package = read("package.json").and_then(|text| serde_json::from_str(&text).ok());
     let package: Option<serde_json::Value> = package;
     if let Some(scripts) = package
@@ -476,6 +512,43 @@ pub fn folder_icon(name: &str, open: bool) -> (&'static str, Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_runs_the_commands_it_wrote_down() {
+        let root = std::env::temp_dir().join(format!("godcode-run-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".godcode")).expect("folder");
+        std::fs::write(
+            root.join(RUN_FILE),
+            "{ \"Serve\": \"npm run dev -- --port 3000\", \"Bad\": 3 }",
+        )
+        .expect("file");
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("file");
+        let tasks = tasks(&root);
+        // Its own first, then those of the tools it uses; what is no command is left out.
+        assert_eq!(
+            tasks[0],
+            (
+                "run: Serve".to_owned(),
+                "npm run dev -- --port 3000".to_owned()
+            )
+        );
+        assert_eq!(tasks[1].0, "cargo: run");
+        assert!(tasks.iter().all(|(name, _)| name != "run: Bad"));
+        let _ = std::fs::remove_dir_all(root);
+
+        let file = Path::new("C:/my site/src/main.py");
+        let folder = Path::new("C:/work");
+        assert_eq!(
+            with_places(
+                "python ${file} --out ${folder}/out ${fileName}",
+                Some(file),
+                Some(folder)
+            ),
+            "python \"C:/my site/src/main.py\" --out C:/work/out main.py"
+        );
+        // Nothing to write in: the command is left as it is.
+        assert_eq!(with_places("run ${file}", None, None), "run ${file}");
+    }
 
     #[test]
     fn files_get_a_run_command_a_checker_and_an_icon() {

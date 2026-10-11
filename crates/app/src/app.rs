@@ -161,6 +161,8 @@ enum Cmd {
     CaretAbove,
     CaretBelow,
     Tasks,
+    RunLast,
+    RunSettings,
     GitLog,
     Stash,
     StashPop,
@@ -529,6 +531,8 @@ const COMMANDS: &[Spec] = &[
         "Ctrl+Alt+Down",
     ),
     spec(Cmd::Tasks, icon::PLAY, "Run Task…", "Ctrl+Shift+R"),
+    spec(Cmd::RunLast, icon::PLAY, "Run Last Task", "Ctrl+Alt+R"),
+    spec(Cmd::RunSettings, icon::PLAY, "Edit Run Configurations", ""),
     spec(Cmd::GitLog, icon::GIT_BRANCH, "Git Log…", ""),
     spec(Cmd::Stash, icon::PACKAGE, "Git Stash", ""),
     spec(Cmd::StashPop, icon::PACKAGE, "Git Stash Pop", ""),
@@ -752,6 +756,8 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::RunTests),
             Some(Cmd::TestAtCaret),
             Some(Cmd::Tasks),
+            Some(Cmd::RunLast),
+            Some(Cmd::RunSettings),
             Some(Cmd::LivePreview),
             Some(Cmd::LivePreviewBrowser),
             Some(Cmd::Response),
@@ -1411,6 +1417,8 @@ pub struct GodApp {
     zen: bool,
     /// What the project can run, what was typed to narrow it, the task chosen.
     tasks: Option<(Vec<Task>, String, usize)>,
+    /// The command of the task last run, to run again.
+    last_task: Option<String>,
     /// The commits to pick from, what was typed to narrow them, the one chosen.
     log: Option<(Vec<String>, String, usize)>,
     /// The snippets of the user, by language.
@@ -1566,6 +1574,7 @@ impl GodApp {
             themes: None,
             zen: false,
             tasks: None,
+            last_task: None,
             log: None,
             snippets: load_snippets(),
             response: String::new(),
@@ -3633,11 +3642,29 @@ impl GodApp {
         if answer.is_none() {
             self.tasks = Some((all, typed, selected));
         } else if let Some(command) = command {
-            self.show_terminal(ctx);
-            if let Some(terminal) = &mut self.terminal {
-                terminal.send(&command);
-            }
+            // What stands for the file in front and its project is written in now.
+            let file = self.tabs.get(self.active).and_then(|tab| tab.path.clone());
+            let command = tools::with_places(&command, file.as_deref(), self.folder().as_deref());
+            self.run_task(ctx, command);
         }
+    }
+
+    /// Run `command` in the terminal, and remember it as the task to run again.
+    fn run_task(&mut self, ctx: &Context, command: String) {
+        self.show_terminal(ctx);
+        if let Some(terminal) = &mut self.terminal {
+            terminal.send(&command);
+        }
+        self.last_task = Some(command);
+    }
+
+    /// The folder commands are run for: the one open, or the one of the file in front.
+    fn run_root(&self) -> Option<PathBuf> {
+        let beside = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| Some(tab.path.as_deref()?.parent()?.to_path_buf()));
+        self.folder().or(beside)
     }
 
     /// The commits of the folder: pick one to see what it changed.
@@ -4765,18 +4792,33 @@ impl GodApp {
             Cmd::CaretAbove => self.add_caret(false),
             Cmd::CaretBelow => self.add_caret(true),
             Cmd::Tasks => {
-                let beside = self
-                    .tabs
-                    .get(self.active)
-                    .and_then(|tab| Some(tab.path.as_deref()?.parent()?.to_path_buf()));
-                let tasks = self.folder().or(beside).map(|root| tools::tasks(&root));
+                let tasks = self.run_root().map(|root| tools::tasks(&root));
                 match tasks.filter(|tasks| !tasks.is_empty()) {
                     Some(tasks) => self.tasks = Some((tasks, String::new(), 0)),
                     None => self.toasts.error(
-                        "No task found: they come from package.json, Cargo.toml, go.mod, Makefile",
+                        "No task found: write some with Edit Run Configurations, or they come \
+                         from package.json, Cargo.toml, go.mod, Makefile",
                     ),
                 }
             }
+            Cmd::RunLast => match self.last_task.clone() {
+                Some(command) => self.run_task(ctx, command),
+                // Nothing was run yet: there is one to choose.
+                None => self.pending.push(Cmd::Tasks),
+            },
+            Cmd::RunSettings => match self.run_root() {
+                Some(root) => {
+                    let file = root.join(tools::RUN_FILE);
+                    if !file.exists() {
+                        let example = "{\n  \"Serve\": \"npm run dev\",\n  \"Run this file\": \
+                                       \"python ${file}\"\n}\n";
+                        let _ = std::fs::create_dir_all(file.parent().unwrap_or(&root));
+                        let _ = std::fs::write(&file, example);
+                    }
+                    self.open_file(ctx, &file);
+                }
+                None => self.toasts.error("Open a folder or a file first"),
+            },
             Cmd::GitLog => {
                 let format = "--pretty=format:%h  %ad  %an  %s";
                 let listed = self
@@ -5030,6 +5072,7 @@ impl GodApp {
             (alt, Key::Z, Cmd::Zen),
             (alt, Key::ArrowUp, Cmd::CaretAbove),
             (alt, Key::ArrowDown, Cmd::CaretBelow),
+            (alt, Key::R, Cmd::RunLast),
             (shift, Key::R, Cmd::Tasks),
             (shift, Key::T, Cmd::RunTests),
             (ctrl, Key::Backslash, Cmd::Split),
