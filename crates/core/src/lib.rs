@@ -8,6 +8,8 @@ pub mod edit;
 pub mod format;
 pub mod fuzzy;
 pub mod git;
+pub mod http;
+pub mod markdown;
 pub mod outline;
 pub mod search;
 pub mod syntax;

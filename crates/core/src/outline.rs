@@ -115,6 +115,51 @@ pub fn symbols(text: &str, language: &Language) -> Vec<Symbol> {
         .collect()
 }
 
+/// The name of the test line `at` of `lines` starts, when it starts one: a Rust `#[test]`
+/// function, a Python `test_…` function, a Go `Test…` function, a JavaScript `it("…")`.
+fn test_on(lines: &[&str], at: usize, language: &Language) -> Option<String> {
+    let content = lines[at].trim_start();
+    let name_after = |keyword: &str| -> Option<String> {
+        let rest = content.split(keyword).nth(1)?;
+        let name: String = rest
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    };
+    match language.name {
+        "Rust" => {
+            let above = lines[..at].iter().rev().take(3);
+            let marked = above.into_iter().any(|line| line.contains("#[test]"));
+            name_after("fn ").filter(|_| marked)
+        }
+        "Python" => name_after("def ").filter(|name| name.starts_with("test")),
+        "Go" => name_after("func ").filter(|name| name.starts_with("Test")),
+        "JavaScript" | "TypeScript" => ["it(", "test("].iter().find_map(|call| {
+            let rest = content.strip_prefix(call)?;
+            let quote = rest.chars().next().filter(|ch| "\"'`".contains(*ch))?;
+            Some(rest[1..].split(quote).next()?.to_owned())
+        }),
+        _ => None,
+    }
+}
+
+/// The name of the test written at or above line `line` (counted from 0).
+pub fn test_at(text: &str, language: &Language, line: usize) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let last = line.min(lines.len().checked_sub(1)?);
+    (0..=last)
+        .rev()
+        .find_map(|at| test_on(&lines, at, language))
+}
+
+/// Every test of `text`, with the line (from 0) it starts on.
+pub fn tests(text: &str, language: &Language) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let found = (0..lines.len()).filter_map(|at| Some((at, test_on(&lines, at, language)?)));
+    found.collect()
+}
+
 /// Words that introduce a name without being in the outline: variables and constants.
 const BINDERS: [&str; 6] = ["let mut ", "const ", "let ", "var ", "static ", "val "];
 
@@ -144,6 +189,28 @@ pub fn declaration(text: &str, language: &Language, word: &str) -> Option<usize>
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn the_test_around_a_line_is_named() {
+        let named = |text: &str, file: &str, line: usize| {
+            test_at(text, Language::of(Path::new(file)), line)
+        };
+        let rust = "fn helper() {}\n\n#[test]\nfn adds_up() {\n    assert!(true);\n}";
+        assert_eq!(named(rust, "a.rs", 4).as_deref(), Some("adds_up"));
+        assert_eq!(named(rust, "a.rs", 0), None);
+        let python = "def helper():\n    pass\n\ndef test_sum():\n    assert 1";
+        assert_eq!(named(python, "a.py", 4).as_deref(), Some("test_sum"));
+        let script =
+            "describe('x', () => {\n  it(\"adds two\", () => {\n    expect(1);\n  });\n});";
+        assert_eq!(named(script, "a.ts", 2).as_deref(), Some("adds two"));
+        assert_eq!(
+            named("func TestSum(t *testing.T) {\n}", "a_test.go", 1).as_deref(),
+            Some("TestSum")
+        );
+        assert_eq!(named("", "a.rs", 0), None);
+        let all = tests(python, Language::of(Path::new("a.py")));
+        assert_eq!(all, [(3, "test_sum".to_owned())]);
+    }
 
     #[test]
     fn a_word_leads_to_its_declaration() {

@@ -6,3 +6,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Search by regular expression and by whole word.
+regex = "1"

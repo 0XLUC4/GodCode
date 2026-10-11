@@ -97,6 +97,88 @@ pub fn find(text: &str, query: &str, match_case: bool) -> Vec<Match> {
     matches
 }
 
+/// How the find bar reads its query.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Options {
+    pub match_case: bool,
+    pub whole_word: bool,
+    /// The query is a regular expression.
+    pub regex: bool,
+}
+
+/// `query` as a pattern; `None` when it is empty or not a valid expression.
+fn pattern(query: &str, options: Options) -> Option<regex::Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    let wanted = if options.regex {
+        query.to_owned()
+    } else {
+        regex::escape(query)
+    };
+    let wanted = if options.whole_word {
+        format!(r"\b(?:{wanted})\b")
+    } else {
+        wanted
+    };
+    regex::RegexBuilder::new(&wanted)
+        .case_insensitive(!options.match_case)
+        .build()
+        .ok()
+}
+
+/// Every occurrence of `query` in `text`, read as `options` say. Matches do not span lines.
+pub fn find_with(text: &str, query: &str, options: Options) -> Vec<Match> {
+    let Some(pattern) = pattern(query, options) else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    let mut line_start = 0;
+    for (line, content) in text.split('\n').enumerate() {
+        let mut column = 0;
+        let mut counted = 0;
+        // An expression that matches nothing (`x*`) is found nowhere.
+        for found in pattern.find_iter(content).filter(|found| !found.is_empty()) {
+            column += content[counted..found.start()].chars().count();
+            counted = found.start();
+            matches.push(Match {
+                start: line_start + column,
+                len: found.as_str().chars().count(),
+                line,
+                column,
+            });
+        }
+        line_start += column + content[counted..].chars().count() + 1;
+    }
+    matches
+}
+
+/// What replaces `matched`, one occurrence of `query`: `with`, in which `$1` stands for
+/// the first group of a regular expression.
+pub fn expand(matched: &str, query: &str, with: &str, options: Options) -> String {
+    match pattern(query, options) {
+        Some(pattern) if options.regex => pattern.replace(matched, with).into_owned(),
+        _ => with.to_owned(),
+    }
+}
+
+/// `text` with every occurrence of `query` replaced as [`expand`] does, and how many
+/// there were.
+pub fn replace_all_with(text: &str, query: &str, with: &str, options: Options) -> (String, usize) {
+    let Some(pattern) = pattern(query, options) else {
+        return (text.to_owned(), 0);
+    };
+    let count = find_with(text, query, options).len();
+    let lines = text.split('\n').map(|line| {
+        if options.regex {
+            pattern.replace_all(line, with)
+        } else {
+            pattern.replace_all(line, regex::NoExpand(with))
+        }
+    });
+    (lines.collect::<Vec<_>>().join("\n"), count)
+}
+
 /// Every occurrence of `word` in `text` that is a whole word, not a part of a longer one.
 pub fn find_word(text: &str, word: &str) -> Vec<Match> {
     let is_word = |ch: &char| ch.is_alphanumeric() || *ch == '_';
@@ -210,6 +292,39 @@ pub fn in_file(path: &Path, query: &str, match_case: bool) -> Vec<Hit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queries_can_be_words_or_expressions() {
+        let text = "let total = totals(1);\nTotal é2";
+        let places = |query: &str, options: Options| -> Vec<(usize, usize)> {
+            let found = find_with(text, query, options);
+            found.iter().map(|at| (at.start, at.len)).collect()
+        };
+        let plain = Options::default();
+        assert_eq!(places("total", plain), [(4, 5), (12, 5), (23, 5)]);
+        let word = Options {
+            whole_word: true,
+            match_case: true,
+            ..plain
+        };
+        assert_eq!(places("total", word), [(4, 5)]);
+        let regex = Options {
+            regex: true,
+            ..plain
+        };
+        assert_eq!(places(r"t\w+s", regex), [(12, 6)]);
+        assert_eq!(places(r"\d", regex), [(19, 1), (30, 1)]);
+        assert_eq!(places("(", regex), [], "a broken expression finds nothing");
+        assert_eq!(places("(", plain), [(18, 1)]);
+
+        let swapped = replace_all_with("a=1, b=2", r"(\w)=(\d)", "$2=$1", regex);
+        assert_eq!(swapped, ("1=a, 2=b".to_owned(), 2));
+        assert_eq!(
+            replace_all_with("a.b", ".", "$1", plain),
+            ("a$1b".to_owned(), 1)
+        );
+        assert_eq!(expand("b=2", r"(\w)=(\d)", "$2$1", regex), "2b");
+    }
 
     #[test]
     fn matches_carry_char_positions() {

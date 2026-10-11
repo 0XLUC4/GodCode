@@ -81,7 +81,7 @@ static PLAIN: Language = Language {
     ..BASE
 };
 
-static LANGUAGES: [Language; 25] = [
+static LANGUAGES: &[Language] = &[
     Language {
         name: "Rust",
         brackets: true,
@@ -263,7 +263,7 @@ static LANGUAGES: [Language; 25] = [
     Language {
         name: "Shell",
         extensions: &["sh", "bash", "zsh", "fish"],
-        files: &["Dockerfile", "Makefile", ".gitignore", ".env"],
+        files: &["Makefile", ".gitignore", ".env"],
         line_comments: &["#"],
         keywords: &[
             "case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function", "if",
@@ -285,7 +285,7 @@ static LANGUAGES: [Language; 25] = [
     },
     Language {
         name: "SQL",
-        extensions: &["sql"],
+        extensions: &["sql", "pls", "plsql", "tsql", "psql"],
         line_comments: &["--"],
         block_comment: C_COMMENTS,
         keywords_ignore_case: true,
@@ -375,7 +375,7 @@ static LANGUAGES: [Language; 25] = [
     },
     Language {
         name: "CSS",
-        extensions: &["css", "scss", "less"],
+        extensions: &["css", "scss", "sass", "less"],
         block_comment: C_COMMENTS,
         keywords: &["important", "import", "media", "from", "to"],
         ..BASE
@@ -401,6 +401,13 @@ static LANGUAGES: [Language; 25] = [
         ..BASE
     },
     Language {
+        name: "HTTP",
+        extensions: &["http", "rest"],
+        line_comments: &["#", "//"],
+        keywords: &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        ..BASE
+    },
+    Language {
         name: "Batch",
         extensions: &["bat", "cmd"],
         line_comments: &["::", "REM ", "rem "],
@@ -410,6 +417,923 @@ static LANGUAGES: [Language; 25] = [
         ],
         ..BASE
     },
+    Language {
+        name: "Dockerfile",
+        extensions: &["dockerfile"],
+        files: &["Dockerfile", "Containerfile"],
+        line_comments: &["#"],
+        keywords: &[
+            "FROM",
+            "RUN",
+            "CMD",
+            "COPY",
+            "ADD",
+            "ENV",
+            "ARG",
+            "EXPOSE",
+            "WORKDIR",
+            "ENTRYPOINT",
+            "USER",
+            "VOLUME",
+            "LABEL",
+            "AS",
+            "HEALTHCHECK",
+            "SHELL",
+            "ONBUILD",
+            "STOPSIGNAL",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Dart",
+        brackets: true,
+        extensions: &["dart"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        triple_quotes: true,
+        keywords: JAVA_KEYWORDS,
+        ..BASE
+    },
+    Language {
+        name: "Scala",
+        extensions: &["scala", "sc", "sbt"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        triple_quotes: true,
+        keywords: &[
+            "abstract",
+            "case",
+            "catch",
+            "class",
+            "def",
+            "do",
+            "else",
+            "extends",
+            "false",
+            "final",
+            "finally",
+            "for",
+            "given",
+            "if",
+            "implicit",
+            "import",
+            "lazy",
+            "match",
+            "new",
+            "null",
+            "object",
+            "override",
+            "package",
+            "private",
+            "protected",
+            "return",
+            "sealed",
+            "super",
+            "this",
+            "throw",
+            "trait",
+            "true",
+            "try",
+            "type",
+            "using",
+            "val",
+            "var",
+            "while",
+            "with",
+            "yield",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Groovy",
+        extensions: &["groovy", "gradle", "gvy"],
+        files: &["Jenkinsfile"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        triple_quotes: true,
+        keywords: JAVA_KEYWORDS,
+        ..BASE
+    },
+    Language {
+        name: "Objective-C",
+        brackets: true,
+        extensions: &["mm"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        keywords: C_KEYWORDS,
+        ..BASE
+    },
+    Language {
+        name: "Zig",
+        brackets: true,
+        extensions: &["zig", "zon"],
+        line_comments: &["//"],
+        keywords: &[
+            "and",
+            "break",
+            "catch",
+            "comptime",
+            "const",
+            "continue",
+            "defer",
+            "else",
+            "enum",
+            "errdefer",
+            "error",
+            "export",
+            "extern",
+            "false",
+            "fn",
+            "for",
+            "if",
+            "inline",
+            "null",
+            "or",
+            "orelse",
+            "pub",
+            "return",
+            "struct",
+            "switch",
+            "test",
+            "true",
+            "try",
+            "undefined",
+            "union",
+            "unreachable",
+            "var",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "D",
+        brackets: true,
+        extensions: &["d", "di"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        keywords: C_KEYWORDS,
+        ..BASE
+    },
+    Language {
+        name: "Nim",
+        extensions: &["nim", "nims", "nimble"],
+        line_comments: &["#"],
+        triple_quotes: true,
+        keywords: &[
+            "and", "case", "const", "discard", "echo", "elif", "else", "false", "for", "from",
+            "func", "if", "import", "in", "include", "let", "nil", "not", "object", "of", "or",
+            "proc", "return", "true", "type", "var", "when", "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Haskell",
+        extensions: &["hs", "lhs", "cabal"],
+        line_comments: &["--"],
+        block_comment: Some(("{-", "-}")),
+        quotes: b"\"",
+        keywords: &[
+            "as",
+            "case",
+            "class",
+            "data",
+            "deriving",
+            "do",
+            "else",
+            "if",
+            "import",
+            "in",
+            "infixl",
+            "infixr",
+            "instance",
+            "let",
+            "module",
+            "newtype",
+            "of",
+            "qualified",
+            "then",
+            "type",
+            "where",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "OCaml",
+        extensions: &["ml", "mli"],
+        block_comment: Some(("(*", "*)")),
+        quotes: b"\"",
+        keywords: &[
+            "and",
+            "begin",
+            "else",
+            "end",
+            "exception",
+            "false",
+            "for",
+            "fun",
+            "function",
+            "if",
+            "in",
+            "let",
+            "match",
+            "module",
+            "mutable",
+            "of",
+            "open",
+            "rec",
+            "sig",
+            "struct",
+            "then",
+            "true",
+            "try",
+            "type",
+            "val",
+            "when",
+            "while",
+            "with",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "F#",
+        extensions: &["fs", "fsx", "fsi"],
+        line_comments: &["//"],
+        block_comment: Some(("(*", "*)")),
+        quotes: b"\"",
+        triple_quotes: true,
+        keywords: &[
+            "async",
+            "do",
+            "elif",
+            "else",
+            "false",
+            "for",
+            "fun",
+            "if",
+            "in",
+            "let",
+            "match",
+            "member",
+            "module",
+            "mutable",
+            "namespace",
+            "of",
+            "open",
+            "rec",
+            "return",
+            "then",
+            "true",
+            "try",
+            "type",
+            "use",
+            "when",
+            "while",
+            "with",
+            "yield",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Elixir",
+        extensions: &["ex", "exs", "heex"],
+        line_comments: &["#"],
+        triple_quotes: true,
+        keywords: &[
+            "alias",
+            "and",
+            "case",
+            "cond",
+            "def",
+            "defimpl",
+            "defmacro",
+            "defmodule",
+            "defp",
+            "defprotocol",
+            "defstruct",
+            "do",
+            "else",
+            "end",
+            "false",
+            "fn",
+            "if",
+            "import",
+            "in",
+            "nil",
+            "not",
+            "or",
+            "raise",
+            "require",
+            "rescue",
+            "true",
+            "try",
+            "unless",
+            "use",
+            "when",
+            "with",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Erlang",
+        extensions: &["erl", "hrl"],
+        line_comments: &["%"],
+        quotes: b"\"",
+        keywords: &[
+            "after", "and", "begin", "case", "catch", "end", "fun", "if", "not", "of", "or",
+            "receive", "try", "when",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Perl",
+        extensions: &["pl", "pm", "t"],
+        line_comments: &["#"],
+        keywords: &[
+            "die", "else", "elsif", "for", "foreach", "if", "last", "local", "my", "next", "our",
+            "package", "print", "require", "return", "sub", "unless", "until", "use", "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "R",
+        extensions: &["r", "rmd"],
+        line_comments: &["#"],
+        keywords: &[
+            "FALSE", "NA", "NULL", "TRUE", "break", "else", "for", "function", "if", "in",
+            "library", "next", "repeat", "return", "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Julia",
+        extensions: &["jl"],
+        line_comments: &["#"],
+        block_comment: Some(("#=", "=#")),
+        quotes: b"\"",
+        triple_quotes: true,
+        keywords: &[
+            "abstract", "begin", "break", "catch", "const", "continue", "do", "else", "elseif",
+            "end", "export", "false", "finally", "for", "function", "if", "import", "in", "let",
+            "macro", "module", "mutable", "nothing", "return", "struct", "true", "try", "using",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Assembly",
+        extensions: &["asm", "s", "nasm"],
+        line_comments: &[";"],
+        keywords_ignore_case: true,
+        keywords: &[
+            "add", "and", "call", "cmp", "db", "dd", "dq", "dw", "extern", "global", "jmp", "je",
+            "jne", "lea", "mov", "or", "pop", "push", "ret", "section", "sub", "xor",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Ada",
+        extensions: &["adb", "ads"],
+        line_comments: &["--"],
+        quotes: b"\"",
+        keywords_ignore_case: true,
+        keywords: &[
+            "begin",
+            "body",
+            "case",
+            "constant",
+            "else",
+            "elsif",
+            "end",
+            "for",
+            "function",
+            "if",
+            "in",
+            "is",
+            "loop",
+            "out",
+            "package",
+            "procedure",
+            "record",
+            "return",
+            "then",
+            "type",
+            "use",
+            "when",
+            "while",
+            "with",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Fortran",
+        extensions: &["f90", "f95", "f03", "f08", "f", "for"],
+        line_comments: &["!"],
+        keywords_ignore_case: true,
+        keywords: &[
+            "call",
+            "contains",
+            "do",
+            "else",
+            "end",
+            "function",
+            "if",
+            "implicit",
+            "integer",
+            "module",
+            "none",
+            "program",
+            "real",
+            "return",
+            "subroutine",
+            "then",
+            "use",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "COBOL",
+        extensions: &["cob", "cbl", "cpy"],
+        line_comments: &["*>"],
+        keywords_ignore_case: true,
+        keywords: &[
+            "data",
+            "display",
+            "division",
+            "else",
+            "identification",
+            "if",
+            "move",
+            "perform",
+            "pic",
+            "procedure",
+            "run",
+            "section",
+            "stop",
+            "to",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Pascal",
+        extensions: &["pas", "pp", "dpr", "lpr"],
+        line_comments: &["//"],
+        block_comment: Some(("{", "}")),
+        keywords_ignore_case: true,
+        keywords: &[
+            "begin",
+            "class",
+            "const",
+            "do",
+            "else",
+            "end",
+            "for",
+            "function",
+            "if",
+            "procedure",
+            "program",
+            "record",
+            "repeat",
+            "then",
+            "type",
+            "unit",
+            "until",
+            "uses",
+            "var",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Tcl",
+        extensions: &["tcl"],
+        line_comments: &["#"],
+        quotes: b"\"",
+        keywords: &[
+            "else", "elseif", "expr", "for", "foreach", "if", "proc", "puts", "return", "set",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Awk",
+        extensions: &["awk"],
+        line_comments: &["#"],
+        quotes: b"\"",
+        keywords: &[
+            "BEGIN", "END", "else", "for", "function", "if", "next", "print", "printf", "return",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "GraphQL",
+        extensions: &["graphql", "gql"],
+        line_comments: &["#"],
+        triple_quotes: true,
+        keywords: &[
+            "directive",
+            "enum",
+            "extend",
+            "false",
+            "fragment",
+            "implements",
+            "input",
+            "interface",
+            "mutation",
+            "null",
+            "on",
+            "query",
+            "scalar",
+            "schema",
+            "subscription",
+            "true",
+            "type",
+            "union",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Protocol Buffers",
+        extensions: &["proto"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        keywords: &[
+            "enum", "import", "map", "message", "oneof", "option", "optional", "package",
+            "repeated", "required", "reserved", "returns", "rpc", "service", "stream", "syntax",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Nix",
+        extensions: &["nix"],
+        line_comments: &["#"],
+        block_comment: C_COMMENTS,
+        quotes: b"\"",
+        keywords: &[
+            "assert", "else", "false", "if", "import", "in", "inherit", "let", "null", "rec",
+            "then", "true", "with",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "HCL",
+        extensions: &["tf", "hcl", "tfvars"],
+        line_comments: &["#", "//"],
+        block_comment: C_COMMENTS,
+        quotes: b"\"",
+        keywords: &[
+            "data",
+            "false",
+            "for",
+            "if",
+            "in",
+            "locals",
+            "module",
+            "null",
+            "output",
+            "provider",
+            "resource",
+            "terraform",
+            "true",
+            "variable",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "LaTeX",
+        extensions: &["tex", "sty", "cls", "bib"],
+        line_comments: &["%"],
+        quotes: b"",
+        ..BASE
+    },
+    Language {
+        name: "MATLAB",
+        extensions: &["m"],
+        line_comments: &["%"],
+        keywords: &[
+            "break",
+            "case",
+            "catch",
+            "classdef",
+            "continue",
+            "else",
+            "elseif",
+            "end",
+            "false",
+            "for",
+            "function",
+            "if",
+            "methods",
+            "otherwise",
+            "properties",
+            "return",
+            "switch",
+            "true",
+            "try",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Solidity",
+        brackets: true,
+        extensions: &["sol"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        keywords: &[
+            "address",
+            "bool",
+            "calldata",
+            "contract",
+            "else",
+            "emit",
+            "enum",
+            "event",
+            "external",
+            "false",
+            "for",
+            "function",
+            "if",
+            "import",
+            "interface",
+            "internal",
+            "is",
+            "library",
+            "mapping",
+            "memory",
+            "modifier",
+            "payable",
+            "pragma",
+            "private",
+            "public",
+            "pure",
+            "require",
+            "return",
+            "returns",
+            "storage",
+            "struct",
+            "true",
+            "uint",
+            "view",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Vyper",
+        extensions: &["vy"],
+        line_comments: &["#"],
+        triple_quotes: true,
+        keywords: &[
+            "False", "True", "assert", "def", "elif", "else", "event", "for", "from", "if",
+            "import", "in", "pass", "return", "struct",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Move",
+        brackets: true,
+        extensions: &["move"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        quotes: b"\"",
+        keywords: &[
+            "abort", "const", "else", "false", "fun", "has", "if", "let", "loop", "module", "mut",
+            "public", "return", "struct", "true", "use", "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "GDScript",
+        extensions: &["gd"],
+        line_comments: &["#"],
+        triple_quotes: true,
+        keywords: &[
+            "and",
+            "class_name",
+            "const",
+            "elif",
+            "else",
+            "export",
+            "extends",
+            "false",
+            "for",
+            "func",
+            "if",
+            "in",
+            "match",
+            "not",
+            "null",
+            "onready",
+            "or",
+            "pass",
+            "return",
+            "signal",
+            "true",
+            "var",
+            "while",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "GLSL",
+        brackets: true,
+        extensions: &["glsl", "vert", "frag", "comp", "geom"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        keywords: SHADER_KEYWORDS,
+        ..BASE
+    },
+    Language {
+        name: "HLSL",
+        brackets: true,
+        extensions: &["hlsl", "fx", "shader", "cginc"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        keywords: SHADER_KEYWORDS,
+        ..BASE
+    },
+    Language {
+        name: "WGSL",
+        brackets: true,
+        extensions: &["wgsl"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        keywords: SHADER_KEYWORDS,
+        ..BASE
+    },
+    Language {
+        name: "Verilog",
+        extensions: &["v", "sv", "svh", "vh"],
+        line_comments: &["//"],
+        block_comment: C_COMMENTS,
+        quotes: b"\"",
+        keywords: &[
+            "always",
+            "assign",
+            "begin",
+            "case",
+            "else",
+            "end",
+            "endcase",
+            "endfunction",
+            "endmodule",
+            "for",
+            "function",
+            "generate",
+            "if",
+            "initial",
+            "inout",
+            "input",
+            "localparam",
+            "logic",
+            "module",
+            "negedge",
+            "output",
+            "parameter",
+            "posedge",
+            "reg",
+            "wire",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "VHDL",
+        extensions: &["vhd", "vhdl"],
+        line_comments: &["--"],
+        quotes: b"\"",
+        keywords_ignore_case: true,
+        keywords: &[
+            "architecture",
+            "begin",
+            "case",
+            "component",
+            "else",
+            "elsif",
+            "end",
+            "entity",
+            "generic",
+            "if",
+            "in",
+            "is",
+            "library",
+            "of",
+            "out",
+            "port",
+            "process",
+            "signal",
+            "then",
+            "use",
+            "when",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Wolfram",
+        extensions: &["wl", "wls"],
+        block_comment: Some(("(*", "*)")),
+        quotes: b"\"",
+        ..BASE
+    },
+    Language {
+        name: "Cypher",
+        extensions: &["cypher", "cql"],
+        line_comments: &["//"],
+        keywords_ignore_case: true,
+        keywords: &[
+            "and", "as", "by", "create", "delete", "limit", "match", "merge", "not", "optional",
+            "or", "order", "return", "set", "unwind", "where", "with",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Datalog",
+        extensions: &["dl"],
+        line_comments: &["%"],
+        quotes: b"\"",
+        ..BASE
+    },
+    Language {
+        name: "WebAssembly",
+        extensions: &["wat", "wast"],
+        line_comments: &[";;"],
+        quotes: b"\"",
+        keywords: &[
+            "call", "export", "func", "global", "import", "local", "memory", "module", "param",
+            "result", "table",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Lisp",
+        extensions: &["lisp", "el", "clj", "cljs", "scm", "rkt"],
+        line_comments: &[";"],
+        quotes: b"\"",
+        keywords: &[
+            "cond", "def", "defmacro", "defn", "defun", "fn", "if", "lambda", "let", "quote",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "CMake",
+        extensions: &["cmake"],
+        files: &["CMakeLists.txt"],
+        line_comments: &["#"],
+        quotes: b"\"",
+        keywords_ignore_case: true,
+        keywords: &[
+            "else",
+            "elseif",
+            "endforeach",
+            "endfunction",
+            "endif",
+            "foreach",
+            "function",
+            "if",
+            "include",
+            "project",
+            "set",
+        ],
+        ..BASE
+    },
+    Language {
+        name: "Astro",
+        family: Family::Markup,
+        extensions: &["astro"],
+        keywords: HTML_TAGS,
+        ..BASE
+    },
+    Language {
+        name: "MDX",
+        family: Family::Markdown,
+        extensions: &["mdx"],
+        ..BASE
+    },
+    Language {
+        name: "CSV",
+        family: Family::Text,
+        extensions: &["csv", "tsv"],
+        ..BASE
+    },
+    Language {
+        name: "reStructuredText",
+        family: Family::Text,
+        extensions: &["rst"],
+        ..BASE
+    },
+    Language {
+        name: "AsciiDoc",
+        family: Family::Text,
+        extensions: &["adoc", "asciidoc"],
+        ..BASE
+    },
+];
+
+/// Shared by the shading languages (GLSL, HLSL, WGSL).
+const SHADER_KEYWORDS: &[&str] = &[
+    "bool", "break", "const", "continue", "discard", "else", "false", "float", "fn", "for", "if",
+    "in", "inout", "int", "let", "mat3", "mat4", "out", "return", "struct", "true", "uniform",
+    "var", "vec2", "vec3", "vec4", "void", "while",
 ];
 
 const HTML_TAGS: &[&str] = &[
@@ -626,6 +1550,30 @@ impl Language {
     /// The language called `name`, as the status bar shows it.
     pub fn named(name: &str) -> Option<&'static Self> {
         LANGUAGES.iter().find(|language| language.name == name)
+    }
+
+    /// The language a Markdown code fence names: by its name, or by the extension of its
+    /// files.
+    pub fn fenced(name: &str) -> &'static Self {
+        let wanted = name.trim().to_lowercase();
+        let wanted = match wanted.as_str() {
+            "bash" | "shell" | "console" | "zsh" => "sh",
+            "node" => "js",
+            "c#" | "csharp" => "cs",
+            "golang" => "go",
+            "yml" => "yaml",
+            other => other,
+        };
+        let named = |language: &&Language| language.name.eq_ignore_ascii_case(wanted);
+        LANGUAGES
+            .iter()
+            .find(named)
+            .unwrap_or_else(|| Self::of(Path::new(&format!("code.{wanted}"))))
+    }
+
+    /// How many languages are coloured.
+    pub fn count() -> usize {
+        LANGUAGES.len()
     }
 
     /// Tags and attributes rather than statements: HTML, XML.
@@ -861,7 +1809,23 @@ fn code(text: &str, language: &Language, spans: &mut Spans) {
     }
 }
 
-/// HTML / XML: comments, tag names, attribute names and values.
+/// Colour the bytes `from..to` of `text` as `language`: a script in a page, a fenced block.
+fn embed(text: &str, from: usize, to: usize, language: &Language, spans: &mut Spans) {
+    if from >= to {
+        return;
+    }
+    if language.family == Family::Text {
+        spans.mark(from, to, Token::String);
+        return;
+    }
+    spans.push(from, Token::Plain);
+    for span in highlight(&text[from..to], language) {
+        spans.push(from + span.end, span.token);
+    }
+}
+
+/// HTML / XML: comments, tag names, attribute names and values; scripts and styles in
+/// their own language.
 fn markup(text: &str, spans: &mut Spans) {
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -897,21 +1861,44 @@ fn markup(text: &str, spans: &mut Spans) {
             }
         }
         index = (close + 1).min(text.len());
+        let name: String = text[open + 1..close]
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let language = match name.as_str() {
+            "script" => Language::named("JavaScript"),
+            "style" => Language::named("CSS"),
+            _ => None,
+        };
+        if let Some(language) = language.filter(|_| !text[open..close].ends_with('/')) {
+            let closing = format!("</{name}");
+            let end = text[index..]
+                .to_ascii_lowercase()
+                .find(&closing)
+                .map_or(text.len(), |at| index + at);
+            embed(text, index, end, language, spans);
+            index = end;
+        }
     }
 }
 
 /// Markdown: headings, quotes, fenced and inline code.
 fn markdown(text: &str, spans: &mut Spans) {
     let mut start = 0;
-    let mut fenced = false;
+    // The fence being read: where its code starts, and the language it names.
+    let mut fence: Option<(usize, &Language)> = None;
     for line in text.split('\n') {
         let end = start + line.len();
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            fenced = !fenced;
+        if let Some(named) = trimmed.strip_prefix("```") {
+            match fence.take() {
+                Some((body, language)) => embed(text, body, start, language, spans),
+                None => fence = Some(((end + 1).min(text.len()), Language::fenced(named))),
+            }
             spans.mark(start, end, Token::String);
-        } else if fenced {
-            spans.mark(start, end, Token::String);
+        } else if fence.is_some() {
+            // Coloured as a whole when the fence closes.
         } else if trimmed.starts_with('#') {
             spans.mark(start, end, Token::Keyword);
         } else if trimmed.starts_with('>') {
@@ -928,6 +1915,9 @@ fn markdown(text: &str, spans: &mut Spans) {
             }
         }
         start = end + 1;
+    }
+    if let Some((body, language)) = fence {
+        embed(text, body, text.len(), language, spans);
     }
 }
 
@@ -1016,9 +2006,64 @@ mod tests {
     }
 
     #[test]
+    fn code_inside_pages_and_fences_takes_its_own_colours() {
+        assert_eq!(
+            tokens(
+                "<style>a{}/* c */</style><script>let x = 'y';</script><b>let</b>",
+                "a.html"
+            ),
+            [
+                ("style", Token::Keyword),
+                ("/* c */", Token::Comment),
+                ("style", Token::Keyword),
+                ("script", Token::Keyword),
+                ("let", Token::Keyword),
+                ("'y'", Token::String),
+                ("script", Token::Keyword),
+                ("b", Token::Keyword),
+                ("b", Token::Keyword),
+            ]
+        );
+        assert_eq!(
+            tokens("```rust\nfn a() {}\n```\ntext\n```\nraw", "a.md"),
+            [
+                ("```rust", Token::String),
+                ("fn", Token::Keyword),
+                ("a", Token::Function),
+                ("```", Token::String),
+                ("```", Token::String),
+                ("raw", Token::String),
+            ]
+        );
+    }
+
+    #[test]
+    fn many_languages_are_known() {
+        assert!(Language::count() >= 70, "{} languages", Language::count());
+        for (file, name) in [
+            ("a.zig", "Zig"),
+            ("Dockerfile", "Dockerfile"),
+            ("main.tf", "HCL"),
+            ("a.sol", "Solidity"),
+            ("CMakeLists.txt", "CMake"),
+            ("a.sass", "CSS"),
+        ] {
+            assert_eq!(Language::of(Path::new(file)).name, name);
+        }
+        assert_eq!(Language::fenced("C++").name, "C++");
+        assert_eq!(Language::fenced("bash").name, "Shell");
+        assert_eq!(Language::fenced("py").name, "Python");
+        assert_eq!(Language::fenced("").name, "Plain Text");
+        assert_eq!(
+            tokens("x = 1 ! note", "a.f90"),
+            [("1", Token::Number), ("! note", Token::Comment)]
+        );
+    }
+
+    #[test]
     fn languages_are_found_by_name() {
         assert_eq!(Language::of(Path::new("a/b/Main.RS")).name, "Rust");
-        assert_eq!(Language::of(Path::new("Dockerfile")).name, "Shell");
+        assert_eq!(Language::of(Path::new("Makefile")).name, "Shell");
         assert_eq!(Language::of(Path::new("notes")).name, "Plain Text");
         assert_eq!(Language::of(Path::new("x.sql")).line_comment(), Some("--"));
         assert_eq!(Language::of(Path::new("x.css")).line_comment(), None);

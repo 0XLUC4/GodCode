@@ -61,37 +61,137 @@ impl Palette {
         error: grey(0x11),
     };
 
-    pub fn of(ui: &Ui) -> Self {
-        if ui.visuals().dark_mode {
-            Self::DARK
-        } else {
-            Self::LIGHT
-        }
+    /// The colours of the scheme in use.
+    pub fn of(_ui: &Ui) -> Self {
+        current().palette
     }
 
-    pub fn of_ctx(ctx: &Context) -> Self {
-        if ctx.global_style().visuals.dark_mode {
-            Self::DARK
-        } else {
-            Self::LIGHT
-        }
+    pub fn of_ctx(_ctx: &Context) -> Self {
+        current().palette
     }
 }
 
-/// Install both styles once; switching later is just [`set_dark`].
-pub fn install(ctx: &Context, dark: bool) {
-    ctx.style_mut_of(Theme::Dark, |style| {
-        configure(style, Visuals::dark(), &Palette::DARK)
-    });
-    ctx.style_mut_of(Theme::Light, |style| {
-        configure(style, Visuals::light(), &Palette::LIGHT)
-    });
+const fn rgb(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+/// A palette from its background, panel, surface, hover, border, text, dim text, selection
+/// and accent.
+const fn palette(colors: [u32; 9]) -> Palette {
+    Palette {
+        bg: rgb(colors[0]),
+        panel: rgb(colors[1]),
+        surface: rgb(colors[2]),
+        hover: rgb(colors[3]),
+        border: rgb(colors[4]),
+        text: rgb(colors[5]),
+        text_dim: rgb(colors[6]),
+        selected: rgb(colors[7]),
+        accent: rgb(colors[8]),
+        accent_text: rgb(colors[8]),
+        canvas: rgb(colors[1]),
+        success: rgb(colors[5]),
+        error: rgb(colors[5]),
+    }
+}
+
+/// A colour scheme: the interface and the code.
+pub struct Scheme {
+    pub name: &'static str,
+    pub dark: bool,
+    pub palette: Palette,
+    /// Keywords, types, functions, strings, numbers, comments.
+    tokens: [u32; 6],
+}
+
+pub static SCHEMES: [Scheme; 6] = [
+    Scheme {
+        name: "GodCode Dark",
+        dark: true,
+        palette: Palette::DARK,
+        tokens: [
+            0x56_9C_D6, 0x4E_C9_B0, 0xDC_DC_AA, 0xCE_91_78, 0xB5_CE_A8, 0x6A_99_55,
+        ],
+    },
+    Scheme {
+        name: "GodCode Light",
+        dark: false,
+        palette: Palette::LIGHT,
+        tokens: [
+            0x00_00_FF, 0x26_7F_99, 0x79_5E_26, 0xA3_15_15, 0x09_86_58, 0x00_80_00,
+        ],
+    },
+    Scheme {
+        name: "Darcula",
+        dark: true,
+        palette: palette([
+            0x2B_2B_2B, 0x31_33_35, 0x3C_3F_41, 0x4B_4F_52, 0x51_51_51, 0xA9_B7_C6, 0x80_88_90,
+            0x21_42_83, 0x4A_88_C7,
+        ]),
+        tokens: [
+            0xCC7832, 0x98_76_AA, 0xFF_C6_6D, 0x6A_87_59, 0x68_97_BB, 0x80_80_80,
+        ],
+    },
+    Scheme {
+        name: "Monokai",
+        dark: true,
+        palette: palette([
+            0x27_28_22, 0x2D_2E_27, 0x34_35_2D, 0x3E3D32, 0x49_48_3E, 0xF8_F8_F2, 0x90_90_8A,
+            0x49_48_3E, 0xA6_E2_2E,
+        ]),
+        tokens: [
+            0xF9_26_72, 0x66_D9_EF, 0xA6_E2_2E, 0xE6_DB_74, 0xAE_81_FF, 0x75_71_5E,
+        ],
+    },
+    Scheme {
+        name: "Solarized Light",
+        dark: false,
+        palette: palette([
+            0xFD_F6_E3, 0xFD_F6_E3, 0xEE_E8_D5, 0xE4_DD_C8, 0xD9_D2_BD, 0x58_6E_75, 0x93_A1_A1,
+            0xD6_CF_BA, 0x26_8B_D2,
+        ]),
+        tokens: [
+            0x85_99_00, 0xB5_89_00, 0x26_8B_D2, 0x2A_A1_98, 0xD3_36_82, 0x93_A1_A1,
+        ],
+    },
+    Scheme {
+        name: "High Contrast",
+        dark: true,
+        palette: palette([
+            0x00_00_00, 0x00_00_00, 0x0C_0C_0C, 0x1F_1F_1F, 0xFF_FF_FF, 0xFF_FF_FF, 0xD0_D0_D0,
+            0x26_4F_78, 0xFF_FF_00,
+        ]),
+        tokens: [
+            0xFF_FF_00, 0x00_FF_FF, 0xFF_A6_57, 0x7C_FC_00, 0xFF_8A_D8, 0x9E_E0_9E,
+        ],
+    },
+];
+
+/// The scheme in use, by its place in [`SCHEMES`].
+static CURRENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn current() -> &'static Scheme {
+    let index = CURRENT.load(std::sync::atomic::Ordering::Relaxed);
+    &SCHEMES[index.min(SCHEMES.len() - 1)]
+}
+
+/// Set up the interface once, in scheme `index`.
+pub fn install(ctx: &Context, index: usize) {
     ctx.options_mut(|options| options.zoom_with_keyboard = false);
-    set_dark(ctx, dark);
+    apply(ctx, index);
 }
 
-pub fn set_dark(ctx: &Context, dark: bool) {
-    ctx.set_theme(if dark { Theme::Dark } else { Theme::Light });
+/// Switch to scheme `index`.
+pub fn apply(ctx: &Context, index: usize) {
+    CURRENT.store(index, std::sync::atomic::Ordering::Relaxed);
+    let scheme = current();
+    let (theme, visuals) = if scheme.dark {
+        (Theme::Dark, Visuals::dark())
+    } else {
+        (Theme::Light, Visuals::light())
+    };
+    ctx.style_mut_of(theme, |style| configure(style, visuals, &scheme.palette));
+    ctx.set_theme(theme);
 }
 
 fn configure(style: &mut Style, mut visuals: Visuals, p: &Palette) {
@@ -163,24 +263,18 @@ fn configure(style: &mut Style, mut visuals: Visuals, p: &Palette) {
     style.spacing.interact_size.y = 26.0;
 }
 
-/// Colour of a syntax token. The interface stays monochrome; only the code is coloured.
-pub fn token_color(token: godcode_core::syntax::Token, dark: bool) -> Color32 {
+/// Colour of a syntax token, in the scheme in use.
+pub fn token_color(token: godcode_core::syntax::Token, _dark: bool) -> Color32 {
     use godcode_core::syntax::Token;
-    let rgb = |hex: u32| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
-    match (token, dark) {
-        (Token::Plain, true) => Palette::DARK.text,
-        (Token::Plain, false) => Palette::LIGHT.text,
-        (Token::Keyword, true) => rgb(0x56_9C_D6),
-        (Token::Keyword, false) => rgb(0x00_00_FF),
-        (Token::Type, true) => rgb(0x4E_C9_B0),
-        (Token::Type, false) => rgb(0x26_7F_99),
-        (Token::Function, true) => rgb(0xDC_DC_AA),
-        (Token::Function, false) => rgb(0x79_5E_26),
-        (Token::String, true) => rgb(0xCE_91_78),
-        (Token::String, false) => rgb(0xA3_15_15),
-        (Token::Number, true) => rgb(0xB5_CE_A8),
-        (Token::Number, false) => rgb(0x09_86_58),
-        (Token::Comment, true) => rgb(0x6A_99_55),
-        (Token::Comment, false) => rgb(0x00_80_00),
-    }
+    let scheme = current();
+    let index = match token {
+        Token::Plain => return scheme.palette.text,
+        Token::Keyword => 0,
+        Token::Type => 1,
+        Token::Function => 2,
+        Token::String => 3,
+        Token::Number => 4,
+        Token::Comment => 5,
+    };
+    rgb(scheme.tokens[index])
 }

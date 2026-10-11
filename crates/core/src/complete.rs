@@ -14,6 +14,8 @@ pub enum Kind {
     Snippet,
     Keyword,
     Word,
+    /// A name the language server knows: a method, a field, a type.
+    Symbol,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

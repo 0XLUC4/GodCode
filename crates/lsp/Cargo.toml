@@ -1,0 +1,10 @@
+[package]
+name = "godcode-lsp"
+description = "GodCode client of the Language Server Protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The protocol is JSON-RPC.
+serde_json = "1"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/app"]
+members = ["crates/core", "crates/lsp", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 godcode-core = { path = "crates/core" }
+godcode-lsp = { path = "crates/lsp" }
 
 [profile.release]
 lto = "thin"

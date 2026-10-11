@@ -17,6 +17,7 @@ use godcode_core::search::Match;
 use godcode_core::syntax::{self, Language};
 use godcode_core::{check, edit};
 
+use crate::field;
 use crate::theme::{self, Palette};
 
 const MARGIN: Margin = Margin {
@@ -34,7 +35,16 @@ pub const ERROR_COLOR: Color32 = Color32::from_rgb(0xF1, 0x4C, 0x4C);
 pub const WARNING_COLOR: Color32 = Color32::from_rgb(0xCC, 0xA7, 0x00);
 /// Columns a tab takes when lines are measured for the indent guides.
 const TAB_COLUMNS: usize = 4;
+const MINIMAP_WIDTH: f32 = 84.0;
+/// Height of a line and width of a column in the minimap, at most.
+const MINIMAP_ROW: f32 = 3.0;
+const MINIMAP_COLUMN: f32 = 0.75;
+/// Lines kept in view by sticky scroll, and how far above the view they are looked for.
+const STICKY_LINES: usize = 4;
+const STICKY_REACH: usize = 3000;
 const ADDED_COLOR: Color32 = Color32::from_rgb(0x58, 0x8C, 0x2C);
+/// Behind the line the debugged program is stopped at.
+const STOPPED_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4A, 0x3C, 0x08, 0x70);
 const MODIFIED_COLOR: Color32 = Color32::from_rgb(0x1B, 0x81, 0xA8);
 
 /// A problem underlined in the text.
@@ -65,6 +75,23 @@ pub struct Config<'a> {
     pub occurrences: &'a [Match],
     /// Long lines go on below instead of running off the view.
     pub wrap: bool,
+    /// Show the whole file as a strip on the right.
+    pub minimap: bool,
+    /// Keep the lines that open the blocks in view above the code.
+    pub sticky: bool,
+    /// A note written after the line of the caret: who last changed it.
+    pub note: Option<&'a str>,
+    /// The snippets of the user for this language: what is typed, what it becomes.
+    pub snippets: &'a [(String, String)],
+    /// The lines (from 0) the debugger stops on.
+    pub breakpoints: &'a [usize],
+    /// The line the debugged program is stopped at.
+    pub stopped: Option<usize>,
+    /// Lay out only the lines in view (see [`field`]). Not with `wrap`: there a line takes
+    /// as many rows as it needs, and the whole text is measured.
+    pub lines_only: bool,
+    /// What the language server writes in the lines; shown with `lines_only` alone.
+    pub hints: &'a [field::Hint],
 }
 
 /// Layout key and caret a bracket pair was looked up for, and the pair found.
@@ -79,7 +106,19 @@ pub struct View {
     pub focus: bool,
     /// Offer completions on the next frame, whatever was typed.
     pub complete_now: bool,
+    /// Put this line (a fraction is a part of it) at the top of the view on the next frame.
+    pub scroll_to_line: Option<f32>,
+    /// The other carets: what is typed at the caret is typed at each of them too.
+    pub extra: Vec<usize>,
+    /// The lines whose block is folded (where only the lines in view are laid out).
+    pub folded: Vec<usize>,
+    /// Fold or unfold the block the caret is in, on the next frame.
+    pub fold_at_caret: bool,
+    /// The completion just picked, for the app to take: it may come with an import.
+    pub accepted: Option<Completion>,
     layout: Option<Layout>,
+    /// What the field that shows only the lines in view worked out of the text.
+    index: Option<Arc<field::Index>>,
     completion: Option<Popup>,
     /// The bracket pair at a caret, for the text of a layout key.
     pair: Option<PairAt>,
@@ -89,6 +128,18 @@ impl View {
     /// The completion list is open.
     pub fn completing(&self) -> bool {
         self.completion.is_some()
+    }
+
+    /// Show `items` as the completions at `caret`: what a language server answered.
+    pub fn offer(&mut self, caret: usize, items: Vec<Completion>) {
+        if !items.is_empty() {
+            self.completion = Some(Popup {
+                items,
+                selected: 0,
+                caret,
+                navigated: false,
+            });
+        }
     }
 
     /// A view that takes the keyboard as soon as it shows.
@@ -103,12 +154,23 @@ impl View {
 /// The laid out text, reused while nothing it depends on changes.
 struct Layout {
     key: u64,
-    galley: Arc<Galley>,
+    /// The whole text laid out; `None` when only the lines in view are.
+    galley: Option<Arc<Galley>>,
     /// Columns of white space leading each line; `None` for a blank line.
     indents: Vec<Option<usize>>,
+    /// The byte each line starts at, then one past the end of the text: line `n` is the
+    /// bytes `starts[n]..starts[n + 1] - 1`.
+    starts: Vec<usize>,
 }
 
-fn indents_of(text: &str) -> Vec<Option<usize>> {
+fn starts_of(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
+    starts.push(text.len() + 1);
+    starts
+}
+
+pub(crate) fn indents_of(text: &str) -> Vec<Option<usize>> {
     text.split('\n')
         .map(|line| {
             let lead = line.len() - line.trim_start_matches([' ', '\t']).len();
@@ -119,6 +181,81 @@ fn indents_of(text: &str) -> Vec<Option<usize>> {
             (lead < line.len()).then_some(columns)
         })
         .collect()
+}
+
+/// Where the chars of the text are on screen, whichever field shows them. Places are
+/// counted from the top left of the text.
+enum Geometry {
+    Whole(Arc<Galley>),
+    Lines(field::Lines),
+}
+
+impl Geometry {
+    /// Where the char `index` is: a rectangle without width, as tall as its row.
+    fn pos(&self, index: usize) -> Rect {
+        match self {
+            Self::Whole(galley) => galley.pos_from_cursor(CCursor::new(index)),
+            Self::Lines(lines) => lines.pos(index),
+        }
+    }
+
+    /// The char at a place.
+    fn at(&self, within: egui::Vec2) -> usize {
+        match self {
+            Self::Whole(galley) => galley.cursor_from_pos(within).index.0,
+            Self::Lines(lines) => lines.at(within),
+        }
+    }
+
+    /// The lines that start between two heights, each with the height it starts at.
+    fn between(&self, top: f32, bottom: f32) -> Vec<(usize, f32)> {
+        match self {
+            Self::Lines(lines) => lines.between(top, bottom),
+            Self::Whole(galley) => {
+                // A wrapped line takes several rows: only the first one starts it.
+                let mut starts = true;
+                let rows = galley.rows.iter();
+                let firsts =
+                    rows.filter(|row| std::mem::replace(&mut starts, row.ends_with_newline));
+                let numbered = firsts.map(|row| row.pos.y).enumerate();
+                numbered
+                    .skip_while(|(_, y)| *y < top)
+                    .take_while(|(_, y)| *y <= bottom)
+                    .collect()
+            }
+        }
+    }
+
+    /// The line the height `y` is in.
+    fn line_at(&self, y: f32) -> usize {
+        match self {
+            Self::Lines(lines) => lines.line_at(y),
+            Self::Whole(galley) => {
+                let above = galley.rows.iter().take_while(|row| row.pos.y <= y + 0.5);
+                let ended = above.filter(|row| row.ends_with_newline).count();
+                // The row at `y` itself is counted when it ends its line: it is still in it.
+                let last = galley.rows.iter().rfind(|row| row.pos.y <= y + 0.5);
+                ended - usize::from(last.is_some_and(|row| row.ends_with_newline))
+            }
+        }
+    }
+
+    /// The height `line` starts at when every line is one row; `None` when it is folded
+    /// away.
+    fn top(&self, line: usize, row_height: f32) -> Option<f32> {
+        match self {
+            Self::Whole(_) => Some(line as f32 * row_height),
+            Self::Lines(lines) => lines.top(line),
+        }
+    }
+
+    /// The line that row `row` belongs to, keeping its fraction.
+    fn line_of_row(&self, row: f32) -> f32 {
+        match self {
+            Self::Lines(lines) => lines.line_of_row(row),
+            Self::Whole(galley) => line_of_row(galley, row),
+        }
+    }
 }
 
 /// The completion list open at the caret.
@@ -137,6 +274,17 @@ pub struct Output {
     pub selection: Option<Range<usize>>,
     /// The char clicked with Ctrl held: go to what is named there.
     pub jump: Option<usize>,
+    /// The line at the top of the view, with the fraction of it scrolled away; infinite
+    /// once the end of the text shows.
+    pub top_line: f32,
+    /// The char under the pointer when it is over the text, and where the pointer is.
+    pub pointed: Option<(usize, Pos2)>,
+    /// Where the caret is on screen: the foot of it.
+    pub caret_pos: Option<Pos2>,
+    /// The editor has the keyboard.
+    pub focused: bool,
+    /// A line whose number was clicked: its breakpoint is to be toggled.
+    pub gutter: Option<usize>,
 }
 
 /// A code-aware edit at the selection.
@@ -296,11 +444,138 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
     !steps_over
 }
 
+/// With several carets, what is typed or erased happens at each of them. Returns whether
+/// the text changed.
+fn type_at_carets(ui: &Ui, id: Id, text: &mut String, view: &mut View) -> bool {
+    enum Act {
+        Insert(String),
+        Back,
+        Delete,
+        Move(isize),
+        Leave,
+    }
+    let primary = selection_of(ui.ctx(), id)
+        .filter(Range::is_empty)
+        .map(|selection| selection.start);
+    let Some(primary) = primary else {
+        view.extra.clear();
+        return false;
+    };
+    let len = text.chars().count();
+    view.extra
+        .retain(|caret| *caret <= len && *caret != primary);
+    if view.extra.is_empty() {
+        return false;
+    }
+    let act = ui.input_mut(|input| {
+        let keys = [
+            (Key::Escape, 0),
+            (Key::Backspace, 1),
+            (Key::Delete, 2),
+            (Key::ArrowLeft, 3),
+            (Key::ArrowRight, 4),
+        ];
+        for (key, act) in keys {
+            if input.consume_key(Modifiers::NONE, key) {
+                return Some(match act {
+                    0 => Act::Leave,
+                    1 => Act::Back,
+                    2 => Act::Delete,
+                    3 => Act::Move(-1),
+                    _ => Act::Move(1),
+                });
+            }
+        }
+        // Any other move is the move of one caret: the others go.
+        let moves = |event: &Event| {
+            matches!(event, Event::Key { key, pressed: true, .. }
+                if matches!(key, Key::ArrowUp | Key::ArrowDown | Key::Home | Key::End
+                    | Key::PageUp | Key::PageDown | Key::Enter | Key::Tab))
+        };
+        if input.events.iter().any(moves) {
+            return Some(Act::Leave);
+        }
+        let typed = input.events.iter().find_map(|event| match event {
+            Event::Text(typed) => Some(typed.clone()),
+            Event::Paste(pasted) if !pasted.contains('\n') => Some(pasted.clone()),
+            _ => None,
+        })?;
+        input
+            .events
+            .retain(|event| !matches!(event, Event::Text(_) | Event::Paste(_)));
+        Some(Act::Insert(typed))
+    });
+    let Some(act) = act else {
+        return false;
+    };
+    // Every caret in order, the main one told apart.
+    let mut carets: Vec<(usize, bool)> = view.extra.iter().map(|caret| (*caret, false)).collect();
+    carets.push((primary, true));
+    carets.sort_unstable();
+    let before = text.len();
+    match act {
+        Act::Leave => {
+            view.extra.clear();
+            return false;
+        }
+        Act::Move(step) => {
+            for caret in &mut carets {
+                caret.0 = caret.0.saturating_add_signed(step).min(len);
+            }
+        }
+        // From the last caret to the first, so that the places still to change stay put.
+        Act::Insert(typed) => {
+            let width = typed.chars().count();
+            for (rank, caret) in carets.iter_mut().enumerate().rev() {
+                text.insert_str(godcode_core::byte_index(text, caret.0), &typed);
+                caret.0 += (rank + 1) * width;
+            }
+        }
+        Act::Back => {
+            for caret in carets.iter().rev().filter(|caret| caret.0 > 0) {
+                text.remove(godcode_core::byte_index(text, caret.0 - 1));
+            }
+            let mut removed = 0;
+            for caret in &mut carets {
+                removed += usize::from(caret.0 > 0);
+                caret.0 -= removed.min(caret.0);
+            }
+        }
+        Act::Delete => {
+            for caret in carets.iter().rev().filter(|caret| caret.0 < len) {
+                text.remove(godcode_core::byte_index(text, caret.0));
+            }
+            let mut removed = 0;
+            for caret in &mut carets {
+                let erased = caret.0 < len;
+                caret.0 -= removed;
+                removed += usize::from(erased);
+            }
+        }
+    }
+    view.extra = carets
+        .iter()
+        .filter(|caret| !caret.1)
+        .map(|caret| caret.0)
+        .collect();
+    if let Some((main, _)) = carets.iter().find(|caret| caret.1) {
+        set_selection(ui.ctx(), id, &(*main..*main));
+    }
+    text.len() != before
+}
+
 /// Keys the plain text field would handle without knowing it holds code.
 fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View) -> bool {
     if !ui.memory(|memory| memory.has_focus(id)) {
         view.completion = None;
+        // Escape takes the keyboard away before it gets here: it also means one caret.
+        if ui.input(|input| input.key_pressed(Key::Escape)) {
+            view.extra.clear();
+        }
         return false;
+    }
+    if type_at_carets(ui, id, text, view) {
+        return true;
     }
     let pressed = |modifiers, key| ui.input_mut(|input| input.consume_key(modifiers, key));
     if let Some(popup) = &mut view.completion {
@@ -345,6 +620,7 @@ fn accept(ctx: &Context, id: Id, text: &mut String, config: &Config<'_>, view: &
         let caret = complete::apply(text, popup.caret, item, config.indent);
         set_selection(ctx, id, &(caret..caret));
         view.focus = true;
+        view.accepted = Some(item.clone());
     }
 }
 
@@ -374,7 +650,18 @@ fn refresh_completion(
     });
     let was_open = view.completion.is_some();
     if manual || (typed && (word || (erased && was_open))) {
-        let items = complete::complete(text, caret, config.language);
+        let start = complete::word_start(text, caret);
+        let typed: String = text.chars().skip(start).take(caret - start).collect();
+        let typed = typed.to_lowercase();
+        let fits = |label: &str| !typed.is_empty() && label.to_lowercase().starts_with(&typed);
+        let own = config.snippets.iter().filter(|(label, _)| fits(label));
+        let own = own.map(|(label, body)| Completion {
+            label: label.clone(),
+            body: body.clone(),
+            kind: Kind::Snippet,
+        });
+        let known = complete::complete(text, caret, config.language);
+        let items: Vec<Completion> = own.chain(known).collect();
         let typed_chars = caret - complete::word_start(text, caret);
         let wanted = manual || was_open || typed_chars >= 2;
         view.completion = (wanted && !items.is_empty()).then_some(Popup {
@@ -424,6 +711,7 @@ fn show_completion(ui: &Ui, id: Id, popup: &Popup, at: Pos2, palette: &Palette) 
                             Kind::Snippet => "snippet",
                             Kind::Keyword => "keyword",
                             Kind::Word => "word",
+                            Kind::Symbol => "symbol",
                         };
                         painter.text(
                             pos2(rect.max.x - 8.0, rect.center().y),
@@ -445,6 +733,8 @@ fn layout_key(text: &str, config: &Config<'_>, dark: bool, width: f32) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     width.to_bits().hash(&mut hasher);
+    // The colours of the code change with the scheme.
+    theme::current().name.hash(&mut hasher);
     config.language.name.hash(&mut hasher);
     config.font_size.to_bits().hash(&mut hasher);
     dark.hash(&mut hasher);
@@ -516,7 +806,9 @@ pub fn show(
     let gutter_width = lines.to_string().len().max(3) as f32 * digit + 2.0 * GUTTER_PAD;
     let full = ui.available_rect_before_wrap();
     let gutter = full.with_max_x(full.min.x + gutter_width);
-    let body = full.with_min_x(gutter.max.x);
+    let map_width = if config.minimap { MINIMAP_WIDTH } else { 0.0 };
+    let map = full.with_min_x(full.max.x - map_width);
+    let body = full.with_min_x(gutter.max.x).with_max_x(map.min.x);
     ui.painter().rect_filled(full, 0.0, palette.bg);
 
     let unit_columns = config
@@ -526,18 +818,68 @@ pub fn show(
         .sum::<usize>()
         .max(1);
     let mut child = ui.new_child(UiBuilder::new().max_rect(body));
-    let scroll = if config.wrap {
+    let mut scroll = if config.wrap {
         ScrollArea::vertical()
     } else {
         ScrollArea::both()
     };
+    if let Some(line) = view.scroll_to_line.take() {
+        // Wrapped, a line takes several rows: the last layout tells which one it starts on.
+        let whole = view
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.galley.as_ref());
+        let row = match whole {
+            Some(galley) if config.wrap => row_of_line(galley, line),
+            // Folded blocks take no row.
+            _ => match &view.index {
+                Some(index) if config.lines_only => field::row_of(index, &view.folded, line),
+                _ => line,
+            },
+        };
+        scroll = scroll.vertical_scroll_offset(row * row_height);
+    }
     let scrolled = scroll
         .id_salt(id)
         .auto_shrink(false)
         .show(&mut child, |ui| {
             // Reserved now so the highlights end up under the text.
             let under = ui.painter().add(Shape::Noop);
-            let output = {
+            let lines_only = config.lines_only && !config.wrap;
+            let (response, cursor_range, galley_pos, geometry, typed) = if lines_only {
+                let look = field::Look {
+                    language: config.language,
+                    font: &font,
+                    dark,
+                    margin: MARGIN,
+                    min_size: body.size(),
+                    hints: config.hints,
+                };
+                let (index, folded) = (&mut view.index, &mut view.folded);
+                let shown = field::show(ui, id, text, &look, index, folded);
+                // What the guides, the pinned lines and the strip read of the text.
+                let index = shown.lines.index();
+                if view
+                    .layout
+                    .as_ref()
+                    .is_none_or(|layout| layout.key != index.key)
+                {
+                    view.layout = Some(Layout {
+                        key: index.key,
+                        galley: None,
+                        indents: index.indents.clone(),
+                        starts: index.starts.clone(),
+                    });
+                }
+                let geometry = Geometry::Lines(shown.lines);
+                (
+                    shown.response,
+                    shown.cursor,
+                    shown.origin,
+                    geometry,
+                    shown.changed,
+                )
+            } else {
                 let layout = &mut view.layout;
                 let mut layouter = |ui: &Ui, buffer: &dyn TextBuffer, wrap_width: f32| {
                     let width = if config.wrap {
@@ -546,19 +888,21 @@ pub fn show(
                         f32::INFINITY
                     };
                     let key = layout_key(buffer.as_str(), config, dark, width);
-                    if let Some(layout) = layout.as_ref().filter(|layout| layout.key == key) {
-                        return Arc::clone(&layout.galley);
+                    let known = layout.as_ref().filter(|layout| layout.key == key);
+                    if let Some(galley) = known.and_then(|layout| layout.galley.as_ref()) {
+                        return Arc::clone(galley);
                     }
                     let job = layout_job(buffer.as_str(), config, dark, width);
                     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                     *layout = Some(Layout {
                         key,
-                        galley: Arc::clone(&galley),
+                        galley: Some(Arc::clone(&galley)),
                         indents: indents_of(buffer.as_str()),
+                        starts: starts_of(buffer.as_str()),
                     });
                     galley
                 };
-                TextEdit::multiline(text)
+                let output = TextEdit::multiline(text)
                     .id(id)
                     .frame(Frame::NONE)
                     .margin(MARGIN)
@@ -569,13 +913,23 @@ pub fn show(
                     ))
                     .lock_focus(true)
                     .layouter(&mut layouter)
-                    .show(ui)
+                    .show(ui);
+                let typed = output.response.response.changed();
+                let geometry = Geometry::Whole(output.galley);
+                let response = output.response.response;
+                (
+                    response,
+                    output.cursor_range,
+                    output.galley_pos,
+                    geometry,
+                    typed,
+                )
             };
             if std::mem::take(&mut view.focus) {
-                output.response.response.request_focus();
+                response.request_focus();
             }
-            output.response.response.context_menu(|ui| menu(ui));
-            let mut selection = output.cursor_range.map(sorted);
+            response.context_menu(|ui| menu(ui));
+            let mut selection = cursor_range.map(sorted);
             // The text field moves the caret on any click: a right click inside the
             // selection keeps it, for the menu to act on.
             let right_click =
@@ -587,29 +941,42 @@ pub fn show(
                 set_selection(ui.ctx(), id, old);
                 selection = selected_before.clone();
             }
-            let jump = (output.response.response.clicked()
-                && ui.input(|input| input.modifiers.command))
-            .then(|| output.cursor_range.map(|range| range.primary.index.0))
-            .flatten();
-            let origin = output.galley_pos.to_vec2();
-            let galley = &output.galley;
+            // Alt+click leaves a caret where the caret was; a plain click is one caret again.
+            if response.clicked() {
+                match &selected_before {
+                    Some(old) if ui.input(|input| input.modifiers.alt) => {
+                        view.extra.push(old.start)
+                    }
+                    _ => view.extra.clear(),
+                }
+            }
+            let jump = (response.clicked() && ui.input(|input| input.modifiers.command))
+                .then(|| cursor_range.map(|range| range.primary.index.0))
+                .flatten();
+            let pointed = response.hover_pos().and_then(|pos| {
+                let within = pos - galley_pos;
+                let index = geometry.at(within);
+                let cell = geometry.pos(index);
+                // Past the end of a line, the pointer is on nothing.
+                (within.x <= cell.max.x + digit).then_some((index, pos))
+            });
+            let origin = galley_pos.to_vec2();
             let clip = ui.clip_rect();
-            let caret = output
-                .cursor_range
-                .map(|range| galley.pos_from_cursor(range.primary));
+            let caret = cursor_range.map(|range| geometry.pos(range.primary.index.0));
             let caret_index = selection
                 .as_ref()
                 .filter(|selection| selection.is_empty())
                 .map(|selection| selection.start);
             // Where on screen the chars `start..start + len` are, when their line shows.
             let place = |line: usize, start: usize, len: usize| {
-                // One row per line unless they wrap: lines out of view are skipped unmeasured.
-                let top = origin.y + line as f32 * row_height;
+                // One row per line unless they wrap: lines out of view are skipped unmeasured,
+                // and so are the ones folded away.
+                let top = origin.y + geometry.top(line, row_height)?;
                 if !config.wrap && (top > clip.max.y || top + row_height < clip.min.y) {
                     return None;
                 }
-                let from = galley.pos_from_cursor(CCursor::new(start));
-                let to = galley.pos_from_cursor(CCursor::new(start + len));
+                let from = geometry.pos(start);
+                let to = geometry.pos(start + len);
                 // Cut by the end of a row, only its part on the first row is marked.
                 let end = if to.min.y > from.min.y {
                     pos2(from.min.x + len as f32 * digit, from.max.y)
@@ -627,18 +994,24 @@ pub fn show(
                 let line = Rect::from_x_y_ranges(clip.x_range(), caret.translate(origin).y_range());
                 shapes.push(Shape::rect_filled(line, 0.0, palette.surface));
             }
+            // Where the debugged program waits.
+            let stopped = config.stopped.filter(|_| !config.wrap);
+            if let Some(top) = stopped.and_then(|line| geometry.top(line, row_height)) {
+                let top = origin.y + top;
+                let row = Rect::from_x_y_ranges(clip.x_range(), top..=top + row_height);
+                shapes.push(Shape::rect_filled(row, 0.0, STOPPED_COLOR));
+            }
             // A thin line down every indent level, to follow blocks by eye.
             if let Some(layout) = view.layout.as_ref().filter(|_| !config.wrap) {
-                let first = ((clip.min.y - origin.y) / row_height).floor().max(0.0) as usize;
-                let shown = (clip.height() / row_height).ceil() as usize + 1;
                 let stroke = Stroke::new(1.0, palette.border);
                 // A blank line continues the block it is in.
                 let mut levels = 0;
-                for (line, indent) in layout.indents.iter().enumerate().skip(first).take(shown) {
-                    if let Some(columns) = indent {
+                let (above, below) = (clip.min.y - origin.y - row_height, clip.max.y - origin.y);
+                for (line, top) in geometry.between(above, below) {
+                    if let Some(columns) = layout.indents.get(line).copied().flatten() {
                         levels = columns / unit_columns;
                     }
-                    let top = origin.y + line as f32 * row_height;
+                    let top = origin.y + top;
                     for level in 0..levels {
                         let x = origin.x + (level * unit_columns) as f32 * digit + 0.5;
                         shapes.push(Shape::line_segment(
@@ -680,7 +1053,7 @@ pub fn show(
                 });
                 view.pair = Some((layout.key, caret, pair));
                 for index in pair.into_iter().flat_map(|(a, b)| [a, b]) {
-                    let cell = galley.pos_from_cursor(CCursor::new(index));
+                    let cell = geometry.pos(index);
                     let rect = Rect::from_min_size(cell.min, vec2(digit, cell.height()));
                     let stroke = Stroke::new(1.0, palette.text_dim);
                     shapes.push(Shape::rect_stroke(
@@ -692,6 +1065,25 @@ pub fn show(
                 }
             }
             ui.painter().set(under, Shape::Vec(shapes));
+            if let (Some(note), Some(range)) = (config.note, cursor_range) {
+                let index = range.primary.index.0;
+                let rest = text.chars().skip(index).take_while(|ch| *ch != '\n');
+                let end = geometry.pos(index + rest.count()).translate(origin);
+                ui.painter().text(
+                    pos2(end.max.x + 5.0 * digit, end.center().y),
+                    Align2::LEFT_CENTER,
+                    note,
+                    FontId::monospace(config.font_size * 0.9),
+                    palette.text_dim.gamma_multiply(0.75),
+                );
+            }
+            for caret in &view.extra {
+                let cell = geometry.pos(*caret).translate(origin);
+                let bar = Rect::from_min_size(cell.min, vec2(1.5, cell.height()));
+                ui.painter().rect_filled(bar, 0.0, palette.text);
+            }
+            // The keyboard is here as far as the app goes, whether or not the window has it.
+            let focused = ui.memory(|memory| memory.has_focus(response.id));
 
             for (index, squiggle) in config.squiggles.iter().enumerate() {
                 let Some(rect) = place(squiggle.line, squiggle.start, squiggle.len.max(1)) else {
@@ -705,27 +1097,37 @@ pub fn show(
             }
 
             if let Some(index) = view.scroll_to.take() {
-                let target = galley
-                    .pos_from_cursor(CCursor::new(index))
-                    .translate(origin);
+                let target = geometry.pos(index).translate(origin);
                 ui.scroll_to_rect(target.expand2(vec2(60.0, 0.0)), Some(Align::Center));
             }
-            let typed = output.response.response.changed();
             changed |= typed;
             let caret_screen = caret.map(|caret| caret.translate(origin).left_bottom());
             (
-                output.galley,
-                output.galley_pos,
+                geometry,
+                galley_pos,
                 caret,
                 selection,
                 caret_index,
                 caret_screen,
                 typed,
                 jump,
+                pointed,
+                focused,
             )
         });
     ui.allocate_rect(full, Sense::hover());
-    let (galley, origin, caret, selection, caret_index, caret_screen, typed, jump) = scrolled.inner;
+    let (
+        geometry,
+        origin,
+        caret,
+        selection,
+        caret_index,
+        caret_screen,
+        typed,
+        jump,
+        pointed,
+        focused,
+    ) = scrolled.inner;
 
     refresh_completion(ui, text, config, view, caret_index, typed);
     let clicked = match (&view.completion, caret_screen) {
@@ -743,39 +1145,67 @@ pub fn show(
     let painter = ui.painter_at(gutter);
     painter.rect_filled(gutter, 0.0, palette.bg);
     let number_font = FontId::monospace(config.font_size * 0.92);
-    // The row that starts the line the caret is on: a wrapped line takes several rows.
-    let caret_row = caret.and_then(|caret| {
-        let row = galley
-            .rows
-            .iter()
-            .rposition(|row| row.pos.y <= caret.min.y + 0.5)?;
-        let wrapped = galley.rows[..row]
-            .iter()
-            .rev()
-            .take_while(|above| !above.ends_with_newline)
-            .count();
-        Some(row - wrapped)
-    });
-    let mut index = 0;
-    let mut starts_line = true;
-    for (row_index, row) in galley.rows.iter().enumerate() {
-        let top = origin.y + row.pos.y;
-        if top > gutter.max.y {
-            break;
-        }
-        let numbered = std::mem::replace(&mut starts_line, row.ends_with_newline);
-        if !numbered {
-            continue;
-        }
-        index += 1;
-        if top + row_height < gutter.min.y {
-            continue;
-        }
-        // Lines are counted from 0 below, as the marks are.
-        let index = index - 1;
+    // The line the caret is on: wrapped, a line takes several rows.
+    let caret_line = caret.map(|caret| geometry.line_at(caret.min.y));
+    let mut gutter_clicked = None;
+    let mut fold_clicked = None;
+    let over_numbers = ui.rect_contains_pointer(gutter);
+    // Lines are counted from 0, as the marks are.
+    let in_view = geometry.between(
+        gutter.min.y - origin.y - row_height,
+        gutter.max.y - origin.y,
+    );
+    for (index, top) in in_view {
+        let top = origin.y + top;
         // An empty line has no height of its own: the font's row height places the number.
         let middle = top + row_height / 2.0;
-        let current = caret_row == Some(row_index);
+        let current = caret_line == Some(index);
+        // A click on the number of a line sets or removes its breakpoint.
+        let number = Rect::from_min_max(
+            pos2(gutter.min.x, top),
+            pos2(gutter.max.x, top + row_height),
+        );
+        let clicked = ui
+            .interact(number, id.with(("gutter", index)), Sense::click())
+            .clicked();
+        if clicked {
+            gutter_clicked = Some(index);
+        }
+        // A block can be folded from the line that opens it: an arrow by its number, shown
+        // while the pointer is over the numbers, and always when the block is closed.
+        if let Geometry::Lines(lines) = &geometry
+            && let Some(closed) = lines.foldable(index)
+        {
+            let zone = number.with_min_x(gutter.max.x - GUTTER_PAD);
+            let arrow = ui
+                .interact(zone, id.with(("fold", index)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if arrow.clicked() {
+                fold_clicked = Some(index);
+            }
+            if closed || over_numbers {
+                let glyph = if closed {
+                    egui_phosphor::fill::CARET_RIGHT
+                } else {
+                    egui_phosphor::fill::CARET_DOWN
+                };
+                let ink = if arrow.hovered() {
+                    palette.text
+                } else {
+                    palette.text_dim
+                };
+                painter.text(
+                    zone.center(),
+                    Align2::CENTER_CENTER,
+                    glyph,
+                    FontId::proportional(10.0),
+                    ink,
+                );
+            }
+        }
+        if config.breakpoints.contains(&index) {
+            painter.circle_filled(pos2(gutter.min.x + 7.0, middle), 4.5, ERROR_COLOR);
+        }
         painter.text(
             pos2(gutter.max.x - GUTTER_PAD, middle),
             Align2::RIGHT_CENTER,
@@ -815,11 +1245,198 @@ pub fn show(
             painter.circle_filled(pos2(gutter.min.x + 7.0, middle), 3.0, problem_color(error));
         }
     }
+    // Fold or unfold: the block of the arrow clicked, or the one the caret is in.
+    if let Geometry::Lines(lines) = &geometry {
+        let asked = std::mem::take(&mut view.fold_at_caret);
+        let at_caret = caret_line.filter(|_| asked);
+        let header =
+            fold_clicked.or_else(|| at_caret.and_then(|line| lines.index().header_of(line)));
+        if let Some(header) = header {
+            if let Some(open) = view.folded.iter().position(|folded| *folded == header) {
+                view.folded.remove(open);
+            } else {
+                view.folded.push(header);
+                // A caret inside the block would open it again: it waits on the first line.
+                let inside = lines.index().block(header);
+                if caret_line.is_some_and(|line| inside.is_some_and(|block| block.contains(&line)))
+                {
+                    let start = lines.index().start_of(header);
+                    set_selection(ui.ctx(), id, &(start..start));
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+    }
+    let scrolled_rows = scrolled.state.offset.y / row_height;
+    let at_end = scrolled.state.offset.y > 0.0
+        && scrolled.state.offset.y + scrolled.inner_rect.height() >= scrolled.content_size.y - 1.0;
+    let first_line = geometry.line_of_row(scrolled_rows);
+    let top_line = if at_end { f32::INFINITY } else { first_line };
+
+    let mut go_to = None;
+    if let Some(layout) = &view.layout {
+        if config.sticky && !config.wrap && !is_prose(config.language) {
+            // The lines that open the blocks `top` is in, outermost first: going up, each
+            // line less indented than the last one kept opens a block.
+            let opening = |top: usize| {
+                let top = top.min(layout.indents.len());
+                // The first line with text tells how deep the view starts.
+                let mut limit = layout.indents[top..]
+                    .iter()
+                    .find_map(|indent| *indent)
+                    .unwrap_or(0);
+                let mut headers = Vec::new();
+                let mut line = top;
+                while line > 0
+                    && limit > 0
+                    && headers.len() < STICKY_LINES
+                    && top - line < STICKY_REACH
+                {
+                    line -= 1;
+                    if let Some(indent) = layout.indents[line].filter(|indent| *indent < limit) {
+                        headers.push(line);
+                        limit = indent;
+                    }
+                }
+                headers.reverse();
+                headers
+            };
+            // The pinned lines hide as many rows: what counts is the first line under them.
+            let top = first_line.floor() as usize;
+            let hidden = opening(top).len();
+            let headers = opening(top + hidden);
+            let size = vec2(map.min.x - full.min.x, headers.len() as f32 * row_height);
+            let strip = Rect::from_min_size(full.min, size);
+            let painter = ui.painter_at(strip);
+            if !headers.is_empty() {
+                painter.rect_filled(strip, 0.0, palette.bg);
+                painter.hline(
+                    strip.x_range(),
+                    strip.max.y - 0.5,
+                    Stroke::new(1.0, palette.border),
+                );
+            }
+            for (row, line) in headers.iter().enumerate() {
+                let y = strip.min.y + row as f32 * row_height;
+                painter.text(
+                    pos2(gutter.max.x - GUTTER_PAD, y + row_height / 2.0),
+                    Align2::RIGHT_CENTER,
+                    (line + 1).to_string(),
+                    number_font.clone(),
+                    palette.text_dim,
+                );
+                // The text may have changed since it was laid out: no line is better
+                // than a wrong one.
+                let bytes = layout.starts[*line]..layout.starts[line + 1] - 1;
+                let content = text.get(bytes).unwrap_or("");
+                let job = layout_job(content, config, dark, f32::INFINITY);
+                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                ui.painter_at(strip.with_min_x(gutter.max.x)).galley(
+                    pos2(origin.x, y),
+                    galley,
+                    palette.text,
+                );
+                let rect = Rect::from_min_size(pos2(strip.min.x, y), vec2(size.x, row_height));
+                let clicked = ui
+                    .interact(rect, id.with(("sticky", row)), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked();
+                if clicked {
+                    // Under the lines that stay pinned above it.
+                    go_to = Some((*line as f32 - row as f32).max(0.0));
+                }
+            }
+        }
+        if config.minimap {
+            let shown = scrolled.inner_rect.height() / row_height;
+            go_to = show_minimap(ui, id, map, layout, first_line, shown).or(go_to);
+        }
+    }
+    if go_to.is_some() {
+        view.scroll_to_line = go_to;
+        ui.ctx().request_repaint();
+    }
     Output {
         changed,
         selection,
         jump,
+        top_line,
+        pointed,
+        caret_pos: caret_screen,
+        focused,
+        gutter: gutter_clicked,
     }
+}
+
+/// The whole file as a strip: a bar per line, as long as its text, and the part in view.
+/// Returns the line to put at the top of the view when the strip is clicked or dragged.
+fn show_minimap(
+    ui: &Ui,
+    id: Id,
+    rect: Rect,
+    layout: &Layout,
+    first: f32,
+    shown: f32,
+) -> Option<f32> {
+    let palette = Palette::of(ui);
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, palette.bg);
+    painter.vline(
+        rect.min.x + 0.5,
+        rect.y_range(),
+        Stroke::new(1.0, palette.border),
+    );
+    let lines = layout.indents.len();
+    // A long file is squeezed into the height of the strip.
+    let step = (rect.height() / lines as f32).min(MINIMAP_ROW);
+    let view = Rect::from_min_size(
+        pos2(rect.min.x + 1.0, rect.min.y + first * step),
+        vec2(rect.width() - 1.0, (shown * step).max(8.0)),
+    );
+    painter.rect_filled(view, 0.0, palette.hover);
+    let ink = palette.text_dim.gamma_multiply(0.55);
+    // Squeezed under a pixel a line, only some lines are drawn.
+    let every = (1.0 / step).ceil().max(1.0) as usize;
+    for line in (0..lines).step_by(every) {
+        let Some(indent) = layout.indents[line] else {
+            continue;
+        };
+        let bytes = layout.starts[line + 1] - 1 - layout.starts[line];
+        let left = rect.min.x + 6.0 + indent as f32 * MINIMAP_COLUMN;
+        let width = bytes.saturating_sub(indent) as f32 * MINIMAP_COLUMN;
+        let width = width.min(rect.max.x - 4.0 - left).max(1.0);
+        let bar = Rect::from_min_size(
+            pos2(left, rect.min.y + line as f32 * step),
+            vec2(width, (step - 1.0).max(1.0)),
+        );
+        painter.rect_filled(bar, 0.0, ink);
+    }
+    let response = ui.interact(rect, id.with("minimap"), Sense::click_and_drag());
+    let pointer = response
+        .interact_pointer_pos()
+        .filter(|_| response.clicked() || response.dragged())?;
+    // The place pointed at goes to the middle of the view.
+    Some(((pointer.y - rect.min.y) / step - shown / 2.0).clamp(0.0, lines as f32))
+}
+
+/// The row of `galley` that line `line` starts on, keeping its fraction.
+fn row_of_line(galley: &Galley, line: f32) -> f32 {
+    let mut current = 0.0;
+    for (index, row) in galley.rows.iter().enumerate() {
+        if current >= line.floor() {
+            return index as f32 + line.fract();
+        }
+        if row.ends_with_newline {
+            current += 1.0;
+        }
+    }
+    galley.rows.len() as f32
+}
+
+/// The line that row `row` of `galley` belongs to, keeping its fraction.
+fn line_of_row(galley: &Galley, row: f32) -> f32 {
+    let above = galley.rows.iter().take(row as usize);
+    above.filter(|row| row.ends_with_newline).count() as f32 + row.fract()
 }
 
 #[cfg(test)]
@@ -835,6 +1452,13 @@ mod tests {
         time: f64,
         file: &'static str,
         wrap: bool,
+        lines_only: bool,
+        hints: Vec<field::Hint>,
+    }
+
+    thread_local! {
+        /// The tests of this thread run on the field that lays out only the lines in view.
+        static LINES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn editor_id() -> Id {
@@ -854,6 +1478,8 @@ mod tests {
                 time: 0.0,
                 file,
                 wrap,
+                lines_only: LINES_ONLY.get(),
+                hints: Vec::new(),
             };
             harness.frame(Vec::new());
             harness.frame(Vec::new());
@@ -879,6 +1505,14 @@ mod tests {
                 changes: &[],
                 occurrences: &[],
                 wrap: self.wrap,
+                minimap: true,
+                sticky: true,
+                note: None,
+                snippets: &[],
+                breakpoints: &[],
+                stopped: None,
+                lines_only: self.lines_only,
+                hints: &self.hints,
             };
             let mut output = None;
             let _ = self.ctx.run_ui(input, |ui| {
@@ -934,6 +1568,24 @@ mod tests {
     }
 
     #[test]
+    fn several_carets_type_and_erase_together() {
+        let mut harness = Harness::new("ab\nab\nab");
+        set_selection(&harness.ctx, editor_id(), &(1..1));
+        harness.view.extra = vec![4, 7];
+        harness.frame(Vec::new());
+        harness.type_text("X");
+        assert_eq!(harness.text, "aXb\naXb\naXb");
+        assert_eq!(harness.view.extra, [6, 10]);
+        harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(harness.text, "ab\nab\nab");
+        harness.key(Key::Delete, Modifiers::NONE);
+        assert_eq!(harness.text, "a\na\na");
+        assert_eq!(harness.view.extra, [3, 5]);
+        harness.key(Key::Escape, Modifiers::NONE);
+        assert!(harness.view.extra.is_empty());
+    }
+
+    #[test]
     fn typing_a_tag_closes_it() {
         let mut harness = Harness::of("index.html", "", false);
         harness.type_text("<div");
@@ -955,7 +1607,7 @@ mod tests {
         let rows = |wrap: bool| {
             let harness = Harness::of("page.html", &text, wrap);
             let layout = harness.view.layout.as_ref().expect("laid out");
-            layout.galley.rows.len()
+            layout.galley.as_ref().expect("laid out whole").rows.len()
         };
         assert_eq!(rows(false), 2, "one row per line");
         assert!(rows(true) > 4, "the long line takes several rows");
@@ -998,6 +1650,166 @@ mod tests {
         harness.frame(vec![button(false)]);
         // Right of the second line: the caret lands at its end.
         assert_eq!(harness.frame(Vec::new()).selection, Some(7..7));
+    }
+
+    /// What is asked of the editor is asked of both its text fields.
+    #[test]
+    fn the_field_of_lines_in_view_edits_the_same() {
+        LINES_ONLY.set(true);
+        typing_enter_and_tab_write_indented_code();
+        several_carets_type_and_erase_together();
+        typing_a_tag_closes_it();
+        a_completion_is_offered_and_accepted_with_tab();
+        a_click_puts_the_caret_in_the_text();
+        undo_restores_the_text_through_the_menu();
+    }
+
+    #[test]
+    fn the_field_of_lines_in_view_moves_selects_and_erases() {
+        LINES_ONLY.set(true);
+        let mut harness = Harness::new("one two\nthree\n\nfour");
+        set_selection(&harness.ctx, editor_id(), &(0..0));
+        harness.frame(Vec::new());
+        let shift = Modifiers::SHIFT;
+        // Down keeps the column, the end of a shorter line stops it.
+        harness.key(Key::End, Modifiers::NONE);
+        assert_eq!(
+            harness.key(Key::ArrowDown, Modifiers::NONE).selection,
+            Some(13..13)
+        );
+        assert_eq!(
+            harness.key(Key::ArrowDown, Modifiers::NONE).selection,
+            Some(14..14)
+        );
+        assert_eq!(
+            harness.key(Key::ArrowUp, Modifiers::NONE).selection,
+            Some(8..8)
+        );
+        // Word by word, selecting.
+        let word = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert_eq!(harness.key(Key::ArrowRight, word).selection, Some(8..13));
+        harness.type_text("3");
+        assert_eq!(harness.text, "one two\n3\n\nfour");
+        harness.key(Key::Backspace, Modifiers::NONE);
+        harness.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(harness.text, "one two\n\nfour");
+        assert_eq!(harness.key(Key::ArrowLeft, shift).selection, Some(6..7));
+        harness.key(Key::Delete, Modifiers::NONE);
+        assert_eq!(harness.text, "one tw\n\nfour");
+        // Everything, then written over.
+        harness.key(Key::A, Modifiers::COMMAND);
+        let out = harness.type_text("x");
+        assert_eq!((harness.text.as_str(), out.selection), ("x", Some(1..1)));
+        // Only the lines in view were measured: the text was never laid out whole.
+        let layout = harness.view.layout.as_ref().expect("read");
+        assert!(layout.galley.is_none());
+    }
+
+    #[test]
+    fn a_folded_block_takes_no_row_and_opens_for_the_caret() {
+        LINES_ONLY.set(true);
+        let mut harness = Harness::new("fn a() {\n    one();\n    two();\n}\nfn b() {}\n");
+        set_selection(&harness.ctx, editor_id(), &(0..0));
+        harness.view.fold_at_caret = true;
+        harness.frame(Vec::new());
+        assert_eq!(harness.view.folded, [0]);
+        // The second row is now the brace that closes the block: a click there lands on it.
+        let row_height = 17.0;
+        let pos = pos2(600.0, 4.0 + 1.5 * row_height);
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        harness.frame(vec![Event::PointerMoved(pos)]);
+        harness.frame(vec![button(true)]);
+        harness.frame(vec![button(false)]);
+        let caret = harness.frame(Vec::new()).selection.expect("a caret").start;
+        assert_eq!(
+            harness.text[..caret].matches('\n').count(),
+            3,
+            "caret at {caret}"
+        );
+        assert_eq!(harness.view.folded, [0]);
+        // Going up enters the block: it opens rather than hide the caret.
+        harness.key(Key::ArrowUp, Modifiers::NONE);
+        assert!(harness.view.folded.is_empty());
+        // Typed lines above a fold push it down with its block.
+        harness.text.push_str("    z();\n");
+        set_selection(&harness.ctx, editor_id(), &(0..0));
+        harness.frame(Vec::new());
+        harness.view.folded = vec![4];
+        harness.frame(Vec::new());
+        harness.type_text("// top\n");
+        assert_eq!(harness.view.folded, [5]);
+    }
+
+    #[test]
+    fn a_hint_pushes_the_text_along_without_being_in_it() {
+        LINES_ONLY.set(true);
+        let mut harness = Harness::new(&"a".repeat(60));
+        let pos = pos2(400.0, 10.0);
+        let click = |harness: &mut Harness| {
+            let button = |pressed| Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            harness.frame(vec![Event::PointerMoved(pos)]);
+            harness.frame(vec![button(true)]);
+            harness.frame(vec![button(false)]);
+            harness.frame(Vec::new()).selection.expect("a caret").start
+        };
+        let plain = click(&mut harness);
+        harness.hints = vec![field::Hint {
+            line: 0,
+            column: 2,
+            label: ": number".to_owned(),
+        }];
+        // The same place is now a char further left by the width of the hint, which is
+        // written a little smaller than the text.
+        let hinted = click(&mut harness);
+        assert!((7..=8).contains(&(plain - hinted)), "{plain} {hinted}");
+        // What is typed where the hint is goes in the text; the hint does not.
+        set_selection(&harness.ctx, editor_id(), &(2..2));
+        harness.frame(Vec::new());
+        let out = harness.type_text("X");
+        assert_eq!(harness.text, format!("aaX{}", "a".repeat(58)));
+        assert_eq!(out.selection, Some(3..3));
+    }
+
+    #[test]
+    fn the_field_of_lines_in_view_measures_only_what_shows() {
+        LINES_ONLY.set(true);
+        let text: String = (0..5000).map(|line| format!("line {line}\n")).collect();
+        let mut harness = Harness::new(&text);
+        let out = harness.frame(Vec::new());
+        assert!(out.top_line < 1.0);
+        // A click lands on the line under it, far from the lines never measured.
+        let pos = pos2(600.0, 300.0);
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        harness.frame(vec![Event::PointerMoved(pos)]);
+        harness.frame(vec![button(true)]);
+        harness.frame(vec![button(false)]);
+        let caret = harness.frame(Vec::new()).selection.expect("a caret").start;
+        let line = harness.text[..caret].matches('\n').count();
+        assert!((10..40).contains(&line), "line {line}");
+        // The end of the text is reached and shown.
+        harness.key(Key::End, Modifiers::COMMAND);
+        // Scrolling there takes a few frames.
+        for _ in 0..30 {
+            harness.frame(Vec::new());
+        }
+        let out = harness.frame(Vec::new());
+        assert_eq!(out.selection, Some(text.len()..text.len()));
+        assert!(out.top_line > 4000.0, "{}", out.top_line);
     }
 
     #[test]

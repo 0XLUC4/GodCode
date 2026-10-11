@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use egui::Color32;
+use godcode_core::syntax::Language;
 
 use crate::widgets::icon;
 
@@ -106,6 +107,200 @@ pub fn check(checker: &Checker) -> Result<String, String> {
     let mut printed = String::from_utf8_lossy(&output.stdout).into_owned();
     printed.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(printed)
+}
+
+/// What the project in `root` can run, as (what it is called, the command): the scripts
+/// of `package.json`, the usual commands of Cargo and Go, the targets of a `Makefile`.
+pub fn tasks(root: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+    let package = read("package.json").and_then(|text| serde_json::from_str(&text).ok());
+    let package: Option<serde_json::Value> = package;
+    if let Some(scripts) = package
+        .as_ref()
+        .and_then(|package| package["scripts"].as_object())
+    {
+        for name in scripts.keys() {
+            found.push((format!("npm: {name}"), format!("npm run {name}")));
+        }
+    }
+    if root.join("Cargo.toml").is_file() {
+        for task in [
+            "run",
+            "build",
+            "test",
+            "check",
+            "clippy",
+            "fmt",
+            "build --release",
+        ] {
+            found.push((format!("cargo: {task}"), format!("cargo {task}")));
+        }
+    }
+    if root.join("go.mod").is_file() {
+        for task in ["run .", "build ./...", "test ./...", "vet ./..."] {
+            found.push((format!("go: {task}"), format!("go {task}")));
+        }
+    }
+    for line in read("Makefile").unwrap_or_default().lines() {
+        let target = line.split(':').next().unwrap_or("");
+        let named = !target.is_empty()
+            && line.contains(':')
+            && target
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || "-_".contains(ch));
+        if named {
+            found.push((format!("make: {target}"), format!("make {target}")));
+        }
+    }
+    found
+}
+
+/// Send `request` with curl and return what came back, headers first.
+pub fn send(request: &godcode_core::http::Request) -> Result<String, String> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-i",
+        "--max-time",
+        "30",
+        "-X",
+        &request.method,
+        &request.url,
+    ]);
+    for header in &request.headers {
+        command.args(["-H", header]);
+    }
+    if !request.body.is_empty() {
+        command.args(["--data-binary", &request.body]);
+    }
+    hidden(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("Cannot run curl: {err}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let received = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    // A JSON body is easier to read laid out.
+    let (head, body) = received.split_once("\n\n").unwrap_or((&received, ""));
+    let json = body.trim_start().starts_with(['{', '[']);
+    let body = match Language::named("JSON").filter(|_| json) {
+        Some(language) => godcode_core::format::format(body, language, "  "),
+        None => body.to_owned(),
+    };
+    Ok(format!("{head}\n\n{body}"))
+}
+
+/// The command that runs the one test called `name`, written in `file`.
+pub fn test_one(language: &str, file: &Path, name: &str) -> Option<String> {
+    Some(match language {
+        "Rust" => format!("cargo test {name}"),
+        "Python" => format!("pytest \"{}::{name}\"", file.display()),
+        "Go" => format!("go test -run \"^{name}$\" ./..."),
+        "JavaScript" | "TypeScript" => format!("npm test -- -t \"{name}\""),
+        _ => return None,
+    })
+}
+
+/// Open `url` in the browser of the system.
+pub fn open_in_browser(url: &str) -> Result<(), String> {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    } else if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    hidden(&mut command);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Cannot open the browser: {err}"))
+}
+
+/// A project to start from: its name, then its files as (path, content).
+pub type Template = (&'static str, &'static [(&'static str, &'static str)]);
+
+pub const TEMPLATES: &[Template] = &[
+    (
+        "Web page (HTML, CSS, JavaScript)",
+        &[
+            (
+                "index.html",
+                "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>My page</title>\n  <link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n  <h1>Hello</h1>\n  <script src=\"main.js\"></script>\n</body>\n</html>\n",
+            ),
+            (
+                "style.css",
+                "body {\n  font-family: system-ui, sans-serif;\n  margin: 2rem;\n}\n",
+            ),
+            ("main.js", "console.log(\"ready\");\n"),
+        ],
+    ),
+    (
+        "Node.js (TypeScript)",
+        &[
+            (
+                "package.json",
+                "{\n  \"name\": \"app\",\n  \"version\": \"0.1.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"start\": \"tsx src/index.ts\",\n    \"test\": \"vitest run\"\n  },\n  \"devDependencies\": {\n    \"tsx\": \"latest\",\n    \"typescript\": \"latest\",\n    \"vitest\": \"latest\"\n  }\n}\n",
+            ),
+            (
+                "tsconfig.json",
+                "{\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"module\": \"NodeNext\",\n    \"target\": \"ES2022\"\n  },\n  \"include\": [\"src\"]\n}\n",
+            ),
+            (
+                "src/index.ts",
+                "export function greet(who: string): string {\n  return `Hello ${who}`;\n}\n\nconsole.log(greet(\"world\"));\n",
+            ),
+        ],
+    ),
+    (
+        "Python script",
+        &[
+            (
+                "main.py",
+                "def main() -> None:\n    print(\"Hello\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+            ),
+            (
+                "test_main.py",
+                "from main import main\n\n\ndef test_main() -> None:\n    main()\n",
+            ),
+        ],
+    ),
+    (
+        "Rust program",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+            ),
+            ("src/main.rs", "fn main() {\n    println!(\"Hello\");\n}\n"),
+        ],
+    ),
+];
+
+/// The command that runs the tests of the project in `root`, told by the files it holds.
+pub fn test_command(root: &Path) -> Option<&'static str> {
+    let told_by = [
+        ("Cargo.toml", "cargo test"),
+        ("package.json", "npm test"),
+        ("go.mod", "go test ./..."),
+        ("pyproject.toml", "pytest"),
+        ("pytest.ini", "pytest"),
+        ("pom.xml", "mvn test"),
+        ("build.gradle", "gradle test"),
+        ("build.gradle.kts", "gradle test"),
+    ];
+    let found = told_by
+        .into_iter()
+        .find(|(file, _)| root.join(file).is_file());
+    found.map(|(_, command)| command)
 }
 
 /// Run `git` in `folder` and return what it printed; what it complained about when it fails.
@@ -230,6 +425,25 @@ pub fn file_icon(name: &str) -> FileIcon {
         (_, "csv") => glyph(icon::FILE_CSV, 0x4E_AA_25),
         (_, "lock") => glyph(icon::LOCK_SIMPLE, GREY),
         (_, "txt" | "log") => glyph(icon::FILE_TEXT, GREY),
+        (_, "dart") => badge("D", 0x02_75_9A),
+        (_, "scala" | "sc") => badge("SC", 0xDC_32_2F),
+        (_, "zig") => badge("Z", 0xF7_A4_1D),
+        (_, "hs") => badge("HS", 0x5E_50_86),
+        (_, "ex" | "exs") => badge("EX", 0x6E_4A_7E),
+        (_, "jl") => badge("JL", 0x95_58_B2),
+        (_, "r") => badge("R", 0x27_6D_C3),
+        (_, "sol") => badge("S", 0x62_7E_EA),
+        (_, "tf" | "hcl" | "tfvars") => badge("TF", 0x7B_42_BC),
+        (_, "tex" | "bib") => badge("TX", 0x3D_61_17),
+        (_, "graphql" | "gql") => badge("GQ", 0xE1_00_98),
+        (_, "proto") => badge("PB", 0x4F_9C_E8),
+        (_, "mm" | "m") => badge("M", 0x43_8E_FF),
+        (_, "gd") => badge("GD", 0x47_8C_BF),
+        (_, "glsl" | "hlsl" | "wgsl" | "vert" | "frag" | "shader") => glyph(icon::CUBE, 0x5B_8D_EF),
+        // Any other file whose language is known is code.
+        _ if Language::of(Path::new(name)).name != "Plain Text" => {
+            glyph(icon::FILE_CODE, 0x4F_9C_E8)
+        }
         _ => glyph(icon::FILE, GREY),
     };
     FileIcon {

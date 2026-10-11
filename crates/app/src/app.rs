@@ -15,17 +15,21 @@ use egui::{
 };
 use godcode_core::check::{self, Problem, Severity};
 use godcode_core::git::{self, Change, Hunk};
+use godcode_core::markdown;
 use godcode_core::outline::{self, Symbol};
 use godcode_core::search::{self, Hit, Match};
 use godcode_core::syntax::Language;
 use godcode_core::{Decoded, Indent, LineEnding, complete, edit, format, fuzzy};
+use godcode_lsp::Event as ServerEvent;
 
 use crate::explorer::{Action, Explorer};
+use crate::field::Hint;
+use crate::servers::{self, Servers};
 use crate::terminal::Terminal;
 use crate::theme::{self, Palette};
 use crate::toasts::Toasts;
 use crate::widgets::{self, icon, with_icon};
-use crate::{APP_NAME, branding, editor, platform, tools};
+use crate::{APP_NAME, branding, editor, platform, preview, tools};
 
 const TAB_HEIGHT: f32 = 34.0;
 /// Widest a tab's file name gets before it is cut with an ellipsis.
@@ -40,7 +44,7 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_HITS: usize = 5000;
 const MAX_PICKS: usize = 50;
 const MAX_REPORTS: usize = 500;
-/// A file with a line this long (in bytes) opens with soft wrap: it is minified, or prose.
+/// A file with a line this long (in bytes) is minified: opening it says how to read it.
 const LONG_LINE: usize = 400;
 const MAX_HISTORY: usize = 100;
 const MAX_TODOS: usize = 2000;
@@ -52,6 +56,14 @@ const MAX_OCCURRENCE_BYTES: usize = 512 * 1024;
 const DOUBLE_TAP: f64 = 0.4;
 /// What the TODO panel looks for.
 const TODO_MARKS: [&str; 2] = ["TODO", "FIXME"];
+/// With auto save on, a file is written this many seconds after its last change.
+const AUTOSAVE_DELAY: f64 = 1.0;
+/// Completions of a language server shown at once.
+const MAX_SERVED: usize = 60;
+/// The pointer rests this many seconds on a name before its documentation is asked for.
+const HOVER_DELAY: f64 = 0.6;
+/// Versions of a file kept by the local history.
+const MAX_VERSIONS: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cmd {
@@ -125,6 +137,55 @@ enum Cmd {
     CloseAll,
     Reveal,
     CopyPath,
+    Preview,
+    Minimap,
+    LinesOnly,
+    Fold,
+    UnfoldAll,
+    StickyScroll,
+    AutoSave,
+    Documentation,
+    LanguageServer,
+    QuickFix,
+    Implementation,
+    Split,
+    Branches,
+    Diff,
+    Blame,
+    History,
+    RunTests,
+    Themes,
+    Zen,
+    CaretAbove,
+    CaretBelow,
+    Tasks,
+    GitLog,
+    Stash,
+    StashPop,
+    Snippets,
+    Response,
+    Debug,
+    StopDebug,
+    StepOver,
+    StepInto,
+    StepOut,
+    Breakpoint,
+    DebugPanel,
+    LivePreview,
+    TestAtCaret,
+    NewProject,
+    Keymap,
+    SplitDown,
+    SplitSame,
+    Callers,
+    Callees,
+    TestsPanel,
+    Merge,
+    Rebase,
+    AcceptOurs,
+    AcceptTheirs,
+    AcceptBoth,
+    DebugSettings,
 }
 
 /// How a command shows in the menus, the command palette and the shortcut list.
@@ -358,6 +419,18 @@ const COMMANDS: &[Spec] = &[
         "F12",
     ),
     spec(Cmd::FindUsages, icon::BINOCULARS, "Find Usages", "Alt+F7"),
+    spec(
+        Cmd::Callers,
+        icon::TREE_STRUCTURE,
+        "Call Hierarchy: Callers",
+        "Ctrl+Alt+H",
+    ),
+    spec(
+        Cmd::Callees,
+        icon::TREE_STRUCTURE,
+        "Call Hierarchy: Calls Made",
+        "",
+    ),
     spec(Cmd::Back, icon::ARROW_BEND_UP_LEFT, "Back", "Ctrl+Alt+Left"),
     spec(
         Cmd::Forward,
@@ -376,6 +449,143 @@ const COMMANDS: &[Spec] = &[
         "Alt+F1",
     ),
     spec(Cmd::CopyPath, icon::COPY, "Copy Path", "Ctrl+Shift+C"),
+    spec(
+        Cmd::Preview,
+        icon::EYE,
+        "Toggle Markdown Preview",
+        "Ctrl+Shift+V",
+    ),
+    spec(Cmd::Minimap, icon::ROWS, "Toggle Minimap", ""),
+    spec(
+        Cmd::LinesOnly,
+        icon::ROWS,
+        "Toggle Fast Rendering (Experimental)",
+        "",
+    ),
+    spec(Cmd::Fold, icon::ROWS, "Fold / Unfold Block", ""),
+    spec(Cmd::UnfoldAll, icon::ROWS, "Unfold All", ""),
+    spec(
+        Cmd::StickyScroll,
+        icon::PUSH_PIN,
+        "Toggle Sticky Scroll",
+        "",
+    ),
+    spec(Cmd::AutoSave, icon::CLOCK_CLOCKWISE, "Toggle Auto Save", ""),
+    spec(
+        Cmd::Documentation,
+        icon::INFO,
+        "Quick Documentation",
+        "Ctrl+Q",
+    ),
+    spec(
+        Cmd::QuickFix,
+        icon::LIGHTBULB,
+        "Show Quick Fixes",
+        "Alt+Enter",
+    ),
+    spec(
+        Cmd::Implementation,
+        icon::TREE_STRUCTURE,
+        "Go to Implementation",
+        "Ctrl+Alt+B",
+    ),
+    spec(
+        Cmd::Split,
+        icon::SQUARE_SPLIT_HORIZONTAL,
+        "Split Editor Right",
+        "Ctrl+\\",
+    ),
+    spec(Cmd::Branches, icon::GIT_BRANCH, "Git Branches…", ""),
+    spec(Cmd::Diff, icon::ROWS, "Compare with Last Commit", ""),
+    spec(Cmd::Blame, icon::INFO, "Toggle Git Blame", ""),
+    spec(
+        Cmd::History,
+        icon::CLOCK_COUNTER_CLOCKWISE,
+        "Local History…",
+        "",
+    ),
+    spec(
+        Cmd::RunTests,
+        icon::CHECK_SQUARE,
+        "Run Tests",
+        "Ctrl+Shift+T",
+    ),
+    spec(Cmd::Themes, icon::PALETTE, "Color Theme…", ""),
+    spec(Cmd::Zen, icon::EYE, "Toggle Zen Mode", "Ctrl+Alt+Z"),
+    spec(
+        Cmd::CaretAbove,
+        icon::ARROW_UP,
+        "Add Caret Above",
+        "Ctrl+Alt+Up",
+    ),
+    spec(
+        Cmd::CaretBelow,
+        icon::ARROW_DOWN,
+        "Add Caret Below",
+        "Ctrl+Alt+Down",
+    ),
+    spec(Cmd::Tasks, icon::PLAY, "Run Task…", "Ctrl+Shift+R"),
+    spec(Cmd::GitLog, icon::GIT_BRANCH, "Git Log…", ""),
+    spec(Cmd::Stash, icon::PACKAGE, "Git Stash", ""),
+    spec(Cmd::StashPop, icon::PACKAGE, "Git Stash Pop", ""),
+    spec(Cmd::Snippets, icon::CODE_BLOCK, "Edit Snippets", ""),
+    spec(Cmd::Response, icon::GLOBE, "Toggle HTTP Response", ""),
+    spec(Cmd::Debug, icon::BUG, "Debug File", "Ctrl+F5"),
+    spec(Cmd::StopDebug, icon::STOP, "Stop Debugging", "Shift+F5"),
+    spec(
+        Cmd::StepOver,
+        icon::ARROW_ELBOW_DOWN_RIGHT,
+        "Step Over",
+        "F10",
+    ),
+    spec(Cmd::StepInto, icon::ARROW_LINE_DOWN, "Step Into", "F11"),
+    spec(Cmd::StepOut, icon::ARROW_LINE_UP, "Step Out", "Shift+F11"),
+    spec(
+        Cmd::Breakpoint,
+        icon::DOT_OUTLINE,
+        "Toggle Breakpoint",
+        "F9",
+    ),
+    spec(Cmd::DebugPanel, icon::BUG, "Toggle Debug Panel", ""),
+    spec(
+        Cmd::LivePreview,
+        icon::BROWSER,
+        "Live Preview in Browser",
+        "",
+    ),
+    spec(
+        Cmd::TestAtCaret,
+        icon::CHECK_SQUARE,
+        "Run Test at Caret",
+        "Ctrl+Shift+F10",
+    ),
+    spec(Cmd::NewProject, icon::FOLDER_PLUS, "New Project…", ""),
+    spec(Cmd::Keymap, icon::KEYBOARD, "Edit Keyboard Shortcuts", ""),
+    spec(Cmd::SplitDown, icon::ROWS, "Split Editor Down", ""),
+    spec(
+        Cmd::SplitSame,
+        icon::SQUARE_SPLIT_HORIZONTAL,
+        "Split Editor: Same File",
+        "",
+    ),
+    spec(Cmd::TestsPanel, icon::CHECK_SQUARE, "Toggle Tests", ""),
+    spec(Cmd::Merge, icon::ARROWS_MERGE, "Git Merge Branch…", ""),
+    spec(Cmd::Rebase, icon::GIT_BRANCH, "Git Rebase onto…", ""),
+    spec(Cmd::AcceptOurs, icon::CHECK, "Conflict: Keep Mine", ""),
+    spec(Cmd::AcceptTheirs, icon::CHECK, "Conflict: Keep Theirs", ""),
+    spec(Cmd::AcceptBoth, icon::CHECK, "Conflict: Keep Both", ""),
+    spec(
+        Cmd::DebugSettings,
+        icon::BUG,
+        "Edit Debug Configurations",
+        "",
+    ),
+    spec(
+        Cmd::LanguageServer,
+        icon::PLUGS_CONNECTED,
+        "Language Server Status",
+        "",
+    ),
     spec(Cmd::Shortcuts, icon::KEYBOARD, "Keyboard Shortcuts", "F1"),
 ];
 
@@ -397,12 +607,14 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
         "File",
         &[
             Some(Cmd::NewFile),
+            Some(Cmd::NewProject),
             Some(Cmd::OpenFile),
             Some(Cmd::OpenFolder),
             None,
             Some(Cmd::Save),
             Some(Cmd::SaveAs),
             Some(Cmd::SaveAll),
+            Some(Cmd::AutoSave),
             None,
             Some(Cmd::CloseTab),
             Some(Cmd::CloseOthers),
@@ -428,12 +640,16 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::ExpandSelection),
             Some(Cmd::ShrinkSelection),
             Some(Cmd::CopyPath),
+            None,
+            Some(Cmd::CaretAbove),
+            Some(Cmd::CaretBelow),
         ],
     ),
     (
         "Code",
         &[
             Some(Cmd::Reformat),
+            Some(Cmd::QuickFix),
             Some(Cmd::Complete),
             Some(Cmd::Rename),
             None,
@@ -447,6 +663,8 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::MoveLineDown),
             Some(Cmd::JoinLines),
             Some(Cmd::ToggleCase),
+            None,
+            Some(Cmd::Snippets),
         ],
     ),
     (
@@ -466,6 +684,17 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::ToggleTerminal),
             None,
             Some(Cmd::ToggleWrap),
+            Some(Cmd::Split),
+            Some(Cmd::SplitDown),
+            Some(Cmd::SplitSame),
+            Some(Cmd::Zen),
+            Some(Cmd::Themes),
+            Some(Cmd::Preview),
+            Some(Cmd::Minimap),
+            Some(Cmd::LinesOnly),
+            Some(Cmd::Fold),
+            Some(Cmd::UnfoldAll),
+            Some(Cmd::StickyScroll),
             Some(Cmd::ZoomIn),
             Some(Cmd::ZoomOut),
             Some(Cmd::ZoomReset),
@@ -482,7 +711,11 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::GoToLine),
             None,
             Some(Cmd::Declaration),
+            Some(Cmd::Implementation),
             Some(Cmd::FindUsages),
+            Some(Cmd::Callers),
+            Some(Cmd::Callees),
+            Some(Cmd::Documentation),
             Some(Cmd::Back),
             Some(Cmd::Forward),
             Some(Cmd::Reveal),
@@ -499,6 +732,20 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
         "Run",
         &[
             Some(Cmd::Run),
+            Some(Cmd::Debug),
+            Some(Cmd::Breakpoint),
+            Some(Cmd::StepOver),
+            Some(Cmd::StepInto),
+            Some(Cmd::StepOut),
+            Some(Cmd::StopDebug),
+            Some(Cmd::DebugSettings),
+            None,
+            Some(Cmd::TestsPanel),
+            Some(Cmd::RunTests),
+            Some(Cmd::TestAtCaret),
+            Some(Cmd::Tasks),
+            Some(Cmd::LivePreview),
+            Some(Cmd::Response),
             Some(Cmd::Check),
             None,
             Some(Cmd::ToggleTerminal),
@@ -506,7 +753,31 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::ClearTerminal),
         ],
     ),
-    ("Help", &[Some(Cmd::Shortcuts), Some(Cmd::Commands)]),
+    (
+        "Git",
+        &[
+            Some(Cmd::SourceControl),
+            Some(Cmd::Branches),
+            None,
+            Some(Cmd::Diff),
+            Some(Cmd::Blame),
+            Some(Cmd::History),
+            None,
+            Some(Cmd::GitLog),
+            Some(Cmd::Stash),
+            Some(Cmd::StashPop),
+            None,
+            Some(Cmd::Merge),
+            Some(Cmd::Rebase),
+            Some(Cmd::AcceptOurs),
+            Some(Cmd::AcceptTheirs),
+            Some(Cmd::AcceptBoth),
+        ],
+    ),
+    (
+        "Help",
+        &[Some(Cmd::Shortcuts), Some(Cmd::Keymap), Some(Cmd::Commands)],
+    ),
 ];
 
 /// The right-click menu of the editor.
@@ -521,6 +792,7 @@ const EDITOR_MENU: &[Option<Cmd>] = &[
     Some(Cmd::Rename),
     None,
     Some(Cmd::Reformat),
+    Some(Cmd::QuickFix),
     Some(Cmd::ToggleComment),
     Some(Cmd::Find),
     None,
@@ -597,6 +869,29 @@ struct Tab {
     grown: Vec<Range<usize>>,
     /// When it was last in front, by the clock of the app: the order of the recent files.
     used: u64,
+    /// The revision last seen by auto save, and when it appeared.
+    seen: (u64, f64),
+    /// Kept at the start of the tabs, and out of "close others".
+    pinned: bool,
+    /// The lines (from 0) the debugger stops on.
+    breakpoints: Vec<usize>,
+    /// What the language server writes in the lines, and the revision it was last asked
+    /// for: they stay as they are until it has answered about the text typed since.
+    hints: Vec<Hint>,
+    hints_at: Option<u64>,
+    /// The view of the other editor, when this file shows in both.
+    other: Option<Twin>,
+    /// `view` and `selection` are those of the second editor; `other` holds the first's.
+    in_second: bool,
+}
+
+/// A second view of a file: where it is scrolled, what it selects.
+struct Twin {
+    view: editor::View,
+    selection: Range<usize>,
+    grown: Vec<Range<usize>>,
+    /// The revision of the text this view last showed.
+    revision: u64,
 }
 
 impl Tab {
@@ -625,11 +920,51 @@ impl Tab {
             wrap: false,
             grown: Vec::new(),
             used: 0,
+            seen: (0, 0.0),
+            pinned: false,
+            breakpoints: Vec::new(),
+            hints: Vec::new(),
+            hints_at: None,
+            other: None,
+            in_second: false,
         }
     }
 
     fn editor_id(&self) -> Id {
-        Id::new(("editor", self.id))
+        if self.in_second {
+            Id::new(("editor", self.id, "second"))
+        } else {
+            Id::new(("editor", self.id))
+        }
+    }
+
+    /// Trade the view in use for the one of the other editor showing this file. A view
+    /// that never showed starts where this one is.
+    fn swap_views(&mut self, ctx: &Context) {
+        let other = self.other.get_or_insert_with(|| {
+            let mut view = editor::View::default();
+            view.scroll_to = Some(self.selection.start);
+            Twin {
+                view,
+                selection: self.selection.clone(),
+                grown: Vec::new(),
+                // Never shown: its caret is still to be placed.
+                revision: u64::MAX,
+            }
+        });
+        std::mem::swap(&mut self.view, &mut other.view);
+        std::mem::swap(&mut self.selection, &mut other.selection);
+        std::mem::swap(&mut self.grown, &mut other.grown);
+        let shown = std::mem::replace(&mut other.revision, self.revision);
+        self.in_second = !self.in_second;
+        if shown != self.revision {
+            // The text changed in the other editor: what this one pointed at may be gone.
+            let len = self.text.chars().count();
+            self.selection = self.selection.start.min(len)..self.selection.end.min(len);
+            self.view.extra.clear();
+            self.grown.clear();
+            editor::set_selection(ctx, self.editor_id(), &self.selection);
+        }
     }
 
     /// The text changed: derived data is stale, and it may differ from the file again.
@@ -668,6 +1003,9 @@ enum Side {
 enum Bottom {
     Problems,
     Todo,
+    Response,
+    Debug,
+    Tests,
     Terminal,
 }
 
@@ -677,7 +1015,7 @@ struct Find {
     open: bool,
     query: String,
     replace: String,
-    match_case: bool,
+    options: search::Options,
     /// Give the keyboard to the query field on the next frame.
     focus: bool,
     /// What `matches` was computed for.
@@ -721,6 +1059,8 @@ enum Pick {
     Command(&'static Spec),
     Line(usize),
     Symbol(Symbol),
+    /// A definition of the project, as the language server knows it.
+    Place(godcode_lsp::Named),
 }
 
 enum PromptKind {
@@ -770,6 +1110,41 @@ struct ShiftTaps {
     last: Option<f64>,
 }
 
+/// What a language server was asked, to know what to do with its answer.
+enum Asked {
+    /// The definition of what is at this char (the caret when `None`).
+    Definition(Option<usize>),
+    Documentation,
+    /// The documentation of the name starting at this char, the pointer resting on it.
+    Tip(usize),
+    Rename,
+    Format,
+    /// The usages of this word.
+    References(String),
+    /// The call written on this line.
+    Signature(usize),
+    /// The definitions of the project named like this.
+    Symbols(String),
+    Fixes,
+    /// What is written in the lines of a tab, as its text then was.
+    Hints {
+        tab: u64,
+        revision: u64,
+    },
+    /// The completions at a caret of a tab, as its text then was.
+    Completion {
+        tab: u64,
+        revision: u64,
+        caret: usize,
+    },
+}
+
+/// Something the project can run: what it is called, and the command.
+type Task = (String, String);
+
+/// A call being written: its line, its signature, the chars of the argument typed.
+type Call = (usize, String, Option<(usize, usize)>);
+
 /// What the menu of a tab asks for.
 #[derive(Clone, Copy)]
 enum TabAction {
@@ -778,6 +1153,7 @@ enum TabAction {
     CloseAll,
     CopyPath,
     Reveal,
+    Pin,
 }
 
 /// The changed lines of a tab: its id, the revision they are about, the lines.
@@ -845,6 +1221,103 @@ pub struct GodApp {
     shift: ShiftTaps,
     /// Counts the changes of the tab in front.
     clock: u64,
+    /// Markdown files show their rendered page beside their text.
+    preview: bool,
+    /// The blocks of the Markdown file in front, and what they were read from.
+    blocks: (u64, Vec<markdown::Placed>),
+    /// Where the preview drew each block: its line, its distance from the top of the page.
+    preview_starts: Vec<(f32, f32)>,
+    /// The line at the top of the editor, as of the last frame.
+    top_line: f32,
+    /// The whole file shows as a strip right of the editor.
+    minimap: bool,
+    /// The editor lays out only the lines in view: the new text field, still being tried.
+    lines_only: bool,
+    /// The lines that open the blocks stay in view above the code.
+    sticky: bool,
+    /// Files are written a moment after each change.
+    autosave: bool,
+    /// The language servers of the open files.
+    servers: Servers,
+    /// The requests they have not answered yet.
+    asked: std::collections::HashMap<u64, Asked>,
+    /// The problems they found, by file; bumped `diagnosed` tells when they changed.
+    diagnostics: std::collections::HashMap<PathBuf, Vec<Problem>>,
+    diagnosed: u64,
+    /// The documentation on show, as Markdown.
+    documentation: Option<Vec<markdown::Placed>>,
+    /// The name the pointer rests on: where it starts, since when, and whether its
+    /// documentation was asked for.
+    rest: Option<(usize, f64, bool)>,
+    pointer: egui::Pos2,
+    /// The documentation shown at the pointer, for the name starting at this char.
+    tip: Option<(usize, egui::Pos2, Vec<markdown::Placed>)>,
+    /// The fixes offered for the line of the caret, and the one chosen.
+    fixes: Option<(Vec<godcode_lsp::Action>, usize)>,
+    /// The call being written: its line, its signature, the chars of the argument typed.
+    signature: Option<Call>,
+    /// The foot of the caret on screen.
+    caret_pos: Option<egui::Pos2>,
+    /// The definitions of the project last asked for by name, and that name.
+    project_symbols: Vec<godcode_lsp::Named>,
+    symbols_asked: String,
+    /// The completions of the language server last offered: one picked may add an import.
+    served: Vec<godcode_lsp::Item>,
+    /// The tab of the editor on the left, of the one on the right when the view is
+    /// split, and which of the two has the keyboard.
+    left: u64,
+    right: Option<u64>,
+    right_front: bool,
+    /// Both editors show the same file, on purpose.
+    twin: bool,
+    /// The branches to pick from, what was typed to narrow them, the one chosen.
+    branches: Option<(Vec<String>, String, usize)>,
+    /// A file compared with its last commit: its name and the rows.
+    diff: Option<(String, Vec<git::Row>)>,
+    /// Who last changed each line shows after the line of the caret.
+    blame: bool,
+    blamed: (u64, Vec<git::Blame>),
+    note: Option<String>,
+    /// The saved versions of the file in front to pick from, and the one chosen.
+    versions: Option<(Vec<(String, PathBuf)>, usize)>,
+    /// The window had the keyboard at the last frame.
+    was_focused: bool,
+    /// The colour scheme, by its place in the list.
+    scheme: usize,
+    /// The schemes to pick from are shown, and the one chosen.
+    themes: Option<usize>,
+    /// Only the code shows: no bars, no panels.
+    zen: bool,
+    /// What the project can run, what was typed to narrow it, the task chosen.
+    tasks: Option<(Vec<Task>, String, usize)>,
+    /// The commits to pick from, what was typed to narrow them, the one chosen.
+    log: Option<(Vec<String>, String, usize)>,
+    /// The snippets of the user, by language.
+    snippets: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// What the last HTTP request answered, and the answer still awaited.
+    response: String,
+    requesting: Option<Receiver<Result<String, String>>>,
+    /// The program being debugged, and whether it is stopped.
+    debug: Option<godcode_lsp::dap::Session>,
+    debug_stopped: bool,
+    /// Where it is stopped: the calls, the variables of one of them, the file and line.
+    frames: Vec<godcode_lsp::dap::Frame>,
+    variables: Vec<(String, String)>,
+    debug_at: Option<(PathBuf, usize)>,
+    /// What it printed.
+    debug_output: String,
+    /// The folder served to the browser, pages reloading at each save.
+    live: Option<crate::live::Live>,
+    /// The project templates are shown, and the one chosen.
+    templates: Option<usize>,
+    /// The shortcuts of the user: they win over the built-in ones.
+    keymap: Vec<(Modifiers, Key, Cmd)>,
+    /// The second editor is below the first rather than beside it.
+    split_down: bool,
+    /// The tests of the file in front, and what they were found in.
+    tests: (u64, Vec<(usize, String)>),
+    /// What picking a branch does: switch to it, merge it, rebase onto it.
+    branch_action: Cmd,
 }
 
 impl GodApp {
@@ -857,7 +1330,13 @@ impl GodApp {
             .map_or(1.0, |zoom| {
                 zoom.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
             });
-        theme::install(&cc.egui_ctx, dark);
+        // The scheme last chosen; before there were schemes, dark or light.
+        let scheme = get("scheme")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|index| *index < theme::SCHEMES.len())
+            .unwrap_or(usize::from(!dark));
+        let dark = theme::SCHEMES[scheme].dark;
+        theme::install(&cc.egui_ctx, scheme);
         widgets::install_icons(&cc.egui_ctx);
         let mut app = Self {
             tabs: Vec::new(),
@@ -909,7 +1388,77 @@ impl GodApp {
             todos_incoming: None,
             shift: ShiftTaps::default(),
             clock: 0,
+            preview: get("preview").is_none_or(|value| value == "1"),
+            blocks: (0, Vec::new()),
+            preview_starts: Vec::new(),
+            top_line: 0.0,
+            minimap: get("minimap").is_none_or(|value| value == "1"),
+            lines_only: get("lines_only").is_some_and(|value| value == "1"),
+            sticky: get("sticky").is_none_or(|value| value == "1"),
+            autosave: get("autosave").is_some_and(|value| value == "1"),
+            servers: Servers::default(),
+            asked: std::collections::HashMap::new(),
+            diagnostics: std::collections::HashMap::new(),
+            diagnosed: 0,
+            documentation: None,
+            rest: None,
+            pointer: egui::Pos2::ZERO,
+            tip: None,
+            fixes: None,
+            signature: None,
+            caret_pos: None,
+            project_symbols: Vec::new(),
+            symbols_asked: String::new(),
+            served: Vec::new(),
+            left: 0,
+            right: None,
+            right_front: false,
+            twin: false,
+            branches: None,
+            diff: None,
+            blame: get("blame").is_some_and(|value| value == "1"),
+            blamed: (0, Vec::new()),
+            note: None,
+            versions: None,
+            was_focused: false,
+            scheme,
+            themes: None,
+            zen: false,
+            tasks: None,
+            log: None,
+            snippets: load_snippets(),
+            response: String::new(),
+            requesting: None,
+            debug: None,
+            debug_stopped: false,
+            frames: Vec::new(),
+            variables: Vec::new(),
+            debug_at: None,
+            debug_output: String::new(),
+            live: None,
+            templates: None,
+            keymap: load_keymap(),
+            split_down: false,
+            tests: (0, Vec::new()),
+            branch_action: Cmd::Branches,
         };
+        if paths.is_empty() {
+            // Nothing was asked for: back to where the last session was left.
+            let folder = get("session_folder").map(PathBuf::from);
+            if let Some(folder) = folder.filter(|folder| folder.is_dir()) {
+                app.open_folder(&cc.egui_ctx, folder);
+            }
+            let files = get("session_files").unwrap_or_default();
+            for file in files.lines().map(Path::new).filter(|file| file.is_file()) {
+                app.open_file(&cc.egui_ctx, file);
+            }
+            let front = get("session_front").map(PathBuf::from);
+            let front = front.and_then(|front| {
+                let is_front = |tab: &Tab| tab.path.as_deref() == Some(front.as_path());
+                app.tabs.iter().position(is_front)
+            });
+            app.active = front.unwrap_or(app.active);
+        }
         for path in paths {
             app.open_path(&cc.egui_ctx, &path);
         }
@@ -1028,17 +1577,16 @@ impl GodApp {
         // The caret starts at the top, not where the text field would put it.
         let tab = &mut self.tabs[self.active];
         editor::set_selection(ctx, tab.editor_id(), &(0..0));
-        // A minified file is one endless line: wrapped, it can at least be read.
+        // A minified file is one endless line running off the view: say what helps.
         if !tab.wrap && format::longest_line(&tab.text) > LONG_LINE {
-            tab.wrap = true;
-            let hint = if format::restructures(tab.language) {
-                ". Ctrl+Alt+L reformats it."
+            let help = if format::restructures(tab.language) {
+                "Ctrl+Alt+L reformats it, Alt+Z wraps it"
             } else {
-                "."
+                "Alt+Z wraps them"
             };
             let name = &tab.name;
             self.toasts
-                .success(format!("{name} has very long lines: soft wrap is on{hint}"));
+                .success(format!("{name} has very long lines. {help}."));
         }
         self.refresh_diff(ctx, self.active);
         ctx.request_repaint();
@@ -1089,12 +1637,25 @@ impl GodApp {
             self.toasts.error(err);
             return false;
         }
+        keep_version(&path, &bytes);
+        if let Some(live) = &self.live {
+            live.changed();
+        }
+        if snippets_file().as_deref() == Some(path.as_path()) {
+            self.snippets = load_snippets();
+        }
+        if settings_file("keymap.json").as_deref() == Some(path.as_path()) {
+            self.keymap = load_keymap();
+        }
         let tab = &mut self.tabs[index];
         tab.saved = hash_of(&tab.text);
         tab.dirty = false;
         if tab.path.as_deref() != Some(path.as_path()) {
             tab.set_path(path);
             self.files_changed(ctx);
+        }
+        if let Some(path) = &self.tabs[index].path {
+            self.servers.saved(path);
         }
         // What is on disk is what the compiler sees: look for problems now.
         self.start_check(ctx, index, false);
@@ -1113,6 +1674,10 @@ impl GodApp {
 
     fn close_tab(&mut self, ctx: &Context, index: usize) {
         let tab = self.tabs.remove(index);
+        if let Some(path) = &tab.path {
+            self.servers.closed(path);
+            self.diagnostics.remove(path);
+        }
         // Drop the undo history kept with the text field.
         TextEdit::store_state(ctx, tab.editor_id(), Default::default());
         if self.active > index || self.active >= self.tabs.len() {
@@ -1138,9 +1703,9 @@ impl GodApp {
             find.key = None;
             return;
         };
-        let key = hash_of((tab.id, tab.revision, &find.query, find.match_case));
+        let key = hash_of((tab.id, tab.revision, &find.query, find.options));
         if find.key != Some(key) {
-            find.matches = search::find(&tab.text, &find.query, find.match_case);
+            find.matches = search::find_with(&tab.text, &find.query, find.options);
             find.key = Some(key);
         }
     }
@@ -1191,8 +1756,15 @@ impl GodApp {
         {
             let start = godcode_core::byte_index(&tab.text, tab.selection.start);
             let end = godcode_core::byte_index(&tab.text, tab.selection.end);
-            tab.text.replace_range(start..end, &self.find.replace);
-            let caret = tab.selection.start + self.find.replace.chars().count();
+            let find = &self.find;
+            let with = search::expand(
+                &tab.text[start..end],
+                &find.query,
+                &find.replace,
+                find.options,
+            );
+            tab.text.replace_range(start..end, &with);
+            let caret = tab.selection.start + with.chars().count();
             tab.touched();
             tab.select(ctx, caret..caret);
         }
@@ -1205,7 +1777,7 @@ impl GodApp {
             return;
         };
         let (text, count) =
-            search::replace_all(&tab.text, &find.query, &find.replace, find.match_case);
+            search::replace_all_with(&tab.text, &find.query, &find.replace, find.options);
         if count > 0 {
             tab.text = text;
             tab.touched();
@@ -1274,6 +1846,14 @@ impl GodApp {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        // A language server already reports the problems of this file as it is typed.
+        let served = tab
+            .path
+            .as_deref()
+            .is_some_and(|path| self.servers.serves(path));
+        if served && !manual {
+            return;
+        }
         let checker = tab
             .path
             .as_deref()
@@ -1302,6 +1882,12 @@ impl GodApp {
 
     /// Collect what the background threads produced.
     fn poll(&mut self) {
+        if let Some(receiver) = &self.requesting
+            && let Ok(answer) = receiver.try_recv()
+        {
+            self.requesting = None;
+            self.response = answer.unwrap_or_else(|err| format!("The request failed: {err}"));
+        }
         if let Some(receiver) = &self.indexing
             && let Ok(index) = receiver.try_recv()
         {
@@ -1403,7 +1989,7 @@ impl GodApp {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        let key = hash_of((tab.revision, self.reports_version));
+        let key = hash_of((tab.revision, self.reports_version, self.diagnosed));
         if tab.checked == Some(key) {
             return;
         }
@@ -1415,10 +2001,13 @@ impl GodApp {
             .iter()
             .filter(|(path, _)| fresh && tab.path.as_deref() == Some(path.as_path()))
             .map(|(_, problem)| problem);
+        let path = tab.path.as_deref();
+        let served = path.and_then(|path| self.diagnostics.get(path));
         tab.squiggles = tab
             .problems
             .iter()
             .chain(reported)
+            .chain(served.into_iter().flatten())
             .map(|problem| squiggle(&tab.text, problem))
             .collect();
     }
@@ -1441,7 +2030,11 @@ impl GodApp {
                     .is_none_or(|tab| tab.reports_at == Some(tab.revision))
             })
             .map(|(path, problem)| (Some(path.clone()), problem.clone()));
-        live.chain(reported).collect()
+        let served = self.diagnostics.iter().flat_map(|(path, list)| {
+            list.iter()
+                .map(move |problem| (Some(path.clone()), problem.clone()))
+        });
+        live.chain(reported).chain(served).collect()
     }
 
     fn open_problem(&mut self, ctx: &Context, path: Option<&Path>, problem: &Problem) {
@@ -1511,6 +2104,10 @@ impl GodApp {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        if tab.language.name == "HTTP" {
+            self.send_request(ctx);
+            return;
+        }
         if (tab.dirty || tab.path.is_none()) && !self.save_tab(ctx, self.active, false) {
             return;
         }
@@ -1617,6 +2214,22 @@ impl GodApp {
         if new.is_empty() || new == old {
             return;
         }
+        // The language server renames what the name means, in every file; without one,
+        // the word is replaced in this file.
+        let place = tab.path.clone().map(|path| {
+            let (line, column) = servers::position(&tab.text, tab.selection.start);
+            (path, line, column)
+        });
+        self.sync_server(ctx);
+        if let Some((path, line, column)) = place
+            && let Some(id) = self.servers.rename(&path, line, column, new)
+        {
+            self.asked.insert(id, Asked::Rename);
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         let (text, count) = search::rename_word(&tab.text, old, new);
         if count > 0 {
             tab.text = text;
@@ -1661,7 +2274,11 @@ impl GodApp {
                 .inner_margin(Margin::symmetric(10, 0))
                 .show(ui, |ui| {
                     let branch = repo.branch.as_deref().unwrap_or("no branch");
-                    ui.label(format!("{} {branch}", icon::GIT_BRANCH));
+                    let label = format!("{} {branch}", icon::GIT_BRANCH);
+                    let pick = ui.button(label).on_hover_text("Switch or create a branch");
+                    if pick.clicked() {
+                        self.pending.push(Cmd::Branches);
+                    }
                     ui.add_space(4.0);
                     ui.add(
                         TextEdit::multiline(&mut self.commit_message)
@@ -1733,6 +2350,1317 @@ impl GodApp {
         }
         if let Some(path) = open {
             self.open_file(&ctx, &root.join(path));
+        }
+    }
+
+    /// Tell the language server of the file in front what its text is now.
+    fn sync_server(&mut self, ctx: &Context) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(path) = tab.path.as_deref() else {
+            return;
+        };
+        // The project is the open folder, or for a lone file the folder it is in.
+        let folder = self.explorer.as_ref().map(Explorer::root);
+        let root = folder
+            .filter(|root| path.starts_with(root))
+            .or(path.parent())
+            .unwrap_or(path);
+        self.servers
+            .sync(ctx, root, path, tab.language.name, &tab.text, tab.revision);
+    }
+
+    /// Ask the language server what it writes in the lines of the file in front, once for
+    /// each state of its text. Only the field that lays out the lines in view shows it.
+    fn ask_hints(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active).filter(|_| self.lines_only) else {
+            return;
+        };
+        if tab.hints_at == Some(tab.revision) {
+            return;
+        }
+        let Some(path) = tab.path.as_deref() else {
+            return;
+        };
+        if let Some(asked) = self.servers.hints(path, &tab.text, tab.revision) {
+            tab.hints_at = Some(tab.revision);
+            let (tab, revision) = (tab.id, tab.revision);
+            self.asked.insert(asked, Asked::Hints { tab, revision });
+        }
+    }
+
+    /// Take in what the language servers answered.
+    fn poll_servers(&mut self, ctx: &Context) {
+        for event in self.servers.poll() {
+            match event {
+                ServerEvent::Diagnostics { path, list } => {
+                    let tab = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.path.as_deref() == Some(&*path));
+                    let problems = list.into_iter().map(|found| Problem {
+                        line: found.line,
+                        // Counted in chars here, in UTF-16 units there.
+                        column: tab.map_or(found.column, |tab| {
+                            servers::index_of(&tab.text, found.line, found.column).1
+                        }),
+                        severity: if found.error {
+                            Severity::Error
+                        } else {
+                            Severity::Warning
+                        },
+                        message: found.message,
+                    });
+                    self.diagnostics.insert(path, problems.collect());
+                    self.diagnosed += 1;
+                }
+                ServerEvent::Hover { id, text } => {
+                    let asked = self.asked.remove(&id);
+                    if let Some(Asked::Tip(start)) = asked {
+                        // Shown only if the pointer still rests on that name.
+                        let resting = self.rest.is_some_and(|(name, ..)| name == start);
+                        if resting && !text.trim().is_empty() {
+                            self.tip = Some((start, self.pointer, markdown::blocks(&text)));
+                        }
+                        continue;
+                    }
+                    if asked.is_none() {
+                        continue;
+                    }
+                    if text.trim().is_empty() {
+                        self.toasts.error("No documentation here");
+                    } else {
+                        self.documentation = Some(markdown::blocks(&text));
+                    }
+                }
+                ServerEvent::Definition { id, places } => {
+                    let Some(Asked::Definition(at)) = self.asked.remove(&id) else {
+                        continue;
+                    };
+                    let Some(place) = places.first() else {
+                        self.declaration_in_open_files(ctx, at);
+                        continue;
+                    };
+                    self.record_jump();
+                    if self.open_file(ctx, &place.path)
+                        && let Some(tab) = self.tabs.get_mut(self.active)
+                    {
+                        let start = servers::index_of(&tab.text, place.line, place.column).0;
+                        tab.select(ctx, start..start);
+                    }
+                }
+                ServerEvent::Completion { id, items } => {
+                    let Some(Asked::Completion {
+                        tab,
+                        revision,
+                        caret,
+                    }) = self.asked.remove(&id)
+                    else {
+                        continue;
+                    };
+                    // Asked for a text that has changed since: the next answer is the one.
+                    let current = self.tabs.iter_mut().find(|open| {
+                        open.id == tab
+                            && open.revision == revision
+                            && open.selection == (caret..caret)
+                    });
+                    let Some(tab) = current else {
+                        continue;
+                    };
+                    let start = complete::word_start(&tab.text, caret);
+                    let typed: String = tab.text.chars().skip(start).take(caret - start).collect();
+                    let typed = typed.to_lowercase();
+                    let offered = items
+                        .into_iter()
+                        .filter(|item| item.label.to_lowercase().starts_with(&typed))
+                        .filter(|item| item.label.len() > typed.len())
+                        .take(MAX_SERVED);
+                    self.served = offered.collect();
+                    let offered = self.served.iter().map(|item| complete::Completion {
+                        label: item.label.clone(),
+                        body: item.insert.clone(),
+                        kind: complete::Kind::Symbol,
+                    });
+                    tab.view.offer(caret, offered.collect());
+                }
+                ServerEvent::References { id, places } => {
+                    let Some(Asked::References(word)) = self.asked.remove(&id) else {
+                        continue;
+                    };
+                    let mut texts: std::collections::HashMap<PathBuf, String> = Default::default();
+                    let mut hits = Vec::with_capacity(places.len());
+                    for place in places {
+                        let text = texts
+                            .entry(place.path.clone())
+                            .or_insert_with(|| self.text_of(&place.path));
+                        let (start, column) = servers::index_of(text, place.line, place.column);
+                        let line = text.lines().nth(place.line).unwrap_or("");
+                        // The name found there: not always the one asked about.
+                        let named = text.chars().skip(start);
+                        let named = named.take_while(|ch| ch.is_alphanumeric() || *ch == '_');
+                        let len = match named.count() {
+                            0 => word.chars().count(),
+                            len => len,
+                        };
+                        hits.push(Hit {
+                            path: place.path,
+                            at: Match {
+                                start,
+                                len,
+                                line: place.line,
+                                column,
+                            },
+                            preview: line.trim().chars().take(200).collect(),
+                        });
+                    }
+                    hits.sort_by(|a, b| (&a.path, a.at.start).cmp(&(&b.path, b.at.start)));
+                    self.search.stop();
+                    self.search.hits = hits;
+                    self.search.query = word;
+                    self.search.done = true;
+                    self.side = Side::Search;
+                    self.sidebar = true;
+                }
+                ServerEvent::Edits { id, files } => {
+                    let asked = self.asked.remove(&id);
+                    let changed = self.apply_edits(ctx, &files);
+                    let plural = if changed == 1 { "" } else { "s" };
+                    match asked {
+                        Some(Asked::Rename) => self
+                            .toasts
+                            .success(format!("Renamed in {changed} file{plural}")),
+                        Some(Asked::Format) if changed == 0 => {
+                            self.toasts.success("Already formatted");
+                        }
+                        Some(Asked::Format) => self.toasts.success("Reformatted"),
+                        _ => {}
+                    }
+                }
+                ServerEvent::Actions { id, actions } => {
+                    if self.asked.remove(&id).is_none() {
+                        continue;
+                    }
+                    if actions.is_empty() {
+                        self.toasts.error("No quick fix on this line");
+                    } else {
+                        self.fixes = Some((actions, 0));
+                    }
+                }
+                ServerEvent::Signature { id, label, active } => {
+                    if let Some(Asked::Signature(line)) = self.asked.remove(&id) {
+                        self.signature = (!label.is_empty()).then_some((line, label, active));
+                    }
+                }
+                ServerEvent::Symbols { id, list } => {
+                    let fresh = matches!(
+                        self.asked.remove(&id),
+                        Some(Asked::Symbols(named)) if named == self.symbols_asked
+                    );
+                    if fresh {
+                        self.project_symbols = list;
+                    }
+                }
+                ServerEvent::Hints { id, list } => {
+                    let Some(Asked::Hints { tab, revision }) = self.asked.remove(&id) else {
+                        continue;
+                    };
+                    // Asked for a text that has changed since: the next answer is the one.
+                    let mut tabs = self.tabs.iter_mut();
+                    if let Some(tab) = tabs.find(|open| open.id == tab && open.revision == revision)
+                    {
+                        tab.hints = servers::placed(&tab.text, list);
+                    }
+                }
+                ServerEvent::Exited { .. } => {}
+            }
+        }
+    }
+
+    /// Which tab each editor shows: the tab in front goes to the editor that has the
+    /// keyboard, and an editor whose tab was closed goes away.
+    fn settle_panes(&mut self) {
+        let Some(front) = self.tabs.get(self.active).map(|tab| tab.id) else {
+            self.right = None;
+            return;
+        };
+        if self.twin && self.left == front && self.right == Some(front) {
+            // One file in both editors: the keyboard stays where it was put.
+            return;
+        }
+        self.twin = false;
+        if self.right == Some(front) {
+            self.right_front = true;
+        } else if self.left == front {
+            self.right_front = false;
+        } else if self.right_front && self.right.is_some() {
+            self.right = Some(front);
+        } else {
+            self.left = front;
+            self.right_front = false;
+        }
+        let open = |id: u64| self.tabs.iter().any(|tab| tab.id == id);
+        if self.right.is_some_and(|id| !open(id) || id == self.left) {
+            self.right = None;
+            self.right_front = false;
+        }
+        if !open(self.left) {
+            self.left = front;
+        }
+    }
+
+    /// Take the files changed on disk by something else (a branch switch, another
+    /// program) into their editors, unless they have unsaved changes.
+    fn reload_from_disk(&mut self, ctx: &Context) {
+        let mut reloaded = Vec::new();
+        let mut kept = Vec::new();
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let read = tab
+                .path
+                .as_deref()
+                .and_then(|path| std::fs::read(path).ok());
+            let Some(decoded) = read.and_then(|bytes| godcode_core::decode(&bytes)) else {
+                continue;
+            };
+            let on_disk = hash_of(&decoded.text);
+            if on_disk == tab.saved {
+                continue;
+            }
+            // Either way the file is told about once, not at every return to the window.
+            tab.saved = on_disk;
+            if tab.dirty {
+                kept.push(tab.name.clone());
+            } else {
+                tab.text = decoded.text;
+                tab.touched();
+                reloaded.push(index);
+            }
+        }
+        if !kept.is_empty() {
+            self.toasts.error(format!(
+                "{} changed on disk: your unsaved changes are kept here",
+                kept.join(", ")
+            ));
+        }
+        if !reloaded.is_empty() {
+            let plural = if reloaded.len() == 1 { "" } else { "s" };
+            self.toasts.success(format!(
+                "Reloaded {} file{plural} changed on disk",
+                reloaded.len()
+            ));
+        }
+        for index in reloaded {
+            self.refresh_diff(ctx, index);
+        }
+    }
+
+    /// Who last changed the line of the caret, when blame is on and the file is as saved.
+    fn refresh_blame(&mut self) {
+        self.note = None;
+        let Some(tab) = self.tabs.get(self.active).filter(|_| self.blame) else {
+            return;
+        };
+        let Some(path) = tab.path.as_deref() else {
+            return;
+        };
+        let key = hash_of((tab.id, tab.saved));
+        if self.blamed.0 != key {
+            let folder = path.parent().unwrap_or(path);
+            let file = path.display().to_string();
+            let printed = tools::git(folder, &["blame", "--line-porcelain", "--", &file]);
+            self.blamed = (key, git::parse_blame(&printed.unwrap_or_default()));
+        }
+        // Once edited, the lines no longer are where blame saw them.
+        let line = self.blamed.1.get(self.caret_line).filter(|_| !tab.dirty);
+        self.note = line.map(|line| format!("{}, {} · {}", line.author, line.date, line.summary));
+    }
+
+    /// Show the file in front beside what it was at the last commit.
+    fn compare_with_commit(&mut self, ctx: &Context) {
+        let index = self.active;
+        let dirty = self.tabs.get(index).is_some_and(|tab| tab.dirty);
+        // Git compares what is on disk.
+        if dirty && !self.save_tab(ctx, index, false) {
+            return;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(path) = tab.path.as_deref() else {
+            self.toasts.error("This file is not saved yet");
+            return;
+        };
+        let folder = path.parent().unwrap_or(path);
+        let file = path.display().to_string();
+        let args = ["diff", "--no-color", "-U1000000", "HEAD", "--", &file];
+        match tools::git(folder, &args).map(|printed| git::side_by_side(&printed, false)) {
+            Ok(rows) if rows.is_empty() => {
+                self.toasts.success("No change since the last commit");
+            }
+            Ok(rows) => self.diff = Some((format!("{}: last commit  |  now", tab.name), rows)),
+            Err(err) => self.toasts.error(err),
+        }
+    }
+
+    /// The comparison asked for, the old lines on the left and the new ones on the right.
+    fn diff_window(&mut self, ctx: &Context) {
+        let Some((name, rows)) = &self.diff else {
+            return;
+        };
+        let palette = Palette::of_ctx(ctx);
+        let removed = Color32::from_rgba_unmultiplied(0xF1, 0x4C, 0x4C, 46);
+        let added = Color32::from_rgba_unmultiplied(0x58, 0xAC, 0x2C, 46);
+        let font = FontId::monospace(13.0);
+        let mut open = true;
+        egui::Window::new(name.as_str())
+            .id(Id::new("diff-window"))
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_size(vec2(1180.0, 640.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let height = 18.0;
+                let area = ScrollArea::vertical().auto_shrink(false);
+                area.show_rows(ui, height, rows.len(), |ui, range| {
+                    for row in &rows[range] {
+                        let size = vec2(ui.available_width(), height);
+                        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                        let half = rect.width() / 2.0;
+                        let changed = row.old.as_ref().map(|line| &line.1)
+                            != row.new.as_ref().map(|line| &line.1);
+                        let sides = [
+                            (&row.old, rect.min.x, removed),
+                            (&row.new, rect.min.x + half, added),
+                        ];
+                        for (side, left, tint) in sides {
+                            let cell = Rect::from_min_size(
+                                pos2(left, rect.min.y),
+                                vec2(half - 4.0, height),
+                            );
+                            let painter = ui.painter_at(cell);
+                            let Some((number, text)) = side else {
+                                painter.rect_filled(cell, 0.0, palette.surface);
+                                continue;
+                            };
+                            if changed {
+                                painter.rect_filled(cell, 0.0, tint);
+                            }
+                            let mid = cell.center().y;
+                            painter.text(
+                                pos2(left + 44.0, mid),
+                                Align2::RIGHT_CENTER,
+                                // A row numbered 0 is the name of a file.
+                                if *number > 0 {
+                                    number.to_string()
+                                } else {
+                                    String::new()
+                                },
+                                font.clone(),
+                                palette.text_dim,
+                            );
+                            painter.text(
+                                pos2(left + 56.0, mid),
+                                Align2::LEFT_CENTER,
+                                text,
+                                font.clone(),
+                                palette.text,
+                            );
+                        }
+                    }
+                });
+            });
+        if !open || ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.diff = None;
+        }
+    }
+
+    /// The branches of the folder: pick one to switch to it, type a new name to create it.
+    fn branches_dialog(&mut self, ctx: &Context) {
+        let Some((all, mut typed, mut selected)) = self.branches.take() else {
+            return;
+        };
+        let wanted = typed.trim().to_owned();
+        let narrowed = all
+            .iter()
+            .filter(|branch| branch.to_lowercase().contains(&wanted.to_lowercase()));
+        let mut rows: Vec<String> = narrowed.cloned().collect();
+        let action = self.branch_action;
+        let new = action == Cmd::Branches && !wanted.is_empty() && !all.contains(&wanted);
+        if new {
+            rows.push(format!("Create branch {wanted}"));
+        }
+        let Some(answer) = list_dialog(ctx, "Branches", &rows, &mut selected, Some(&mut typed))
+        else {
+            self.branches = Some((all, typed, selected));
+            return;
+        };
+        let (Some(row), Some(root)) = (answer, self.folder()) else {
+            return;
+        };
+        let create = new && row + 1 == rows.len();
+        let name = if create { wanted } else { rows[row].clone() };
+        let (done, said) = match action {
+            Cmd::Merge => (
+                tools::git(&root, &["merge", &name]),
+                format!("Merged {name}"),
+            ),
+            Cmd::Rebase => (
+                tools::git(&root, &["rebase", &name]),
+                format!("Rebased onto {name}"),
+            ),
+            _ if create => (
+                tools::git(&root, &["switch", "-c", &name]),
+                format!("On new branch {name}"),
+            ),
+            _ => (
+                tools::git(&root, &["switch", &name]),
+                format!("On branch {name}"),
+            ),
+        };
+        match done {
+            Ok(_) => self.toasts.success(said),
+            // A merge that stops on conflicts leaves its markers in the files.
+            Err(err) => self.toasts.error(format!(
+                "{err}. Conflicts are marked in the files: settle them from the Git menu."
+            )),
+        }
+        self.reload_from_disk(ctx);
+        self.files_changed(ctx);
+    }
+
+    /// The versions kept of the file in front: pick one to bring its text back.
+    fn versions_dialog(&mut self, ctx: &Context) {
+        let Some((versions, mut selected)) = self.versions.take() else {
+            return;
+        };
+        let rows: Vec<String> = versions.iter().map(|(label, _)| label.clone()).collect();
+        let Some(answer) = list_dialog(ctx, "Local history", &rows, &mut selected, None) else {
+            self.versions = Some((versions, selected));
+            return;
+        };
+        let Some((label, file)) = answer.and_then(|row| versions.get(row)) else {
+            return;
+        };
+        let read = std::fs::read(file).ok();
+        let decoded = read.and_then(|bytes| godcode_core::decode(&bytes));
+        match (decoded, self.tabs.get_mut(self.active)) {
+            (Some(decoded), Some(tab)) => {
+                tab.text = decoded.text;
+                tab.touched();
+                tab.select(ctx, 0..0);
+                // Not saved: Ctrl+Z, or closing without saving, takes it back.
+                self.toasts.success(format!("Text of {label} brought back"));
+            }
+            _ => self.toasts.error("This version cannot be read any more"),
+        }
+    }
+
+    /// The signature of the call being written, above the caret.
+    fn signature_window(&self, ctx: &Context) {
+        let (Some((_, label, active)), Some(caret)) = (&self.signature, self.caret_pos) else {
+            return;
+        };
+        let palette = Palette::of_ctx(ctx);
+        let font = FontId::monospace(self.font_size() * 0.93);
+        let mut job = LayoutJob::default();
+        let chars: Vec<char> = label.chars().collect();
+        let (from, to) = active.unwrap_or((0, 0));
+        let (from, to) = (
+            from.min(chars.len()),
+            to.min(chars.len()).max(from.min(chars.len())),
+        );
+        let parts = [(0..from, false), (from..to, true), (to..chars.len(), false)];
+        for (range, typed) in parts {
+            let text: String = chars[range].iter().collect();
+            let color = if typed {
+                palette.text
+            } else {
+                palette.text_dim
+            };
+            let mut format = egui::TextFormat::simple(font.clone(), color);
+            if typed {
+                format.underline = Stroke::new(1.0, palette.text);
+            }
+            job.append(&text, 0.0, format);
+        }
+        egui::Area::new(Id::new("signature"))
+            .order(egui::Order::Tooltip)
+            .pivot(Align2::LEFT_BOTTOM)
+            .fixed_pos(caret - vec2(0.0, self.font_size() * 1.6))
+            .show(ctx, |ui| {
+                Frame::popup(ui.style())
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| ui.label(job));
+            });
+    }
+
+    /// Set or remove the breakpoint of a line of tab `index`, and tell the debugger.
+    fn toggle_breakpoint(&mut self, index: usize, line: usize) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            toggle_breakpoint_of(tab, &mut self.debug, line);
+        }
+    }
+
+    /// The program runs again: nothing to show of where it was.
+    fn debug_running(&mut self) {
+        self.debug_stopped = false;
+        self.debug_at = None;
+        self.frames.clear();
+        self.variables.clear();
+    }
+
+    /// Run the file in front under the debugger of its language.
+    fn start_debug(&mut self, ctx: &Context) {
+        let index = self.active;
+        let unsaved = self
+            .tabs
+            .get(index)
+            .is_some_and(|tab| tab.dirty || tab.path.is_none());
+        if unsaved && !self.save_tab(ctx, index, false) {
+            return;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(path) = tab.path.clone() else {
+            return;
+        };
+        let project = self.folder().filter(|root| path.starts_with(root));
+        let folder = project
+            .or_else(|| path.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let language = tab.language.name;
+        // The settings of the user for this language, else the built-in ones.
+        let configured = debug_settings(language, &path, &folder);
+        let (adapter, launch, install) = match (configured, language) {
+            (Some((adapter, launch)), _) => (
+                adapter,
+                launch,
+                "check the adapter named in the debug configurations",
+            ),
+            (None, "Python") => (
+                ["python", "-m", "debugpy.adapter"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                serde_json::json!({
+                    "request": "launch",
+                    "program": path,
+                    "cwd": folder,
+                    "console": "internalConsole",
+                    "justMyCode": true,
+                }),
+                "pip install debugpy",
+            ),
+            (None, other) => {
+                self.toasts.error(format!(
+                    "No debugger is set for {other}: add one with \"Edit Debug Configurations\""
+                ));
+                return;
+            }
+        };
+        let Some((program, args)) = adapter.split_first() else {
+            return;
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let breakpoints = self.tabs.iter().filter_map(|tab| {
+            let lines = tab.breakpoints.clone();
+            Some((tab.path.clone()?, lines)).filter(|(_, lines)| !lines.is_empty())
+        });
+        let wake = ctx.clone();
+        let wake = move || wake.request_repaint();
+        match godcode_lsp::dap::Session::start(program, &args, launch, breakpoints.collect(), wake)
+        {
+            Ok(session) => {
+                self.debug = Some(session);
+                self.debug_running();
+                self.debug_output.clear();
+                self.bottom = Some(Bottom::Debug);
+            }
+            Err(err) => self.toasts.error(format!(
+                "Cannot start the debugger ({err}). To get it: {install}"
+            )),
+        }
+    }
+
+    /// Take in what the debugger said.
+    fn poll_debug(&mut self, ctx: &Context) {
+        use godcode_lsp::dap::Event;
+        let Some(session) = &mut self.debug else {
+            return;
+        };
+        for event in session.poll() {
+            match event {
+                Event::Stopped { .. } => {
+                    self.debug_stopped = true;
+                    self.bottom = Some(Bottom::Debug);
+                }
+                Event::Running => self.debug_running(),
+                Event::Stack(frames) => {
+                    // The innermost call of a file that can be shown is where the eye goes.
+                    let shown = frames
+                        .iter()
+                        .find_map(|frame| Some((frame.path.clone()?, frame.line)));
+                    self.frames = frames;
+                    if let Some((path, line)) = shown {
+                        if self.open_file(ctx, &path)
+                            && let Some(tab) = self.tabs.get_mut(self.active)
+                        {
+                            let start = godcode_core::line_start(&tab.text, line + 1);
+                            tab.select(ctx, start..start);
+                        }
+                        self.debug_at = Some((path, line));
+                    }
+                }
+                Event::Variables(variables) => self.variables = variables,
+                Event::Output(printed) => self.debug_output.push_str(&printed),
+                Event::Ended => {
+                    // Having said nothing at all, it never started.
+                    if self.debug_output.is_empty() && self.frames.is_empty() {
+                        self.debug_output
+                            .push_str("The debugger ended at once. Is debugpy installed? pip install debugpy\n");
+                    }
+                    self.debug = None;
+                    self.debug_running();
+                    self.debug_output.push_str("\n[ended]\n");
+                    return;
+                }
+                Event::Failed(why) => {
+                    self.toasts.error(format!("The debugger refused: {why}"));
+                    self.debug = None;
+                    self.debug_running();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The debugger: the calls, the variables of the one chosen, what the program printed.
+    fn debug_panel(&mut self, ui: &mut Ui) {
+        let palette = Palette::of(ui);
+        let state = match (&self.debug, self.debug_stopped) {
+            (None, _) => {
+                "No program is being debugged. Ctrl+F5 debugs the file in front; \
+                          click a line number to stop there."
+            }
+            (Some(_), true) => "Stopped.",
+            (Some(_), false) => "Running…",
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(RichText::new(state).size(12.0).color(palette.text_dim));
+        });
+        ui.add_space(4.0);
+        let mut inspect = None;
+        ui.columns(3, |columns| {
+            let titled = |ui: &mut Ui, title: &str| {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(title)
+                            .size(11.0)
+                            .strong()
+                            .color(palette.text_dim),
+                    );
+                });
+            };
+            titled(&mut columns[0], "CALL STACK");
+            ScrollArea::vertical()
+                .id_salt("debug-stack")
+                .auto_shrink(false)
+                .show(&mut columns[0], |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for frame in &self.frames {
+                        let file = frame.path.as_deref().map(file_name).unwrap_or_default();
+                        let label = format!("{}    {file}:{}", frame.name, frame.line + 1);
+                        if list_row(ui, &palette, &label, 10.0, palette.text).clicked() {
+                            inspect = Some(frame.clone());
+                        }
+                    }
+                });
+            titled(&mut columns[1], "VARIABLES");
+            ScrollArea::vertical()
+                .id_salt("debug-variables")
+                .auto_shrink(false)
+                .show(&mut columns[1], |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (name, value) in &self.variables {
+                        let label = format!("{name} = {value}");
+                        list_row(ui, &palette, &label, 10.0, palette.text).on_hover_text(value);
+                    }
+                });
+            titled(&mut columns[2], "OUTPUT");
+            ScrollArea::vertical()
+                .id_salt("debug-output")
+                .auto_shrink(false)
+                .stick_to_bottom(true)
+                .show(&mut columns[2], |ui| {
+                    let text = RichText::new(&self.debug_output).monospace().size(12.5);
+                    ui.add(egui::Label::new(text).selectable(true));
+                });
+        });
+        // A call of the stack is looked at: its line shows, its variables are asked for.
+        let Some(frame) = inspect else {
+            return;
+        };
+        if let Some(session) = &mut self.debug {
+            session.inspect(frame.id);
+        }
+        if let Some(path) = frame.path {
+            let ctx = ui.ctx().clone();
+            if self.open_file(&ctx, &path)
+                && let Some(tab) = self.tabs.get_mut(self.active)
+            {
+                let start = godcode_core::line_start(&tab.text, frame.line + 1);
+                tab.select(&ctx, start..start);
+            }
+            self.debug_at = Some((path, frame.line));
+        }
+    }
+
+    /// Open a settings file of the user, written with `example` the first time.
+    fn open_settings(&mut self, ctx: &Context, name: &str, example: &str) {
+        let Some(file) = settings_file(name) else {
+            self.toasts
+                .error("No place to keep settings on this system");
+            return;
+        };
+        if !file.exists() {
+            let folder = file.parent().unwrap_or(&file);
+            let _ = std::fs::create_dir_all(folder);
+            let _ = std::fs::write(&file, example);
+        }
+        self.open_file(ctx, &file);
+    }
+
+    /// The tests of the file in front: click one to run it.
+    fn tests_list(&mut self, ui: &mut Ui) {
+        let palette = Palette::of(ui);
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if self.tests.1.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                let none = "No test found in this file (Rust, Python, Go, JavaScript, TypeScript).";
+                ui.label(RichText::new(none).color(palette.text_dim));
+            });
+            return;
+        }
+        let mut run = None;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for (line, name) in &self.tests.1 {
+                let label = format!("{name}    line {}", line + 1);
+                let row = list_row(ui, &palette, &label, 30.0, palette.text);
+                ui.painter().text(
+                    pos2(row.rect.min.x + 10.0, row.rect.center().y),
+                    Align2::LEFT_CENTER,
+                    icon::PLAY,
+                    FontId::proportional(13.0),
+                    palette.text_dim,
+                );
+                if row.on_hover_text("Run this test").clicked() {
+                    run = Some(name.clone());
+                }
+            }
+        });
+        let command =
+            run.and_then(|name| tools::test_one(tab.language.name, tab.path.as_deref()?, &name));
+        if let Some(command) = command {
+            let ctx = ui.ctx().clone();
+            self.show_terminal(&ctx);
+            if let Some(terminal) = &mut self.terminal {
+                terminal.send(&command);
+            }
+        }
+    }
+
+    /// Show the file in front in the browser, served from this computer: it reloads by
+    /// itself at each save.
+    fn live_preview(&mut self, ctx: &Context) {
+        let index = self.active;
+        let unsaved = self
+            .tabs
+            .get(index)
+            .is_some_and(|tab| tab.dirty || tab.path.is_none());
+        if unsaved && !self.save_tab(ctx, index, false) {
+            return;
+        }
+        let Some(path) = self.tabs.get(index).and_then(|tab| tab.path.clone()) else {
+            return;
+        };
+        let beside = path.parent().map(Path::to_path_buf);
+        let root = self
+            .folder()
+            .filter(|root| path.starts_with(root))
+            .or(beside);
+        let Some(root) = root else {
+            return;
+        };
+        // One folder is served at a time: another one replaces it.
+        if self.live.as_ref().is_none_or(|live| live.root != root) {
+            match crate::live::Live::start(root) {
+                Ok(live) => self.live = Some(live),
+                Err(err) => {
+                    self.toasts.error(format!("Cannot serve the folder: {err}"));
+                    return;
+                }
+            }
+        }
+        let url = self.live.as_ref().and_then(|live| live.url_of(&path));
+        match url.map(|url| tools::open_in_browser(&url).map(|()| url)) {
+            Some(Ok(url)) => self.toasts.success(format!("Live preview at {url}")),
+            Some(Err(err)) => self.toasts.error(err),
+            None => {}
+        }
+    }
+
+    /// The projects to start from: pick one, then the folder to write it in.
+    fn templates_dialog(&mut self, ctx: &Context) {
+        let Some(mut selected) = self.templates.take() else {
+            return;
+        };
+        let rows: Vec<String> = tools::TEMPLATES
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        let Some(answer) = list_dialog(ctx, "New project", &rows, &mut selected, None) else {
+            self.templates = Some(selected);
+            return;
+        };
+        let Some((_, files)) = answer.and_then(|row| tools::TEMPLATES.get(row)) else {
+            return;
+        };
+        let Some(root) = platform::pick_folder(self.folder().as_deref()) else {
+            return;
+        };
+        // What is already there stays as it is.
+        let mut first = None;
+        for (name, content) in *files {
+            let file = root.join(name);
+            first.get_or_insert_with(|| file.clone());
+            if file.exists() {
+                continue;
+            }
+            let written = file.parent().map_or(Ok(()), std::fs::create_dir_all);
+            if let Err(err) = written.and_then(|()| std::fs::write(&file, content)) {
+                self.toasts.error(format!("Cannot write {name}: {err}"));
+                return;
+            }
+        }
+        self.open_folder(ctx, root);
+        if let Some(file) = first {
+            self.open_file(ctx, &file);
+        }
+    }
+
+    /// Switch to the colour scheme at `index`.
+    fn set_scheme(&mut self, ctx: &Context, index: usize) {
+        self.scheme = index.min(theme::SCHEMES.len() - 1);
+        self.dark = theme::SCHEMES[self.scheme].dark;
+        theme::apply(ctx, self.scheme);
+    }
+
+    /// The colour schemes: the one chosen shows at once, Escape keeps it.
+    fn themes_dialog(&mut self, ctx: &Context) {
+        let Some(mut selected) = self.themes.take() else {
+            return;
+        };
+        let rows: Vec<String> = theme::SCHEMES
+            .iter()
+            .map(|scheme| scheme.name.to_owned())
+            .collect();
+        let before = selected;
+        let answer = list_dialog(ctx, "Color theme", &rows, &mut selected, None);
+        // Moving in the list tries the scheme on.
+        if selected != before {
+            self.set_scheme(ctx, selected);
+        }
+        match answer {
+            None => self.themes = Some(selected),
+            Some(Some(row)) => self.set_scheme(ctx, row),
+            Some(None) => {}
+        }
+    }
+
+    /// Add a caret on the line above or below the carets there are, in the same column.
+    fn add_caret(&mut self, below: bool) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let carets = tab.view.extra.iter().copied().chain([tab.selection.start]);
+        let edge = if below { carets.max() } else { carets.min() };
+        let (line, column) = godcode_core::line_col(&tab.text, edge.unwrap_or(0));
+        let lines = tab.text.split('\n').count();
+        let target = if below { line + 1 } else { line - 1 };
+        if target == 0 || target > lines {
+            return;
+        }
+        let start = godcode_core::line_start(&tab.text, target);
+        let length = tab
+            .text
+            .chars()
+            .skip(start)
+            .take_while(|ch| *ch != '\n')
+            .count();
+        let caret = start + (column - 1).min(length);
+        if caret != tab.selection.start && !tab.view.extra.contains(&caret) {
+            tab.view.extra.push(caret);
+        }
+        tab.view.focus = true;
+    }
+
+    /// What the project can run: pick a task to run it in the terminal.
+    fn tasks_dialog(&mut self, ctx: &Context) {
+        let Some((all, mut typed, mut selected)) = self.tasks.take() else {
+            return;
+        };
+        let wanted = typed.to_lowercase();
+        let fits = |task: &&(String, String)| task.0.to_lowercase().contains(&wanted);
+        let shown: Vec<&(String, String)> = all.iter().filter(fits).collect();
+        let rows: Vec<String> = shown
+            .iter()
+            .map(|(name, command)| format!("{name}      {command}"))
+            .collect();
+        let answer = list_dialog(ctx, "Run task", &rows, &mut selected, Some(&mut typed));
+        let command = answer
+            .flatten()
+            .and_then(|row| Some(shown.get(row)?.1.clone()));
+        if answer.is_none() {
+            self.tasks = Some((all, typed, selected));
+        } else if let Some(command) = command {
+            self.show_terminal(ctx);
+            if let Some(terminal) = &mut self.terminal {
+                terminal.send(&command);
+            }
+        }
+    }
+
+    /// The commits of the folder: pick one to see what it changed.
+    fn log_dialog(&mut self, ctx: &Context) {
+        let Some((all, mut typed, mut selected)) = self.log.take() else {
+            return;
+        };
+        let wanted = typed.to_lowercase();
+        let fits = |commit: &&String| commit.to_lowercase().contains(&wanted);
+        let rows: Vec<String> = all.iter().filter(fits).cloned().collect();
+        let answer = list_dialog(ctx, "Git log", &rows, &mut selected, Some(&mut typed));
+        let Some(answer) = answer else {
+            self.log = Some((all, typed, selected));
+            return;
+        };
+        let hash =
+            answer.and_then(|row| Some(rows.get(row)?.split_whitespace().next()?.to_owned()));
+        let (Some(hash), Some(root)) = (hash, self.folder()) else {
+            return;
+        };
+        match tools::git(&root, &["show", "--no-color", "--format=", &hash]) {
+            Ok(printed) => {
+                let title = format!("Commit {hash}: before  |  after");
+                self.diff = Some((title, git::side_by_side(&printed, true)));
+            }
+            Err(err) => self.toasts.error(err),
+        }
+    }
+
+    /// Send the request written around the caret of a `.http` file.
+    fn send_request(&mut self, ctx: &Context) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(request) = godcode_core::http::request_at(&tab.text, self.caret_line) else {
+            self.toasts
+                .error("No request here: write a line such as GET https://example.com");
+            return;
+        };
+        let (sender, receiver) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // The window may be gone: nobody listens then.
+            let _ = sender.send(tools::send(&request));
+            ctx.request_repaint();
+        });
+        self.requesting = Some(receiver);
+        self.bottom = Some(Bottom::Response);
+    }
+
+    /// The text of the file at `path`: as edited when it is open, else as on disk.
+    fn text_of(&self, path: &Path) -> String {
+        let open = self
+            .tabs
+            .iter()
+            .find(|tab| tab.path.as_deref() == Some(path));
+        open.map(|tab| tab.text.clone())
+            .or_else(|| Some(godcode_core::decode(&std::fs::read(path).ok()?)?.text))
+            .unwrap_or_default()
+    }
+
+    /// Make the changes a language server asks for: in the editors of the open files, on
+    /// disk for the others. Returns how many files changed.
+    fn apply_edits(&mut self, ctx: &Context, files: &[godcode_lsp::FileEdits]) -> usize {
+        // All of it or nothing: half a change (code taken out of a file, not put in the
+        // other) is worse than none.
+        let is_open = |path: &Path| {
+            self.tabs
+                .iter()
+                .any(|tab| tab.path.as_deref() == Some(path))
+        };
+        let closed = files.iter().filter(|file| !is_open(&file.path));
+        if let Some(file) = closed
+            .into_iter()
+            .find(|file| text_on_disk(&file.path).is_none())
+        {
+            let name = file_name(&file.path);
+            self.toasts
+                .error(format!("Nothing changed: {name} cannot be read as text"));
+            return 0;
+        }
+        let mut changed = 0;
+        for file in files {
+            let path = file.path.as_path();
+            let open = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.path.as_deref() == Some(path));
+            if let Some(tab) = open {
+                let text = servers::rewritten(&tab.text, &file.edits);
+                if text != tab.text {
+                    // The caret stays on what it was on, lines added above or not.
+                    let caret = servers::moved(&tab.text, &file.edits, tab.selection.start);
+                    tab.text = text;
+                    tab.touched();
+                    tab.select(ctx, caret..caret);
+                    changed += 1;
+                }
+                continue;
+            }
+            let Some(decoded) = text_on_disk(path) else {
+                continue;
+            };
+            let text = servers::rewritten(&decoded.text, &file.edits);
+            let bytes = godcode_core::encode(&text, decoded.ending, decoded.bom);
+            if text != decoded.text {
+                match platform::write_atomic(path, &bytes) {
+                    Ok(()) => changed += 1,
+                    Err(err) => self.toasts.error(err),
+                }
+            }
+        }
+        changed
+    }
+
+    /// Ask the language server what can be fixed on the line of the caret.
+    fn ask_fixes(&mut self, ctx: &Context) {
+        self.sync_server(ctx);
+        let asked = self.tabs.get(self.active).and_then(|tab| {
+            let line = servers::position(&tab.text, tab.selection.start).0;
+            self.servers.actions(tab.path.as_deref()?, line)
+        });
+        match asked {
+            Some(id) => {
+                self.asked.insert(id, Asked::Fixes);
+            }
+            None => self.tell_server_state(ctx),
+        }
+    }
+
+    /// The fixes the language server offers: pick one to apply it.
+    fn fixes_dialog(&mut self, ctx: &Context) {
+        let Some((actions, mut selected)) = self.fixes.take() else {
+            return;
+        };
+        let (up, down, enter) = ctx.input_mut(|input| {
+            (
+                input.consume_key(Modifiers::NONE, Key::ArrowUp),
+                input.consume_key(Modifiers::NONE, Key::ArrowDown),
+                input.consume_key(Modifiers::NONE, Key::Enter),
+            )
+        });
+        selected = (selected + usize::from(down)).min(actions.len() - 1);
+        selected = selected.saturating_sub(usize::from(up));
+        let mut chosen = enter.then_some(selected);
+        let response = Modal::new(Id::new("quick-fixes")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading("Quick fixes");
+            ui.add_space(6.0);
+            for (index, action) in actions.iter().enumerate() {
+                let row = Button::selectable(
+                    index == selected,
+                    with_icon(icon::LIGHTBULB, &action.title),
+                )
+                .frame_when_inactive(index == selected)
+                .stroke(Stroke::NONE)
+                .wrap_mode(egui::TextWrapMode::Truncate)
+                .min_size(vec2(ui.available_width(), 28.0));
+                if ui.add(row).clicked() {
+                    chosen = Some(index);
+                }
+            }
+        });
+        match chosen.and_then(|index| actions.get(index)) {
+            Some(action) => {
+                self.apply_edits(ctx, &action.files);
+                // The rest is the server's to do, on the text as it now is.
+                self.sync_server(ctx);
+                let front = self.tabs.get(self.active);
+                if let Some(path) = front.and_then(|tab| tab.path.clone()) {
+                    self.servers.carry_out(&path, action);
+                }
+                self.toasts.success(action.title.clone());
+            }
+            None if !response.should_close() => self.fixes = Some((actions, selected)),
+            None => {}
+        }
+    }
+
+    /// Follow the pointer over the code: once it rests on a name, its documentation is
+    /// asked for, and dropped when the pointer leaves.
+    fn rest_pointer(&mut self, ctx: &Context, pointed: Option<(usize, egui::Pos2)>) {
+        let now = ctx.input(|input| input.time);
+        let is_word = |ch: &char| ch.is_alphanumeric() || *ch == '_';
+        let name = pointed.and_then(|(index, pointer)| {
+            let tab = self.tabs.get(self.active)?;
+            let start = complete::word_start(&tab.text, index);
+            let named = tab.text.chars().skip(start).take_while(is_word).count() > 0;
+            named.then_some((start, pointer))
+        });
+        let Some((start, pointer)) = name else {
+            self.rest = None;
+            self.tip = None;
+            return;
+        };
+        self.pointer = pointer;
+        match self.rest {
+            Some((name, since, false)) if name == start && now - since >= HOVER_DELAY => {
+                self.rest = Some((start, since, true));
+                self.sync_server(ctx);
+                let asked = self.tabs.get(self.active).and_then(|tab| {
+                    let (line, column) = servers::position(&tab.text, start);
+                    self.servers.hover(tab.path.as_deref()?, line, column)
+                });
+                if let Some(id) = asked {
+                    self.asked.insert(id, Asked::Tip(start));
+                }
+            }
+            Some((name, ..)) if name == start => {}
+            _ => {
+                self.rest = Some((start, now, false));
+                self.tip = None;
+            }
+        }
+        if matches!(self.rest, Some((_, _, false))) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(HOVER_DELAY));
+        }
+    }
+
+    /// The documentation of the name under the pointer, next to it.
+    fn tip_window(&self, ctx: &Context) {
+        let Some((_, pointer, blocks)) = &self.tip else {
+            return;
+        };
+        egui::Area::new(Id::new("code-tip"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(*pointer + vec2(12.0, 18.0))
+            .show(ctx, |ui| {
+                Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(520.0);
+                    preview::show(ui, blocks, self.zoom);
+                });
+            });
+    }
+
+    /// Ask the language server what is known about what the caret is on.
+    fn ask_documentation(&mut self, ctx: &Context) {
+        self.sync_server(ctx);
+        let asked = self.tabs.get(self.active).and_then(|tab| {
+            let path = tab.path.as_deref()?;
+            let (line, column) = servers::position(&tab.text, tab.selection.start);
+            self.servers.hover(path, line, column)
+        });
+        match asked {
+            Some(id) => {
+                self.asked.insert(id, Asked::Documentation);
+            }
+            None => self.tell_server_state(ctx),
+        }
+    }
+
+    /// Say which language server serves the file in front, or how to get one.
+    fn tell_server_state(&mut self, ctx: &Context) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let language = tab.language.name;
+        match self.servers.state(language) {
+            Some(servers::State::On(program)) => {
+                self.toasts
+                    .success(format!("{language} is served by {program}"));
+            }
+            Some(servers::State::Off(known, why)) if !why.is_empty() => {
+                self.toasts
+                    .error(format!("{} stopped: {why}", known.program));
+            }
+            Some(servers::State::Off(known, _)) => {
+                ctx.copy_text(known.install.to_owned());
+                self.toasts.error(format!(
+                    "{} is not running. To install it (copied): {}",
+                    known.program, known.install
+                ));
+            }
+            None => self
+                .toasts
+                .error(format!("No language server is known for {language}")),
+        }
+    }
+
+    /// The documentation the language server answered, in a window of its own.
+    fn documentation_window(&mut self, ctx: &Context) {
+        let Some(blocks) = &self.documentation else {
+            return;
+        };
+        let mut open = true;
+        let zoom = self.zoom;
+        egui::Window::new("Documentation")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, -60.0))
+            .default_width(560.0)
+            .default_height(320.0)
+            .vscroll(true)
+            .show(ctx, |ui| {
+                ui.set_width(ui.available_width());
+                preview::show(ui, blocks, zoom);
+            });
+        if !open || ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.documentation = None;
+        }
+    }
+
+    /// With auto save on, write the files left alone for a moment since their last change.
+    fn save_idle(&mut self, ctx: &Context) {
+        let now = ctx.input(|input| input.time);
+        let on = self.autosave;
+        let mut due = Vec::new();
+        let mut waiting = false;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.seen.0 != tab.revision {
+                tab.seen = (tab.revision, now);
+            }
+            if on && tab.dirty && tab.path.is_some() {
+                if now - tab.seen.1 >= AUTOSAVE_DELAY {
+                    due.push(index);
+                } else {
+                    waiting = true;
+                }
+            }
+        }
+        for index in due {
+            if !self.save_tab(ctx, index, false) {
+                // It said why once: no new attempt before the next change.
+                self.tabs[index].seen.1 = f64::INFINITY;
+            }
+        }
+        if waiting {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(AUTOSAVE_DELAY));
         }
     }
 
@@ -1812,6 +3740,23 @@ impl GodApp {
     /// file, then in the other open ones. Failing that, or from the definition itself, its
     /// usages are listed.
     fn go_to_declaration(&mut self, ctx: &Context, at: Option<usize>) {
+        // The language server knows best, across files; without one, the outline does.
+        self.sync_server(ctx);
+        if let Some(tab) = self.tabs.get(self.active)
+            && let Some(path) = tab.path.as_deref()
+        {
+            let (line, column) = servers::position(&tab.text, at.unwrap_or(tab.selection.start));
+            if let Some(id) = self.servers.definition(path, line, column) {
+                self.asked.insert(id, Asked::Definition(at));
+                return;
+            }
+        }
+        self.declaration_in_open_files(ctx, at);
+    }
+
+    /// [`Self::go_to_declaration`] without a language server: by the outline of the open
+    /// files.
+    fn declaration_in_open_files(&mut self, ctx: &Context, at: Option<usize>) {
         let Some(word) = self.word_at(at) else {
             return;
         };
@@ -1850,12 +3795,28 @@ impl GodApp {
     /// List where `word` (or the word at the caret) is written: in the files of the folder,
     /// or in the active file when no folder is open.
     fn find_usages(&mut self, ctx: &Context, word: Option<String>) {
+        let at_caret = word.is_none();
         let Some(word) = word.or_else(|| self.word_at(None)) else {
             return;
         };
+        // The language server knows what the name means; a search only knows how it is
+        // written.
+        self.sync_server(ctx);
+        let asked = self
+            .tabs
+            .get(self.active)
+            .filter(|_| at_caret)
+            .and_then(|tab| {
+                let (line, column) = servers::position(&tab.text, tab.selection.start);
+                self.servers.references(tab.path.as_deref()?, line, column)
+            });
+        if let Some(id) = asked {
+            self.asked.insert(id, Asked::References(word));
+            return;
+        }
         if self.explorer.is_none() {
             self.find.query = word;
-            self.find.match_case = true;
+            self.find.options.match_case = true;
             self.find.open = true;
             return;
         }
@@ -1868,6 +3829,18 @@ impl GodApp {
 
     /// Rebuild the line breaks and the indentation of the active file.
     fn reformat(&mut self, ctx: &Context) {
+        self.sync_server(ctx);
+        let asked = self.tabs.get(self.active).and_then(|tab| {
+            let (width, spaces) = match tab.indent {
+                Indent::Spaces(width) => (width, true),
+                Indent::Tabs => (4, false),
+            };
+            self.servers.format(tab.path.as_deref()?, width, spaces)
+        });
+        if let Some(id) = asked {
+            self.asked.insert(id, Asked::Format);
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1888,7 +3861,6 @@ impl GodApp {
         let before = tab.text.lines().count();
         tab.text = formatted;
         tab.indent = Indent::detect(&tab.text);
-        tab.wrap = self.wrap || format::longest_line(&tab.text) > LONG_LINE;
         tab.touched();
         let caret = godcode_core::line_start(&tab.text, line);
         tab.select(ctx, caret..caret);
@@ -1924,7 +3896,11 @@ impl GodApp {
     fn close_many(&mut self, ctx: &Context, wanted: impl Fn(usize) -> bool) {
         let front = self.tabs.get(self.active).map(|tab| tab.id);
         let mut kept = 0;
-        for index in (0..self.tabs.len()).rev().filter(|index| wanted(*index)) {
+        let targets = (0..self.tabs.len()).rev();
+        let targets: Vec<usize> = targets
+            .filter(|index| wanted(*index) && !self.tabs[*index].pinned)
+            .collect();
+        for index in targets {
             if self.tabs[index].dirty {
                 kept += 1;
             } else {
@@ -1963,6 +3939,9 @@ impl GodApp {
         let key = hash_of((tab.id, tab.revision, tab.language.name));
         if self.symbols.0 != key {
             self.symbols = (key, outline::symbols(&tab.text, tab.language));
+        }
+        if self.tests.0 != key {
+            self.tests = (key, outline::tests(&tab.text, tab.language));
         }
     }
 
@@ -2041,6 +4020,14 @@ impl GodApp {
             changes: &[],
             occurrences: &[],
             wrap: false,
+            minimap: false,
+            sticky: false,
+            note: None,
+            snippets: &[],
+            breakpoints: &[],
+            stopped: None,
+            lines_only: false,
+            hints: &[],
         };
         let id = tab.editor_id();
         if editor::run(ctx, id, &mut tab.text, &config, op) {
@@ -2176,11 +4163,89 @@ impl GodApp {
             Cmd::ZoomOut => self.set_zoom(self.zoom - 0.1),
             Cmd::ZoomReset => self.set_zoom(1.0),
             Cmd::ToggleTheme => {
-                self.dark = !self.dark;
-                theme::set_dark(ctx, self.dark);
+                // From a dark scheme to the light one, and back.
+                self.set_scheme(ctx, usize::from(self.dark));
             }
             Cmd::Home => self.home = !self.home,
+            // While a program is stopped under the debugger, running means going on.
+            Cmd::Run if self.debug_stopped && self.debug.is_some() => {
+                if let Some(session) = &mut self.debug {
+                    session.resume();
+                }
+                self.debug_running();
+            }
             Cmd::Run => self.run_file(ctx),
+            Cmd::Debug => self.start_debug(ctx),
+            Cmd::StopDebug => {
+                if let Some(session) = &mut self.debug {
+                    session.stop();
+                }
+            }
+            Cmd::StepOver | Cmd::StepInto | Cmd::StepOut => {
+                if let Some(session) = self.debug.as_mut().filter(|_| self.debug_stopped) {
+                    match cmd {
+                        Cmd::StepOver => session.step_over(),
+                        Cmd::StepInto => session.step_into(),
+                        _ => session.step_out(),
+                    }
+                    self.debug_running();
+                }
+            }
+            Cmd::Breakpoint => {
+                let line = self.caret_line;
+                self.toggle_breakpoint(self.active, line);
+            }
+            Cmd::LivePreview => self.live_preview(ctx),
+            Cmd::Keymap => {
+                let example = "{\n  \"Reformat Code\": \"Ctrl+Alt+L\",\n  \"Toggle Terminal\": \"Ctrl+J\"\n}\n";
+                self.open_settings(ctx, "keymap.json", example);
+            }
+            Cmd::DebugSettings => {
+                let example = "{\n  \"Rust\": {\n    \"adapter\": [\"lldb-dap\"],\n    \"launch\": {\n      \
+                               \"program\": \"${folder}/target/debug/app.exe\",\n      \"cwd\": \"${folder}\"\n    \
+                               }\n  }\n}\n";
+                self.open_settings(ctx, "debug.json", example);
+            }
+            Cmd::TestsPanel => {
+                let shown = self.bottom == Some(Bottom::Tests);
+                self.bottom = (!shown).then_some(Bottom::Tests);
+            }
+            Cmd::AcceptOurs | Cmd::AcceptTheirs | Cmd::AcceptBoth => {
+                let keep = match cmd {
+                    Cmd::AcceptOurs => git::Keep::Ours,
+                    Cmd::AcceptTheirs => git::Keep::Theirs,
+                    _ => git::Keep::Both,
+                };
+                let line = self.caret_line;
+                let settled = self.tabs.get_mut(self.active).and_then(|tab| {
+                    tab.text = git::resolve_conflict(&tab.text, line, keep)?;
+                    tab.touched();
+                    Some(())
+                });
+                if settled.is_none() {
+                    self.toasts.error("The caret is not in a conflict");
+                }
+            }
+            Cmd::TestAtCaret => {
+                let found = self.tabs.get(self.active).and_then(|tab| {
+                    let name = outline::test_at(&tab.text, tab.language, self.caret_line)?;
+                    tools::test_one(tab.language.name, tab.path.as_deref()?, &name)
+                });
+                match found {
+                    Some(command) => {
+                        self.show_terminal(ctx);
+                        if let Some(terminal) = &mut self.terminal {
+                            terminal.send(&command);
+                        }
+                    }
+                    None => self.toasts.error("No test around the caret"),
+                }
+            }
+            Cmd::NewProject => self.templates = Some(0),
+            Cmd::DebugPanel => {
+                let shown = self.bottom == Some(Bottom::Debug);
+                self.bottom = (!shown).then_some(Bottom::Debug);
+            }
             Cmd::Check => {
                 let index = self.active;
                 let dirty = self.tabs.get(index).is_some_and(|tab| tab.dirty);
@@ -2248,6 +4313,217 @@ impl GodApp {
                 self.close_many(ctx, |index| index != front);
             }
             Cmd::CloseAll => self.close_many(ctx, |_| true),
+            Cmd::Preview => self.preview = !self.preview,
+            Cmd::Minimap => self.minimap = !self.minimap,
+            Cmd::Fold | Cmd::UnfoldAll if !self.lines_only => {
+                self.toasts
+                    .error("Folding needs Fast Rendering: turn it on in the View menu");
+            }
+            Cmd::Fold | Cmd::UnfoldAll => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.view.fold_at_caret = cmd == Cmd::Fold;
+                    if cmd == Cmd::UnfoldAll {
+                        tab.view.folded.clear();
+                    }
+                }
+            }
+            Cmd::LinesOnly => {
+                self.lines_only = !self.lines_only;
+                self.toasts.success(if self.lines_only {
+                    "Fast rendering on: only the lines in view are laid out"
+                } else {
+                    "Fast rendering off"
+                });
+            }
+            Cmd::Documentation => self.ask_documentation(ctx),
+            Cmd::LanguageServer => self.tell_server_state(ctx),
+            Cmd::QuickFix => self.ask_fixes(ctx),
+            Cmd::Implementation => {
+                self.sync_server(ctx);
+                let asked = self.tabs.get(self.active).and_then(|tab| {
+                    let (line, column) = servers::position(&tab.text, tab.selection.start);
+                    self.servers
+                        .implementation(tab.path.as_deref()?, line, column)
+                });
+                match asked {
+                    Some(id) => {
+                        self.asked.insert(id, Asked::Definition(None));
+                    }
+                    None => self.tell_server_state(ctx),
+                }
+            }
+            Cmd::Callers | Cmd::Callees => {
+                self.sync_server(ctx);
+                let word = self.word_at(None);
+                let front = self.tabs.get(self.active).zip(word);
+                let asked = front.and_then(|(tab, word)| {
+                    let (line, column) = servers::position(&tab.text, tab.selection.start);
+                    let incoming = cmd == Cmd::Callers;
+                    let path = tab.path.as_deref()?;
+                    Some((self.servers.calls(path, line, column, incoming)?, word))
+                });
+                match asked {
+                    // Listed like usages: the calls for the callers, the definitions for
+                    // what is called.
+                    Some((id, word)) => {
+                        self.asked.insert(id, Asked::References(word));
+                    }
+                    None => self.tell_server_state(ctx),
+                }
+            }
+            Cmd::Split | Cmd::SplitDown | Cmd::SplitSame => {
+                self.split_down = cmd == Cmd::SplitDown;
+                let alone = self.tabs.len() == 1;
+                if self.right.is_some() && (self.twin || cmd != Cmd::SplitSame) {
+                    // Back to one editor: the one that had the keyboard stays.
+                    self.right = None;
+                    self.right_front = false;
+                    self.twin = false;
+                    self.left = self.tabs.get(self.active).map_or(0, |tab| tab.id);
+                } else if cmd == Cmd::SplitSame || alone {
+                    // The file in front, twice: each editor scrolls and selects on its own.
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.other = None;
+                        tab.view.focus = true;
+                        (self.left, self.right) = (tab.id, Some(tab.id));
+                        // The keyboard stays with the view it is in.
+                        self.right_front = tab.in_second;
+                        self.twin = true;
+                    }
+                } else {
+                    // The file used before this one goes to the right.
+                    let front = self.active;
+                    let others = self
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| *index != front);
+                    match others.max_by_key(|(_, tab)| tab.used) {
+                        Some((_, tab)) => self.right = Some(tab.id),
+                        None => self
+                            .toasts
+                            .error("Open another file to put beside this one"),
+                    }
+                }
+            }
+            Cmd::Branches | Cmd::Merge | Cmd::Rebase => {
+                self.branch_action = cmd;
+                let listed = self
+                    .folder()
+                    .map(|root| tools::git(&root, &["branch", "--format=%(refname:short)"]));
+                match listed {
+                    Some(Ok(printed)) => {
+                        let all = printed.lines().map(str::to_owned).collect();
+                        self.branches = Some((all, String::new(), 0));
+                    }
+                    Some(Err(err)) => self.toasts.error(err),
+                    None => self.toasts.error("Open a folder to see its branches"),
+                }
+            }
+            Cmd::Diff => self.compare_with_commit(ctx),
+            Cmd::Blame => self.blame = !self.blame,
+            Cmd::Themes => self.themes = Some(self.scheme),
+            Cmd::Zen => self.zen = !self.zen,
+            Cmd::CaretAbove => self.add_caret(false),
+            Cmd::CaretBelow => self.add_caret(true),
+            Cmd::Tasks => {
+                let beside = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|tab| Some(tab.path.as_deref()?.parent()?.to_path_buf()));
+                let tasks = self.folder().or(beside).map(|root| tools::tasks(&root));
+                match tasks.filter(|tasks| !tasks.is_empty()) {
+                    Some(tasks) => self.tasks = Some((tasks, String::new(), 0)),
+                    None => self.toasts.error(
+                        "No task found: they come from package.json, Cargo.toml, go.mod, Makefile",
+                    ),
+                }
+            }
+            Cmd::GitLog => {
+                let format = "--pretty=format:%h  %ad  %an  %s";
+                let listed = self
+                    .folder()
+                    .map(|root| tools::git(&root, &["log", format, "--date=short", "-n", "400"]));
+                match listed {
+                    Some(Ok(printed)) => {
+                        let commits = printed.lines().map(str::to_owned).collect();
+                        self.log = Some((commits, String::new(), 0));
+                    }
+                    Some(Err(err)) => self.toasts.error(err),
+                    None => self.toasts.error("Open a folder to see its commits"),
+                }
+            }
+            Cmd::Stash | Cmd::StashPop => {
+                let args: &[&str] = if cmd == Cmd::Stash {
+                    &["stash", "push", "--include-untracked"]
+                } else {
+                    &["stash", "pop"]
+                };
+                match self.folder().map(|root| tools::git(&root, args)) {
+                    Some(Ok(printed)) => {
+                        let said = printed.lines().next().unwrap_or("Done").to_owned();
+                        self.toasts.success(said);
+                        self.reload_from_disk(ctx);
+                        self.files_changed(ctx);
+                    }
+                    Some(Err(err)) => self.toasts.error(err),
+                    None => self.toasts.error("Open a folder first"),
+                }
+            }
+            Cmd::Snippets => match snippets_file() {
+                Some(file) => {
+                    if !file.exists() {
+                        let example = "{\n  \"JavaScript\": {\n    \"clg\": \"console.log($0);\"\n  },\n  \
+                                       \"Rust\": {\n    \"dbg\": \"dbg!($0);\"\n  }\n}\n";
+                        let folder = file.parent().unwrap_or(&file);
+                        let _ = std::fs::create_dir_all(folder);
+                        let _ = std::fs::write(&file, example);
+                    }
+                    self.open_file(ctx, &file);
+                }
+                None => self
+                    .toasts
+                    .error("No place to keep the snippets on this system"),
+            },
+            Cmd::Response => {
+                let shown = self.bottom == Some(Bottom::Response);
+                self.bottom = (!shown).then_some(Bottom::Response);
+            }
+            Cmd::History => {
+                let path = self.tabs.get(self.active).and_then(|tab| tab.path.clone());
+                let versions = path.as_deref().map(versions_of).unwrap_or_default();
+                if versions.is_empty() {
+                    self.toasts
+                        .error("No saved version of this file yet: one is kept at each save");
+                } else {
+                    self.versions = Some((versions, 0));
+                }
+            }
+            Cmd::RunTests => {
+                let beside = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|tab| Some(tab.path.as_deref()?.parent()?.to_path_buf()));
+                let command = self
+                    .folder()
+                    .or(beside)
+                    .and_then(|root| tools::test_command(&root));
+                match command {
+                    Some(command) => {
+                        self.show_terminal(ctx);
+                        if let Some(terminal) = &mut self.terminal {
+                            terminal.send(command);
+                        }
+                    }
+                    None => self.toasts.error("No tests are known for this project"),
+                }
+            }
+            Cmd::StickyScroll => self.sticky = !self.sticky,
+            Cmd::AutoSave => {
+                self.autosave = !self.autosave;
+                let state = if self.autosave { "on" } else { "off" };
+                self.toasts.success(format!("Auto save is {state}"));
+            }
             Cmd::Reveal | Cmd::CopyPath => {
                 let path = self.tabs.get(self.active).and_then(|tab| tab.path.clone());
                 match path {
@@ -2306,12 +4582,28 @@ impl GodApp {
         // More specific (shifted) shortcuts first.
         let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
         let table = [
+            (ctrl, Key::F5, Cmd::Debug),
+            (shift, Key::F10, Cmd::TestAtCaret),
+            (Modifiers::SHIFT, Key::F5, Cmd::StopDebug),
+            (Modifiers::SHIFT, Key::F11, Cmd::StepOut),
+            (Modifiers::NONE, Key::F11, Cmd::StepInto),
+            (Modifiers::NONE, Key::F10, Cmd::StepOver),
+            (Modifiers::NONE, Key::F9, Cmd::Breakpoint),
             (alt_shift, Key::ArrowRight, Cmd::ExpandSelection),
             (alt_shift, Key::ArrowLeft, Cmd::ShrinkSelection),
             (alt, Key::L, Cmd::Reformat),
             (alt, Key::ArrowLeft, Cmd::Back),
             (alt, Key::ArrowRight, Cmd::Forward),
             (Modifiers::ALT, Key::Z, Cmd::ToggleWrap),
+            (Modifiers::ALT, Key::Enter, Cmd::QuickFix),
+            (alt, Key::B, Cmd::Implementation),
+            (alt, Key::H, Cmd::Callers),
+            (alt, Key::Z, Cmd::Zen),
+            (alt, Key::ArrowUp, Cmd::CaretAbove),
+            (alt, Key::ArrowDown, Cmd::CaretBelow),
+            (shift, Key::R, Cmd::Tasks),
+            (shift, Key::T, Cmd::RunTests),
+            (ctrl, Key::Backslash, Cmd::Split),
             (Modifiers::ALT, Key::F7, Cmd::FindUsages),
             (Modifiers::ALT, Key::F1, Cmd::Reveal),
             (Modifiers::ALT, Key::F12, Cmd::ToggleTerminal),
@@ -2321,6 +4613,7 @@ impl GodApp {
             (shift, Key::J, Cmd::JoinLines),
             (shift, Key::U, Cmd::ToggleCase),
             (shift, Key::C, Cmd::CopyPath),
+            (shift, Key::V, Cmd::Preview),
             (shift, Key::N, Cmd::GoToFile),
             (shift, Key::A, Cmd::Commands),
             (shift, Key::S, Cmd::SaveAs),
@@ -2339,6 +4632,7 @@ impl GodApp {
             (ctrl, Key::Tab, Cmd::NextTab),
             (ctrl, Key::N, Cmd::NewFile),
             (ctrl, Key::E, Cmd::RecentFiles),
+            (ctrl, Key::Q, Cmd::Documentation),
             (ctrl, Key::O, Cmd::OpenFile),
             (ctrl, Key::S, Cmd::Save),
             (ctrl, Key::W, Cmd::CloseTab),
@@ -2368,8 +4662,10 @@ impl GodApp {
             (Modifiers::NONE, Key::F2, Cmd::Rename),
             (Modifiers::NONE, Key::F12, Cmd::Declaration),
         ];
+        let own = self.keymap.clone();
         ctx.input_mut(|input| {
-            for (modifiers, key, cmd) in table {
+            // The shortcuts of the user first: they win over the built-in ones.
+            for (modifiers, key, cmd) in own.into_iter().chain(table) {
                 if input.consume_shortcut(&KeyboardShortcut::new(modifiers, key)) {
                     clicked.push(cmd);
                 }
@@ -2489,18 +4785,21 @@ impl GodApp {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.add_space(2.0);
             // Share what is left between the tabs; names shrink before anything overflows.
-            let reserved = 5.0 * widgets::ICON_BUTTON.x + 50.0;
+            let reserved = 6.0 * widgets::ICON_BUTTON.x + 60.0;
             let chrome = 12.0 + 16.0 + 8.0 + 8.0 + widgets::SMALL_ICON_BUTTON.x + 22.0;
             let per_tab = (ui.available_width() - reserved) / self.tabs.len().max(1) as f32;
             let text_max = (per_tab - chrome).clamp(40.0, TAB_TEXT_MAX);
             for (index, tab) in self.tabs.iter().enumerate() {
                 let active = index == self.active;
-                let (select_it, close_it, response) =
-                    doc_tab(ui, &palette, &tab.name, tab.dirty, active, text_max);
+                let (select_it, close_it, response) = doc_tab(
+                    ui, &palette, &tab.name, tab.dirty, active, text_max, tab.pinned,
+                );
                 if select_it {
                     select = Some(index);
                 }
-                if close_it {
+                if close_it && tab.pinned {
+                    asked = Some((index, TabAction::Pin));
+                } else if close_it {
                     close = Some(index);
                 }
                 response.context_menu(|ui| {
@@ -2516,6 +4815,7 @@ impl GodApp {
                             TabAction::CloseRight,
                         ),
                         (icon::X_SQUARE, "Close All", TabAction::CloseAll),
+                        (icon::PUSH_PIN, "Pin or Unpin", TabAction::Pin),
                         (icon::COPY, "Copy Path", TabAction::CopyPath),
                         (icon::TARGET, "Select in Explorer", TabAction::Reveal),
                     ];
@@ -2554,6 +4854,12 @@ impl GodApp {
                         clicked.push(cmd);
                     }
                 }
+                let tip = "Markdown preview (Ctrl+Shift+V)";
+                if self.is_markdown()
+                    && widgets::toggle_button(ui, icon::EYE, tip, self.preview).clicked()
+                {
+                    clicked.push(Cmd::Preview);
+                }
             });
         });
         let ctx = ui.ctx().clone();
@@ -2576,6 +4882,16 @@ impl GodApp {
             }
             (TabAction::CloseRight, _) => self.close_many(&ctx, |other| other > index),
             (TabAction::CloseAll, _) => self.close_many(&ctx, |_| true),
+            (TabAction::Pin, _) => {
+                // Pinned tabs come first, in the order they were pinned.
+                let front = self.tabs.get(self.active).map(|tab| tab.id);
+                let mut tab = self.tabs.remove(index);
+                tab.pinned = !tab.pinned;
+                let pinned = self.tabs.iter().filter(|tab| tab.pinned).count();
+                self.tabs.insert(pinned, tab);
+                let front = front.and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
+                self.active = front.unwrap_or(self.active);
+            }
             (TabAction::CopyPath, Some(path)) => ctx.copy_text(path.display().to_string()),
             (TabAction::Reveal, Some(path)) => self.reveal(&path),
             (TabAction::CopyPath | TabAction::Reveal, None) => {
@@ -2639,6 +4955,24 @@ impl GodApp {
                     ui.spacing_mut().item_spacing.x = 18.0;
                     ui.add_space(12.0);
                     ui.label(dim(tab.language.name.to_owned()));
+                    if let Some(state) = self.servers.state(tab.language.name) {
+                        let (label, tip) = match state {
+                            servers::State::On(program) => (
+                                format!("{} {program}", icon::PLUGS_CONNECTED),
+                                "Language server".to_owned(),
+                            ),
+                            servers::State::Off(known, _) => (
+                                format!("{} LSP off", icon::PLUGS),
+                                format!("{} is not running: click to see why", known.program),
+                            ),
+                        };
+                        let server = Button::new(dim(label))
+                            .frame_when_inactive(false)
+                            .stroke(Stroke::NONE);
+                        if ui.add(server).on_hover_text(tip).clicked() {
+                            clicked.push(Cmd::LanguageServer);
+                        }
+                    }
                     ui.label(dim(tab.ending.name().to_owned()));
                     ui.label(dim("UTF-8".to_owned()));
                     ui.label(dim(tab.indent.name()));
@@ -2906,6 +5240,9 @@ impl GodApp {
             let views = [
                 (Bottom::Problems, format!("PROBLEMS  {}", problems.len())),
                 (Bottom::Todo, format!("TODO  {}", self.todos.len())),
+                (Bottom::Response, "RESPONSE".to_owned()),
+                (Bottom::Debug, "DEBUG".to_owned()),
+                (Bottom::Tests, format!("TESTS  {}", self.tests.1.len())),
                 (Bottom::Terminal, "TERMINAL".to_owned()),
             ];
             for (view, title) in views {
@@ -2923,6 +5260,9 @@ impl GodApp {
                     clicked.push(match view {
                         Bottom::Problems => Cmd::Problems,
                         Bottom::Todo => Cmd::Todo,
+                        Bottom::Response => Cmd::Response,
+                        Bottom::Debug => Cmd::DebugPanel,
+                        Bottom::Tests => Cmd::TestsPanel,
                         Bottom::Terminal => Cmd::ToggleTerminal,
                     });
                 }
@@ -2935,6 +5275,33 @@ impl GodApp {
                         &[(icon::BUG, "Check for problems (Ctrl+Shift+B)", Cmd::Check)],
                     ),
                     Bottom::Todo => (Cmd::Todo, &[]),
+                    Bottom::Tests => (
+                        Cmd::TestsPanel,
+                        &[(
+                            icon::PLAY,
+                            "Run all the tests (Ctrl+Shift+T)",
+                            Cmd::RunTests,
+                        )],
+                    ),
+                    Bottom::Debug => (
+                        Cmd::DebugPanel,
+                        &[
+                            (icon::STOP, "Stop (Shift+F5)", Cmd::StopDebug),
+                            (icon::ARROW_LINE_UP, "Step out (Shift+F11)", Cmd::StepOut),
+                            (icon::ARROW_LINE_DOWN, "Step into (F11)", Cmd::StepInto),
+                            (
+                                icon::ARROW_ELBOW_DOWN_RIGHT,
+                                "Step over (F10)",
+                                Cmd::StepOver,
+                            ),
+                            (icon::PLAY, "Continue (F5)", Cmd::Run),
+                            (icon::BUG, "Debug this file (Ctrl+F5)", Cmd::Debug),
+                        ],
+                    ),
+                    Bottom::Response => (
+                        Cmd::Response,
+                        &[(icon::PLAY, "Send the request at the caret (F5)", Cmd::Run)],
+                    ),
                     Bottom::Terminal => (
                         Cmd::ToggleTerminal,
                         &[
@@ -2972,6 +5339,25 @@ impl GodApp {
             },
             Bottom::Problems => self.problem_list(ui, &problems),
             Bottom::Todo => self.todo_list(ui),
+            Bottom::Debug => self.debug_panel(ui),
+            Bottom::Tests => self.tests_list(ui),
+            Bottom::Response => {
+                let shown = if self.requesting.is_some() {
+                    "Waiting for the answer…"
+                } else if self.response.is_empty() {
+                    "In a .http file, write a request (GET https://…) and press F5 on it."
+                } else {
+                    &self.response
+                };
+                ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(12, 0))
+                        .show(ui, |ui| {
+                            let text = RichText::new(shown).monospace().size(13.0);
+                            ui.add(egui::Label::new(text).selectable(true).extend());
+                        });
+                });
+            }
         }
     }
 
@@ -3113,8 +5499,19 @@ impl GodApp {
             };
             let count = RichText::new(count).size(13.0).color(palette.text_dim);
             ui.add_sized(vec2(84.0, 22.0), egui::Label::new(count).selectable(false));
-            if widgets::toggle_button(ui, icon::TEXT_AA, "Match case", find.match_case).clicked() {
-                find.match_case = !find.match_case;
+            let toggles = [
+                (icon::TEXT_AA, "Match case", &mut find.options.match_case),
+                (icon::TEXT_T, "Whole word", &mut find.options.whole_word),
+                (
+                    icon::ASTERISK,
+                    "Regular expression",
+                    &mut find.options.regex,
+                ),
+            ];
+            for (glyph, tip, on) in toggles {
+                if widgets::toggle_button(ui, glyph, tip, *on).clicked() {
+                    *on = !*on;
+                }
             }
             if widgets::icon_button(ui, icon::ARROW_UP, "Previous (Shift+F3)").clicked() {
                 clicked.push(Cmd::FindPrevious);
@@ -3148,9 +5545,7 @@ impl GodApp {
 
     fn editor_area(&mut self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
         let palette = Palette::of(ui);
-        let font_size = self.font_size();
-        let current_mark = self.current_match();
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == self.left) else {
             ui.painter().rect_filled(ui.max_rect(), 0.0, palette.canvas);
             ui.centered_and_justified(|ui| {
                 let hints = "Shift Shift  Search everywhere\n\nCtrl+Shift+P  Commands\n\n\
@@ -3160,12 +5555,68 @@ impl GodApp {
             });
             return;
         };
+        self.editor_pane(ui, clicked, index, false);
+    }
+
+    /// The second editor, right of the first: the name of its file, then its text.
+    fn split_area(&mut self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
+        let palette = Palette::of(ui);
+        let shown = self
+            .right
+            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
+        let Some(index) = shown else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let name = RichText::new(&self.tabs[index].name).size(12.0);
+            ui.label(name.color(palette.text_dim));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(4.0);
+                if widgets::small_icon_button(ui, icon::X, "Close the split (Ctrl+\\)").clicked() {
+                    clicked.push(Cmd::Split);
+                }
+            });
+        });
+        self.editor_pane(ui, clicked, index, true);
+    }
+
+    /// One editor, the `second` one or the first, showing tab `index`. What follows the
+    /// caret (completions, signature, documentation, the page of a Markdown file) is for
+    /// the editor that has the keyboard.
+    fn editor_pane(&mut self, ui: &mut Ui, clicked: &mut Vec<Cmd>, index: usize, second: bool) {
+        // The same file in both editors: only one of them has the keyboard.
+        let twin = self.right == Some(self.left);
+        let front = index == self.active && (!twin || second == self.right_front);
+        let font_size = self.font_size();
+        let current_mark = self.current_match().filter(|_| front);
+        let note = self.note.clone().filter(|_| front);
+        let (marks, occurrences): (&[Match], &[Match]) = if front {
+            (&self.find.matches, &self.occurrences.1)
+        } else {
+            (&[], &[])
+        };
+        let language = self.tabs[index].language.name;
+        let snippets = self.snippets.get(language).map_or(&[][..], Vec::as_slice);
+        let at = self.debug_at.as_ref();
+        let stopped = at.filter(|(path, _)| self.tabs[index].path.as_deref() == Some(path));
+        let stopped = stopped.map(|(_, line)| *line);
+        let tab = &mut self.tabs[index];
+        // The view of this editor is the one put aside: it is brought in to be shown.
+        let borrowed = twin && second != tab.in_second;
+        if borrowed {
+            tab.swap_views(ui.ctx());
+        }
+        if !front {
+            // It takes the keyboard when clicked, not because it was just opened.
+            tab.view.focus = false;
+        }
         let unit = tab.indent.unit();
         let config = editor::Config {
             language: tab.language,
             font_size,
             indent: &unit,
-            marks: &self.find.matches,
+            marks,
             current_mark,
             squiggles: &tab.squiggles,
             // Typing moves the lines: the marks come back with the next save.
@@ -3174,8 +5625,16 @@ impl GodApp {
             } else {
                 &[]
             },
-            occurrences: &self.occurrences.1,
+            occurrences,
             wrap: tab.wrap,
+            minimap: self.minimap,
+            sticky: self.sticky,
+            note: note.as_deref(),
+            snippets,
+            breakpoints: &tab.breakpoints,
+            stopped,
+            lines_only: self.lines_only,
+            hints: &tab.hints,
         };
         let id = tab.editor_id();
         let mut menu = |ui: &mut Ui| {
@@ -3193,10 +5652,141 @@ impl GodApp {
             }
             tab.selection = selection;
         }
+        let gutter = output.gutter;
+        let focused = output.focused;
+        if let Some(line) = gutter {
+            toggle_breakpoint_of(tab, &mut self.debug, line);
+        }
+        if !front {
+            if focused {
+                self.active = index;
+                if twin {
+                    self.right_front = second;
+                }
+            } else if borrowed {
+                tab.swap_views(ui.ctx());
+            }
+            return;
+        }
+        self.top_line = output.top_line;
+        self.caret_pos = output.caret_pos;
+        let pointed = output.pointed;
+        // After a letter, a dot or a colon, the language server says what can follow; after
+        // a bracket or a comma, which argument is being written.
+        let caret = tab.selection.start;
+        let before = tab.text[..godcode_core::byte_index(&tab.text, caret)]
+            .chars()
+            .next_back();
+        let typed = output.changed && tab.selection.is_empty();
+        // A completion just picked is not typing: asking again would have the server
+        // forget the list it is about to be asked about.
+        let typed = typed && tab.view.accepted.is_none();
+        let completes =
+            typed && before.is_some_and(|ch| ch.is_alphanumeric() || "_.:".contains(ch));
+        let calls = typed && matches!(before, Some('(' | ','));
+        if typed && before == Some(')') {
+            self.signature = None;
+        }
+        let ctx = ui.ctx().clone();
+        if completes || calls {
+            let (id, revision) = (tab.id, tab.revision);
+            self.sync_server(&ctx);
+            let place = self.tabs.get(self.active).and_then(|tab| {
+                let (line, column) = servers::position(&tab.text, caret);
+                Some((tab.path.clone()?, line, column))
+            });
+            if let Some((path, line, column)) = place {
+                if completes && let Some(asked) = self.servers.completion(&path, line, column) {
+                    let completion = Asked::Completion {
+                        tab: id,
+                        revision,
+                        caret,
+                    };
+                    self.asked.insert(asked, completion);
+                }
+                if calls && let Some(asked) = self.servers.signature(&path, line, column) {
+                    self.asked.insert(asked, Asked::Signature(line));
+                }
+            }
+        }
+        self.import_for_accepted(&ctx);
         if let Some(at) = output.jump {
-            let ctx = ui.ctx().clone();
             self.go_to_declaration(&ctx, Some(at));
         }
+        self.rest_pointer(&ctx, pointed);
+    }
+
+    /// A completion of the language server was just picked in the file in front: what
+    /// else it changes (an import to add) is made, or asked for.
+    fn import_for_accepted(&mut self, ctx: &Context) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(picked) = tab.view.accepted.take() else {
+            return;
+        };
+        let (Some(path), complete::Kind::Symbol) = (tab.path.clone(), picked.kind) else {
+            return;
+        };
+        let served = self.served.iter();
+        let Some(item) = served.into_iter().find(|item| item.label == picked.label) else {
+            return;
+        };
+        let item = item.clone();
+        // Asked before the server is told the word was written: it answers about the text
+        // its list was made for, and fails on any other.
+        let edits = self.servers.accepted(&path, &item);
+        if !edits.is_empty() {
+            self.apply_edits(ctx, &[godcode_lsp::FileEdits { path, edits }]);
+        }
+    }
+
+    /// The file in front is Markdown: it has a page to show.
+    fn is_markdown(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.language.name == "Markdown")
+    }
+
+    /// The Markdown file in front as a page, scrolling with its text.
+    fn preview_panel(&mut self, ui: &mut Ui) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let key = hash_of((tab.id, tab.revision));
+        if self.blocks.0 != key {
+            self.blocks = (key, markdown::blocks(&tab.text));
+        }
+        // The view being scrolled leads, the other one follows it.
+        let leads = ui.rect_contains_pointer(ui.max_rect())
+            && ui.input(|input| input.smooth_scroll_delta.y != 0.0 || input.pointer.any_down());
+        let mut page = ScrollArea::vertical()
+            .id_salt("markdown-preview")
+            .auto_shrink(false);
+        if !leads {
+            let starts = self.preview_starts.iter().copied();
+            let wanted = preview::interpolate(starts, self.top_line);
+            // Never past the last screenful of the page.
+            let height = self.preview_starts.last().map_or(0.0, |(_, y)| *y);
+            let furthest = (height - ui.available_height()).max(0.0);
+            page = page.vertical_scroll_offset(wanted.min(furthest));
+        }
+        let (blocks, zoom) = (&self.blocks.1, self.zoom);
+        let shown = page.show(ui, |ui| {
+            Frame::new()
+                .inner_margin(Margin::symmetric(24, 16))
+                .show(ui, |ui| preview::show(ui, blocks, zoom))
+                .inner
+        });
+        // The end of the text is the end of the page.
+        let mut starts = shown.inner;
+        let lines = tab.text.split('\n').count() as f32;
+        starts.push((lines, shown.content_size.y));
+        if leads {
+            let lines = starts.iter().map(|(line, y)| (*y, *line));
+            tab.view.scroll_to_line = Some(preview::interpolate(lines, shown.state.offset.y));
+        }
+        self.preview_starts = starts;
     }
 
     /// Where the caret is: the folders of the file, the file, the definition around it.
@@ -3380,6 +5970,10 @@ impl GodApp {
             let line = line.trim().parse::<usize>().ok().filter(|line| *line > 0);
             return line.map(Pick::Line).into_iter().collect();
         }
+        if query.starts_with('#') {
+            let found = self.project_symbols.iter().take(MAX_PICKS);
+            return found.cloned().map(Pick::Place).collect();
+        }
         if let Some(wanted) = query.strip_prefix('@') {
             let wanted = wanted.trim().to_lowercase();
             let Some(tab) = self.tabs.get(self.active) else {
@@ -3430,6 +6024,22 @@ impl GodApp {
         let Some(mut quick) = self.quick.take() else {
             return;
         };
+        // The definitions of the whole project are the language server's to find.
+        if let Some(wanted) = quick.query.strip_prefix('#')
+            && wanted != self.symbols_asked
+        {
+            self.symbols_asked = wanted.to_owned();
+            self.sync_server(ctx);
+            let front = self.tabs.get(self.active);
+            let path = front.and_then(|tab| tab.path.clone());
+            let asked = path.and_then(|path| self.servers.symbols(&path, wanted));
+            match asked {
+                Some(id) => {
+                    self.asked.insert(id, Asked::Symbols(wanted.to_owned()));
+                }
+                None => self.project_symbols.clear(),
+            }
+        }
         let picks = self.picks(&quick.query);
         // Taken before the text field sees them: the arrows move in the list.
         let (up, down, enter) = ctx.input_mut(|input| {
@@ -3454,7 +6064,9 @@ impl GodApp {
             let field = ui.add(
                 TextEdit::singleline(&mut quick.query)
                     .margin(crate::widgets::FIELD_MARGIN)
-                    .hint_text("Search everywhere      >command      :line      @symbol")
+                    .hint_text(
+                        "Search everywhere    >command    :line    @symbol    #project symbol",
+                    )
                     .desired_width(f32::INFINITY),
             );
             if std::mem::take(&mut quick.focus) {
@@ -3493,6 +6105,15 @@ impl GodApp {
                             with_icon(spec.glyph, spec.label).into(),
                             spec.shortcut.to_owned(),
                         ),
+                        Pick::Place(named) => {
+                            let file = named.place.path.file_name();
+                            let file = file.map_or_else(String::new, |name| {
+                                name.to_string_lossy().into_owned()
+                            });
+                            let detail =
+                                format!("{}  {file}:{}", named.container, named.place.line + 1);
+                            (with_icon(icon::CUBE, &named.name).into(), detail)
+                        }
                         Pick::Line(line) => (
                             with_icon(icon::ARROW_RIGHT, &format!("Go to line {line}")).into(),
                             String::new(),
@@ -3527,7 +6148,7 @@ impl GodApp {
                     }
                 }
                 if picks.is_empty() {
-                    let files = !quick.query.starts_with(['>', ':', '@']);
+                    let files = !quick.query.starts_with(['>', ':', '@', '#']);
                     let none = if files && self.explorer.is_none() {
                         "Open a folder to go to its files."
                     } else {
@@ -3562,8 +6183,23 @@ impl GodApp {
                 return;
             }
             Pick::Command(spec) => {
+                // The keyboard goes back to the code the command acts on.
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.view.focus = true;
+                }
                 self.pending.push(spec.cmd);
                 ctx.request_repaint();
+                return;
+            }
+            Pick::Place(named) => {
+                self.record_jump();
+                let place = named.place;
+                if self.open_file(ctx, &place.path)
+                    && let Some(tab) = self.tabs.get_mut(self.active)
+                {
+                    let start = servers::index_of(&tab.text, place.line, place.column).0;
+                    tab.select(ctx, start..start);
+                }
                 return;
             }
             Pick::Line(line) => line,
@@ -3841,8 +6477,30 @@ impl eframe::App for GodApp {
         self.update_title(&ctx);
         self.refresh_find();
         self.refresh_problems();
+        self.settle_panes();
         self.refresh_symbols();
+        self.refresh_blame();
+        // Left for another line, the call is no longer the one being written.
+        if self
+            .signature
+            .as_ref()
+            .is_some_and(|(line, ..)| *line != self.caret_line)
+        {
+            self.signature = None;
+        }
+        // Back from another program: it may have changed the files.
+        let focused = ctx.input(|input| input.focused);
+        if focused && !std::mem::replace(&mut self.was_focused, focused) {
+            self.reload_from_disk(&ctx);
+        }
+        self.was_focused = focused;
         self.refresh_occurrences();
+        self.save_idle(&ctx);
+        self.sync_server(&ctx);
+        self.poll_servers(&ctx);
+        // After the servers were heard: one that just said what it can do is asked at once.
+        self.ask_hints();
+        self.poll_debug(&ctx);
         // The tab in front is the most recent of the recent files.
         if let Some(tab) = self.tabs.get_mut(self.active)
             && tab.used != self.clock
@@ -3862,15 +6520,19 @@ impl eframe::App for GodApp {
                 .frame(Frame::new().fill(palette.bg))
                 .show(ui, |ui| self.welcome(ui, &mut clicked));
         } else {
-            Panel::bottom("status")
-                .frame(plain(palette.bg, Margin::symmetric(12, 3)))
-                .show(ui, |ui| self.status_bar(ui, &mut clicked));
-            Panel::left("activity-bar")
-                .resizable(false)
-                .exact_size(ACTIVITY_WIDTH)
-                .frame(plain(palette.surface, Margin::ZERO))
-                .show(ui, |ui| self.activity_bar(ui));
-            if self.sidebar {
+            // In zen mode only the code shows.
+            let zen = self.zen;
+            if !zen {
+                Panel::bottom("status")
+                    .frame(plain(palette.bg, Margin::symmetric(12, 3)))
+                    .show(ui, |ui| self.status_bar(ui, &mut clicked));
+                Panel::left("activity-bar")
+                    .resizable(false)
+                    .exact_size(ACTIVITY_WIDTH)
+                    .frame(plain(palette.surface, Margin::ZERO))
+                    .show(ui, |ui| self.activity_bar(ui));
+            }
+            if self.sidebar && !zen {
                 Panel::left("side-bar")
                     .resizable(true)
                     .default_size(260.0)
@@ -3883,7 +6545,7 @@ impl eframe::App for GodApp {
                         Side::Structure => self.structure_panel(ui),
                     });
             }
-            if self.bottom.is_some() {
+            if self.bottom.is_some() && !zen {
                 Panel::bottom("bottom-panel")
                     .resizable(true)
                     .default_size(240.0)
@@ -3891,7 +6553,7 @@ impl eframe::App for GodApp {
                     .frame(plain(palette.bg, Margin::symmetric(0, 6)))
                     .show(ui, |ui| self.bottom_panel(ui, &mut clicked));
             }
-            if !self.tabs.is_empty() {
+            if !self.tabs.is_empty() && !zen {
                 let margin = Margin {
                     left: 4,
                     right: 4,
@@ -3912,6 +6574,29 @@ impl eframe::App for GodApp {
                     .frame(plain(palette.surface, Margin::symmetric(12, 5)))
                     .show(ui, |ui| self.find_bar(ui, &mut clicked));
             }
+            if self.preview && self.is_markdown() {
+                Panel::right("markdown-preview")
+                    .resizable(true)
+                    .default_size(560.0)
+                    .size_range(240.0..=1400.0)
+                    .frame(plain(palette.bg, Margin::ZERO))
+                    .show(ui, |ui| self.preview_panel(ui));
+            }
+            if self.right.is_some() && self.split_down {
+                Panel::bottom("split-editor-down")
+                    .resizable(true)
+                    .default_size(ui.available_height() / 2.0)
+                    .size_range(120.0..=2400.0)
+                    .frame(plain(palette.bg, Margin::ZERO))
+                    .show(ui, |ui| self.split_area(ui, &mut clicked));
+            } else if self.right.is_some() {
+                Panel::right("split-editor")
+                    .resizable(true)
+                    .default_size(ui.available_width() / 2.0)
+                    .size_range(240.0..=2400.0)
+                    .frame(plain(palette.bg, Margin::ZERO))
+                    .show(ui, |ui| self.split_area(ui, &mut clicked));
+            }
             CentralPanel::default()
                 .frame(Frame::new().fill(palette.bg))
                 .show(ui, |ui| self.editor_area(ui, &mut clicked));
@@ -3923,6 +6608,17 @@ impl eframe::App for GodApp {
         self.prompt_dialog(&ctx);
         self.quick_dialog(&ctx);
         self.shortcuts_dialog(&ctx);
+        self.documentation_window(&ctx);
+        self.tip_window(&ctx);
+        self.fixes_dialog(&ctx);
+        self.signature_window(&ctx);
+        self.diff_window(&ctx);
+        self.branches_dialog(&ctx);
+        self.versions_dialog(&ctx);
+        self.themes_dialog(&ctx);
+        self.tasks_dialog(&ctx);
+        self.log_dialog(&ctx);
+        self.templates_dialog(&ctx);
         self.toasts.show(&ctx);
     }
 
@@ -3931,6 +6627,25 @@ impl eframe::App for GodApp {
         storage.set_string("dark_mode", flag(self.dark));
         storage.set_string("sidebar", flag(self.sidebar));
         storage.set_string("wrap", flag(self.wrap));
+        storage.set_string("preview", flag(self.preview));
+        storage.set_string("minimap", flag(self.minimap));
+        storage.set_string("lines_only", flag(self.lines_only));
+        storage.set_string("sticky", flag(self.sticky));
+        storage.set_string("autosave", flag(self.autosave));
+        storage.set_string("blame", flag(self.blame));
+        storage.set_string("scheme", self.scheme.to_string());
+        // What is open, to come back to it at the next start.
+        let shown = |path: &Path| path.display().to_string();
+        let folder = self.folder().map(|folder| shown(&folder));
+        storage.set_string("session_folder", folder.unwrap_or_default());
+        let files = self.tabs.iter().filter_map(|tab| tab.path.as_deref());
+        let files: Vec<String> = files.map(shown).collect();
+        storage.set_string("session_files", files.join("\n"));
+        let front = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.path.as_deref());
+        storage.set_string("session_front", front.map(shown).unwrap_or_default());
         storage.set_string("zoom", self.zoom.to_string());
         let recent: Vec<String> = self
             .recent
@@ -3946,6 +6661,225 @@ fn file_name(path: &Path) -> String {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// Set or remove the breakpoint of a line of `tab`, and tell the debugger when one runs.
+fn toggle_breakpoint_of(
+    tab: &mut Tab,
+    session: &mut Option<godcode_lsp::dap::Session>,
+    line: usize,
+) {
+    match tab.breakpoints.iter().position(|set| *set == line) {
+        Some(at) => {
+            tab.breakpoints.remove(at);
+        }
+        None => tab.breakpoints.push(line),
+    }
+    if let (Some(session), Some(path)) = (session, &tab.path) {
+        session.set_breakpoints(path, &tab.breakpoints);
+    }
+}
+
+/// A settings file of the user, by its name.
+fn settings_file(name: &str) -> Option<PathBuf> {
+    Some(eframe::storage_dir(APP_NAME)?.join(name))
+}
+
+/// A shortcut as it is written: `Ctrl+Shift+K`.
+fn parse_shortcut(written: &str) -> Option<(Modifiers, Key)> {
+    let mut modifiers = Modifiers::NONE;
+    let mut key = None;
+    for part in written.split('+').map(str::trim) {
+        match part.to_lowercase().as_str() {
+            "ctrl" | "cmd" => modifiers |= Modifiers::COMMAND,
+            "shift" => modifiers |= Modifiers::SHIFT,
+            "alt" => modifiers |= Modifiers::ALT,
+            _ => key = Key::from_name(part),
+        }
+    }
+    Some((modifiers, key?))
+}
+
+/// The shortcuts of the user: `{ "Reformat Code": "Ctrl+Alt+F" }`, a command by its name
+/// in the menus. Those with more modifier keys come first, as they must be tried first.
+fn load_keymap() -> Vec<(Modifiers, Key, Cmd)> {
+    let text = settings_file("keymap.json").and_then(|file| std::fs::read_to_string(file).ok());
+    let parsed: Option<serde_json::Value> = text.and_then(|text| serde_json::from_str(&text).ok());
+    let written = parsed.as_ref().and_then(|parsed| parsed.as_object());
+    let mut keymap: Vec<(Modifiers, Key, Cmd)> = written
+        .into_iter()
+        .flatten()
+        .filter_map(|(label, shortcut)| {
+            let named = |spec: &&Spec| spec.label.trim_end_matches('…').eq_ignore_ascii_case(label);
+            let (modifiers, key) = parse_shortcut(shortcut.as_str()?)?;
+            Some((modifiers, key, COMMANDS.iter().find(named)?.cmd))
+        })
+        .collect();
+    let held = |modifiers: &Modifiers| {
+        u8::from(modifiers.alt) + u8::from(modifiers.shift) + u8::from(modifiers.command)
+    };
+    keymap.sort_by_key(|(modifiers, ..)| std::cmp::Reverse(held(modifiers)));
+    keymap
+}
+
+/// The debug adapter and the launch settings the user wrote for `language`, `${file}` and
+/// `${folder}` standing for the file in front and its project.
+fn debug_settings(
+    language: &str,
+    file: &Path,
+    folder: &Path,
+) -> Option<(Vec<String>, serde_json::Value)> {
+    let text = std::fs::read_to_string(settings_file("debug.json")?).ok()?;
+    // Written into JSON text: back slashes and quotes of the paths must be escaped.
+    let quoted = |path: &Path| {
+        let json = serde_json::to_string(&path.display().to_string()).unwrap_or_default();
+        json.trim_matches('"').to_owned()
+    };
+    let text = text
+        .replace("${file}", &quoted(file))
+        .replace("${folder}", &quoted(folder));
+    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let entry = parsed.get(language)?;
+    let adapter = entry["adapter"].as_array()?.iter();
+    let adapter: Vec<String> = adapter
+        .filter_map(|part| Some(part.as_str()?.to_owned()))
+        .collect();
+    let mut launch = entry["launch"].clone();
+    if launch.get("request").is_none() {
+        launch["request"] = "launch".into();
+    }
+    (!adapter.is_empty()).then_some((adapter, launch))
+}
+
+/// The file the snippets of the user are written in.
+fn snippets_file() -> Option<PathBuf> {
+    Some(eframe::storage_dir(APP_NAME)?.join("snippets.json"))
+}
+
+/// The snippets of the user, by language: `{ "Rust": { "dbg": "dbg!($0);" } }`. None when
+/// the file is missing or is not that.
+fn load_snippets() -> std::collections::HashMap<String, Vec<(String, String)>> {
+    let text = snippets_file().and_then(|file| std::fs::read_to_string(file).ok());
+    let parsed: Option<serde_json::Value> = text.and_then(|text| serde_json::from_str(&text).ok());
+    let languages = parsed.as_ref().and_then(|parsed| parsed.as_object());
+    let read = |(language, snippets): (&String, &serde_json::Value)| {
+        let snippets = snippets.as_object()?.iter();
+        let snippets =
+            snippets.filter_map(|(label, body)| Some((label.clone(), body.as_str()?.to_owned())));
+        Some((language.clone(), snippets.collect()))
+    };
+    languages.into_iter().flatten().filter_map(read).collect()
+}
+
+/// Where the versions of the file at `path` are kept.
+fn history_dir(path: &Path) -> Option<PathBuf> {
+    let name = format!("{:016x}", hash_of(path));
+    Some(eframe::storage_dir(APP_NAME)?.join("history").join(name))
+}
+
+/// Keep `bytes`, what was just saved to `path`, as a version to come back to.
+fn keep_version(path: &Path, bytes: &[u8]) {
+    let Some(dir) = history_dir(path) else {
+        return;
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let seconds = now.map_or(0, |since| since.as_secs());
+    // The history is a comfort: failing to write it must not get in the way of saving.
+    if std::fs::create_dir_all(&dir).is_err()
+        || std::fs::write(dir.join(format!("{seconds:012}.txt")), bytes).is_err()
+    {
+        return;
+    }
+    let mut kept: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    kept.sort();
+    for old in kept.iter().rev().skip(MAX_VERSIONS) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// The versions kept of the file at `path`, latest first, each with how old it is.
+fn versions_of(path: &Path) -> Vec<(String, PathBuf)> {
+    let Some(dir) = history_dir(path) else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let now = now.map_or(0, |since| since.as_secs());
+    let mut kept: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    kept.sort();
+    kept.reverse();
+    let labelled = kept.into_iter().filter_map(|file| {
+        let saved: u64 = file.file_stem()?.to_str()?.parse().ok()?;
+        let age = now.saturating_sub(saved);
+        let label = match age {
+            0..60 => "a moment ago".to_owned(),
+            60..3600 => format!("{} min ago", age / 60),
+            3600..86_400 => format!("{} h ago", age / 3600),
+            _ => format!("{} days ago", age / 86_400),
+        };
+        Some((label, file))
+    });
+    labelled.collect()
+}
+
+/// A list to pick from, with a field to narrow it when `typed` is given. `None` while it
+/// is open; then the row picked, or `None` when it was closed without picking.
+fn list_dialog(
+    ctx: &Context,
+    title: &str,
+    rows: &[String],
+    selected: &mut usize,
+    typed: Option<&mut String>,
+) -> Option<Option<usize>> {
+    let (up, down, enter) = ctx.input_mut(|input| {
+        (
+            input.consume_key(Modifiers::NONE, Key::ArrowUp),
+            input.consume_key(Modifiers::NONE, Key::ArrowDown),
+            input.consume_key(Modifiers::NONE, Key::Enter),
+        )
+    });
+    let last = rows.len().saturating_sub(1);
+    *selected = (*selected + usize::from(down)).min(last);
+    *selected = selected.saturating_sub(usize::from(up));
+    let mut chosen = (enter && !rows.is_empty()).then_some(*selected);
+    let response = Modal::new(Id::new(title)).show(ctx, |ui| {
+        ui.set_width(520.0);
+        ui.heading(title);
+        ui.add_space(6.0);
+        if let Some(typed) = typed {
+            let field = ui.add(
+                TextEdit::singleline(typed)
+                    .margin(crate::widgets::FIELD_MARGIN)
+                    .hint_text("Type to narrow the list, or a new name")
+                    .desired_width(f32::INFINITY),
+            );
+            field.request_focus();
+            if field.changed() {
+                *selected = 0;
+            }
+            ui.add_space(6.0);
+        }
+        ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            for (index, row) in rows.iter().enumerate() {
+                let button = Button::selectable(index == *selected, row.as_str())
+                    .frame_when_inactive(index == *selected)
+                    .stroke(Stroke::NONE)
+                    .wrap_mode(egui::TextWrapMode::Truncate)
+                    .min_size(vec2(ui.available_width(), 28.0));
+                if ui.add(button).clicked() {
+                    chosen = Some(index);
+                }
+            }
+        });
+    });
+    match chosen {
+        Some(row) => Some(Some(row)),
+        None if response.should_close() => Some(None),
+        None => None,
+    }
 }
 
 /// Icon and colour of a definition of the outline, from the word that defines it.
@@ -4006,6 +6940,7 @@ fn doc_tab(
     dirty: bool,
     active: bool,
     text_max: f32,
+    pinned: bool,
 ) -> (bool, bool, Response) {
     let text_color = if active {
         palette.text
@@ -4056,9 +6991,14 @@ fn doc_tab(
     }
     let close_rect =
         Rect::from_center_size(pos2(rect.max.x - 8.0 - close_size.x / 2.0, mid), close_size);
+    let (glyph, tip) = if pinned {
+        (icon::PUSH_PIN, "Pinned: click to unpin")
+    } else {
+        (icon::X, "Close")
+    };
     let close = ui
-        .put(close_rect, widgets::icon_widget(icon::X, 13.0))
-        .on_hover_text("Close");
+        .put(close_rect, widgets::icon_widget(glyph, 13.0))
+        .on_hover_text(tip);
     let response = response.on_hover_text(title);
     (
         response.clicked(),
@@ -4067,9 +7007,98 @@ fn doc_tab(
     )
 }
 
+/// The text of a file that is not open, for a language server to change. One that is not
+/// there yet is empty: the server wants it made (code moved to a new file). `None` when it
+/// is there but is not text that can be read.
+fn text_on_disk(path: &Path) -> Option<Decoded> {
+    match std::fs::read(path) {
+        Ok(bytes) => godcode_core::decode(&bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(Decoded {
+            text: String::new(),
+            ending: LineEnding::Lf,
+            bom: false,
+        }),
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_a_server_changes_may_not_exist_yet() {
+        let folder = std::env::temp_dir().join(format!("godcode-edits-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("folder");
+        let missing = text_on_disk(&folder.join("new.ts")).expect("an empty text");
+        assert_eq!((missing.text.as_str(), missing.bom), ("", false));
+        std::fs::write(
+            folder.join("old.ts"),
+            "let a;
+",
+        )
+        .expect("file");
+        let found = text_on_disk(&folder.join("old.ts")).expect("its text");
+        assert_eq!(
+            found.text,
+            "let a;
+"
+        );
+        // Not text: left alone rather than overwritten.
+        std::fs::write(folder.join("data.bin"), [0xff, 0xfe, 0x00, 0xd8]).expect("file");
+        assert!(text_on_disk(&folder.join("data.bin")).is_none());
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn shortcuts_are_read_as_written() {
+        let both = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert_eq!(parse_shortcut("Ctrl+Shift+K"), Some((both, Key::K)));
+        assert_eq!(
+            parse_shortcut("f5"),
+            Key::from_name("f5").map(|key| (Modifiers::NONE, key))
+        );
+        assert_eq!(
+            parse_shortcut("Alt + ArrowUp"),
+            Some((Modifiers::ALT, Key::ArrowUp))
+        );
+        assert_eq!(parse_shortcut("Ctrl+"), None);
+    }
+
+    #[test]
+    fn a_file_in_two_editors_has_two_views() {
+        let ctx = Context::default();
+        let decoded = Decoded {
+            text: "one\ntwo\nthree".to_owned(),
+            ending: LineEnding::Lf,
+            bom: false,
+        };
+        let mut tab = Tab::new(7, "a.txt".to_owned(), None, decoded);
+        tab.select(&ctx, 4..7);
+        let first = tab.editor_id();
+
+        // The second view starts where the first is, then goes its own way.
+        tab.swap_views(&ctx);
+        assert!(tab.in_second && tab.editor_id() != first);
+        assert_eq!((tab.selection.clone(), tab.view.scroll_to), (4..7, Some(4)));
+        tab.select(&ctx, 8..13);
+        tab.swap_views(&ctx);
+        assert_eq!((tab.editor_id(), tab.selection.clone()), (first, 4..7));
+
+        // The text is shortened in the first: the second no longer points past its end.
+        tab.text.truncate(5);
+        tab.touched();
+        tab.select(&ctx, 4..5);
+        tab.swap_views(&ctx);
+        assert_eq!(tab.selection, 5..5);
+        let kept = egui::TextEdit::load_state(&ctx, tab.editor_id())
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| (range.primary.index.0, range.secondary.index.0));
+        assert_eq!(kept, Some((5, 5)));
+        // Nothing changed since: the first comes back as it was left.
+        tab.swap_views(&ctx);
+        assert_eq!((tab.in_second, tab.selection.clone()), (false, 4..5));
+    }
 
     #[test]
     fn every_menu_entry_is_a_known_command() {

@@ -110,9 +110,241 @@ pub fn parse_diff(output: &str) -> Vec<Hunk> {
         .collect()
 }
 
+/// Which side of a conflict to keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// What this branch had.
+    Ours,
+    /// What comes from the other branch.
+    Theirs,
+    Both,
+}
+
+/// `text` with the conflict around line `line` (counted from 0) settled, its markers gone;
+/// `None` when that line is in no conflict.
+pub fn resolve_conflict(text: &str, line: usize, keep: Keep) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line = line.min(lines.len().checked_sub(1)?);
+    let marks = |at: &usize, mark: &str| lines[*at].starts_with(mark);
+    let start = (0..=line).rev().find(|at| marks(at, "<<<<<<<"))?;
+    let end = (start..lines.len()).find(|at| marks(at, ">>>>>>>"))?;
+    let middle = (start..end).find(|at| marks(at, "======="))?;
+    if end < line {
+        return None;
+    }
+    // In the three-way style, what both sides started from sits before the `=======`.
+    let ours_end = (start..middle)
+        .find(|at| marks(at, "|||||||"))
+        .unwrap_or(middle);
+    let ours = &lines[start + 1..ours_end];
+    let theirs = &lines[middle + 1..end];
+    let mut settled = lines[..start].to_vec();
+    if keep != Keep::Theirs {
+        settled.extend(ours);
+    }
+    if keep != Keep::Ours {
+        settled.extend(theirs);
+    }
+    settled.extend(&lines[end + 1..]);
+    Some(settled.join("\n"))
+}
+
+/// Who last changed a line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Blame {
+    pub author: String,
+    /// As `2026-10-11`.
+    pub date: String,
+    /// The first line of the message of the commit.
+    pub summary: String,
+}
+
+/// The day a number of seconds since 1970 falls on, as `2026-10-11`.
+fn day_of(seconds: i64) -> String {
+    let shifted = seconds.div_euclid(86_400) + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// What `git blame --line-porcelain` printed: one entry per line of the file.
+pub fn parse_blame(printed: &str) -> Vec<Blame> {
+    let mut lines = Vec::new();
+    let mut current = Blame {
+        author: String::new(),
+        date: String::new(),
+        summary: String::new(),
+    };
+    for line in printed.lines() {
+        if line.starts_with('\t') {
+            lines.push(current.clone());
+        } else if let Some(author) = line.strip_prefix("author ") {
+            current.author = author.to_owned();
+        } else if let Some(time) = line.strip_prefix("author-time ") {
+            current.date = time.parse().map(day_of).unwrap_or_default();
+        } else if let Some(summary) = line.strip_prefix("summary ") {
+            current.summary = summary.to_owned();
+        }
+    }
+    lines
+}
+
+/// A row of a side by side comparison: the line as it was and as it is, with their
+/// numbers; one side is missing where a line was added or removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub old: Option<(usize, String)>,
+    pub new: Option<(usize, String)>,
+}
+
+/// The rows of a unified diff, removed and added lines facing each other. With `titles`,
+/// each file starts with a row numbered 0 holding its name on both sides.
+pub fn side_by_side(diff: &str, titles: bool) -> Vec<Row> {
+    let mut rows: Vec<Row> = Vec::new();
+    // The first of the removed lines still waiting for the added line that replaces it.
+    let mut unpaired = 0;
+    let (mut old, mut new) = (0, 0);
+    let mut started = false;
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("@@ -") {
+            let start = |part: Option<&str>| {
+                let digits = part?.trim_start_matches('+').split(',').next()?;
+                digits.parse::<usize>().ok()
+            };
+            let mut parts = header.split(' ');
+            old = start(parts.next()).unwrap_or(1);
+            new = start(parts.next()).unwrap_or(1);
+            started = true;
+            unpaired = rows.len();
+            continue;
+        }
+        if let Some(names) = line.strip_prefix("diff --git a/") {
+            started = false;
+            let name = names.split(" b/").next().unwrap_or(names).to_owned();
+            if titles {
+                rows.push(Row {
+                    old: Some((0, name.clone())),
+                    new: Some((0, name)),
+                });
+            }
+            continue;
+        }
+        if !started {
+            continue;
+        }
+        let text = line.get(1..).unwrap_or("").to_owned();
+        match line.as_bytes().first() {
+            Some(b'-') => {
+                rows.push(Row {
+                    old: Some((old, text)),
+                    new: None,
+                });
+                old += 1;
+            }
+            // An added line faces the first removed line still alone, when there is one.
+            Some(b'+') => {
+                match rows.get_mut(unpaired) {
+                    Some(row) => row.new = Some((new, text)),
+                    None => rows.push(Row {
+                        old: None,
+                        new: Some((new, text)),
+                    }),
+                }
+                unpaired += 1;
+                new += 1;
+            }
+            Some(b' ') => {
+                rows.push(Row {
+                    old: Some((old, text.clone())),
+                    new: Some((new, text)),
+                });
+                old += 1;
+                new += 1;
+                unpaired = rows.len();
+            }
+            // "\ No newline at end of file" and the like.
+            _ => {}
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conflict_is_settled_for_one_side_or_both() {
+        let text =
+            "top\n<<<<<<< HEAD\nmine\n||||||| base\nold\n=======\ntheirs\n>>>>>>> other\nend";
+        let settled = |keep| resolve_conflict(text, 3, keep);
+        assert_eq!(settled(Keep::Ours).as_deref(), Some("top\nmine\nend"));
+        assert_eq!(settled(Keep::Theirs).as_deref(), Some("top\ntheirs\nend"));
+        assert_eq!(
+            settled(Keep::Both).as_deref(),
+            Some("top\nmine\ntheirs\nend")
+        );
+        assert_eq!(resolve_conflict(text, 0, Keep::Ours), None);
+        assert_eq!(resolve_conflict(text, 8, Keep::Ours), None);
+    }
+
+    #[test]
+    fn blame_gives_an_author_and_a_day_per_line() {
+        let printed = "abc 1 1 2\nauthor Ada\nauthor-time 1760140800\nsummary first\n\tone\n\
+                       abc 2 2\nauthor Ada\nauthor-time 1760140800\nsummary first\n\ttwo\n\
+                       000 3 3 1\nauthor Not Committed Yet\nauthor-time 0\nsummary wip\n\tthree\n";
+        let lines = parse_blame(printed);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            (lines[1].author.as_str(), lines[1].date.as_str()),
+            ("Ada", "2025-10-11")
+        );
+        assert_eq!(lines[2].date, "1970-01-01");
+        assert_eq!(day_of(951_782_400), "2000-02-29");
+    }
+
+    #[test]
+    fn a_diff_is_laid_side_by_side() {
+        let diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,4 +1,4 @@\n same\n-old one\n-old two\n\
+                    +new one\n end\n+added\n\\ No newline at end of file\n";
+        let rows = side_by_side(diff, false);
+        let shown: Vec<(Option<usize>, Option<usize>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.old.as_ref().map(|it| it.0),
+                    row.new.as_ref().map(|it| it.0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (Some(1), Some(1)),
+                (Some(2), Some(2)),
+                (Some(3), None),
+                (Some(4), Some(3)),
+                (None, Some(4)),
+            ]
+        );
+        assert_eq!(
+            rows[1].new.as_ref().map(|it| it.1.as_str()),
+            Some("new one")
+        );
+        assert!(side_by_side("", true).is_empty());
+        assert_eq!(side_by_side(diff, true)[0].old, Some((0, "x".to_owned())));
+    }
 
     #[test]
     fn the_status_gives_the_branch_and_the_changes() {
