@@ -182,6 +182,7 @@ enum Cmd {
     Snippets,
     EditThemes,
     Response,
+    Assistant,
     Debug,
     StopDebug,
     StepOver,
@@ -591,6 +592,7 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::Snippets, icon::CODE_BLOCK, "Edit Snippets", ""),
     spec(Cmd::EditThemes, icon::PALETTE, "Edit My Themes", ""),
     spec(Cmd::Response, icon::GLOBE, "Toggle HTTP Response", ""),
+    spec(Cmd::Assistant, icon::ROWS, "Toggle Assistant", ""),
     spec(Cmd::Debug, icon::BUG, "Debug File", "Ctrl+F5"),
     spec(Cmd::StopDebug, icon::STOP, "Stop Debugging", "Shift+F5"),
     spec(
@@ -838,6 +840,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::LivePreview),
             Some(Cmd::LivePreviewBrowser),
             Some(Cmd::Response),
+            Some(Cmd::Assistant),
             Some(Cmd::Check),
             None,
             Some(Cmd::ToggleTerminal),
@@ -1115,6 +1118,7 @@ enum Bottom {
     Debug,
     Tests,
     Terminal,
+    Assistant,
 }
 
 /// Find and replace in the active file.
@@ -1537,6 +1541,8 @@ pub struct GodApp {
     env_pick: Option<(Vec<String>, usize)>,
     /// What Docker has, while it is looked at.
     docker: Option<Docker>,
+    /// What was said with the assistant, and to which model.
+    chat: Chat,
     /// The layouts kept under a name; and the one chosen while they are picked from.
     layouts: Vec<Arrangement>,
     layout_pick: Option<usize>,
@@ -1766,6 +1772,10 @@ impl GodApp {
             env_file: get("env_file").filter(|name| !name.is_empty()),
             env_pick: None,
             docker: None,
+            chat: Chat::new(
+                get("assistant_provider").as_deref(),
+                get("assistant_model").unwrap_or_default(),
+            ),
             database: None,
             last_task: None,
             log: None,
@@ -4194,6 +4204,180 @@ impl GodApp {
         }
     }
 
+    /// Ask the provider of the assistant which models it has, out of the way.
+    fn list_models(&mut self, ctx: &Context) {
+        let provider = self.chat.provider;
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            // The window may be gone: nobody listens then.
+            let _ = sender.send(crate::assistant::models(provider));
+            waking.request_repaint();
+        });
+        self.chat.listing = Some(receiver);
+        self.chat.listed = true;
+    }
+
+    /// Send what was written to the model, with the talk so far and the file in front.
+    fn ask_assistant(&mut self, ctx: &Context) {
+        use crate::assistant::{self, Message, Settings};
+        let question = std::mem::take(&mut self.chat.typed);
+        if question.trim().is_empty() {
+            return;
+        }
+        if self.chat.model.is_empty() {
+            self.chat.error = Some("Choose a model first".to_owned());
+            self.chat.typed = question;
+            return;
+        }
+        let system = match self.tabs.get(self.active) {
+            Some(tab) => {
+                let (start, end) = (tab.selection.start, tab.selection.end);
+                let chars = tab.text.chars().skip(start.min(end));
+                let chosen: String = chars.take(start.abs_diff(end)).collect();
+                let chosen = Some(chosen.as_str()).filter(|chosen| !chosen.is_empty());
+                assistant::system(Some(&tab.name), tab.language.name, &tab.text, chosen)
+            }
+            None => assistant::system(None, "", "", None),
+        };
+        self.chat.messages.push(Message {
+            from_user: true,
+            text: question,
+        });
+        self.chat.error = None;
+        let settings = Settings {
+            provider: self.chat.provider,
+            model: self.chat.model.clone(),
+        };
+        let messages = self.chat.messages.clone();
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            // The window may be gone: nobody listens then.
+            let _ = sender.send(assistant::ask(&settings, &system, &messages));
+            waking.request_repaint();
+        });
+        self.chat.asking = Some(receiver);
+    }
+
+    /// The talk with the assistant: who answers, what was said, the question to write.
+    fn assistant_panel(&mut self, ui: &mut Ui) {
+        use crate::assistant::{Message, Provider};
+        let palette = Palette::of(ui);
+        let ctx = ui.ctx().clone();
+        match self.chat.asking.as_ref().map(Receiver::try_recv) {
+            Some(Ok(Ok(text))) => {
+                self.chat.asking = None;
+                let from_user = false;
+                self.chat.messages.push(Message { from_user, text });
+            }
+            Some(Ok(Err(err))) => (self.chat.asking, self.chat.error) = (None, Some(err)),
+            Some(Err(TryRecvError::Disconnected)) => self.chat.asking = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        match self.chat.listing.as_ref().map(Receiver::try_recv) {
+            Some(Ok(Ok(models))) => {
+                self.chat.listing = None;
+                // The model of the last time when it is still there, else the first.
+                if !models.contains(&self.chat.model) {
+                    self.chat.model = models.first().cloned().unwrap_or_default();
+                }
+                self.chat.models = models;
+            }
+            Some(Ok(Err(err))) => (self.chat.listing, self.chat.error) = (None, Some(err)),
+            Some(Err(TryRecvError::Disconnected)) => self.chat.listing = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        if !self.chat.listed {
+            self.list_models(&ctx);
+        }
+        let asking = self.chat.asking.is_some();
+        let mut provider = self.chat.provider;
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let providers = egui::ComboBox::from_id_salt("assistant-provider");
+            providers.selected_text(provider.name()).show_ui(ui, |ui| {
+                for offered in [Provider::Ollama, Provider::Anthropic] {
+                    let label = match offered.available() {
+                        true => offered.name().to_owned(),
+                        false => format!("{} (set ANTHROPIC_API_KEY)", offered.name()),
+                    };
+                    ui.selectable_value(&mut provider, offered, label);
+                }
+            });
+            let chosen = match self.chat.model.is_empty() {
+                true => "No model",
+                false => self.chat.model.as_str(),
+            };
+            let models = egui::ComboBox::from_id_salt("assistant-model");
+            models.selected_text(chosen.to_owned()).show_ui(ui, |ui| {
+                for model in &self.chat.models {
+                    ui.selectable_value(&mut self.chat.model, model.clone(), model);
+                }
+            });
+            if ui.button("New chat").clicked() {
+                self.chat.messages.clear();
+                self.chat.error = None;
+            }
+            if asking || self.chat.listing.is_some() {
+                ui.spinner();
+            }
+        });
+        if provider != self.chat.provider {
+            // Its models are others: they are asked for again.
+            self.chat.provider = provider;
+            (self.chat.models, self.chat.listed) = (Vec::new(), false);
+            self.chat.model.clear();
+            self.chat.error = None;
+        }
+        ui.add_space(4.0);
+        let said = ScrollArea::vertical().id_salt("assistant-said");
+        let height = (ui.available_height() - 40.0).max(40.0);
+        let said = said.max_height(height).auto_shrink(false);
+        said.stick_to_bottom(true).show(ui, |ui| {
+            Frame::new()
+                .inner_margin(Margin::symmetric(12, 0))
+                .show(ui, |ui| {
+                    if self.chat.messages.is_empty() {
+                        let hint = "Ask about the file in front. Its text, and what is selected in \
+                                    it, are sent to the model with each question.";
+                        ui.label(RichText::new(hint).color(palette.text_dim));
+                    }
+                    for message in &self.chat.messages {
+                        let (who, ink) = match message.from_user {
+                            true => ("You", palette.accent),
+                            false => (self.chat.provider.name(), palette.text_dim),
+                        };
+                        ui.label(RichText::new(who).size(11.0).strong().color(ink));
+                        let text = RichText::new(&message.text).size(13.0);
+                        ui.add(egui::Label::new(text).selectable(true).wrap());
+                        ui.add_space(8.0);
+                    }
+                    if let Some(error) = &self.chat.error {
+                        ui.colored_label(palette.error, error);
+                    }
+                });
+        });
+        let mut send = false;
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let field = TextEdit::singleline(&mut self.chat.typed)
+                .margin(crate::widgets::FIELD_MARGIN)
+                .hint_text("Ask about this file…")
+                .desired_width(ui.available_width() - 80.0);
+            let field = ui.add(field);
+            let entered = field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            if entered {
+                field.request_focus();
+            }
+            let button = ui.add_enabled(!asking, Button::new("Send"));
+            send = (button.clicked() || entered) && !asking;
+        });
+        if send {
+            self.ask_assistant(&ctx);
+        }
+    }
+
     /// Keep the layout on show under `name`, in place of the one that had that name.
     fn save_layout(&mut self, name: &str) {
         if name.is_empty() || name.contains(['\t', '\n']) {
@@ -6122,6 +6306,10 @@ impl GodApp {
                 let shown = self.bottom == Some(Bottom::Response);
                 self.bottom = (!shown).then_some(Bottom::Response);
             }
+            Cmd::Assistant => {
+                let shown = self.bottom == Some(Bottom::Assistant);
+                self.bottom = (!shown).then_some(Bottom::Assistant);
+            }
             Cmd::History => {
                 let path = self.tabs.get(self.active).and_then(|tab| tab.path.clone());
                 let versions = path.as_deref().map(versions_of).unwrap_or_default();
@@ -7026,6 +7214,7 @@ impl GodApp {
                 (Bottom::Debug, "DEBUG".to_owned()),
                 (Bottom::Tests, format!("TESTS  {}", self.tests.1.len())),
                 (Bottom::Terminal, "TERMINAL".to_owned()),
+                (Bottom::Assistant, "ASSISTANT".to_owned()),
             ];
             for (view, title) in views {
                 let active = view == shown;
@@ -7046,6 +7235,7 @@ impl GodApp {
                         Bottom::Debug => Cmd::DebugPanel,
                         Bottom::Tests => Cmd::TestsPanel,
                         Bottom::Terminal => Cmd::ToggleTerminal,
+                        Bottom::Assistant => Cmd::Assistant,
                     });
                 }
             }
@@ -7057,6 +7247,7 @@ impl GodApp {
                         &[(icon::BUG, "Check for problems (Ctrl+Shift+B)", Cmd::Check)],
                     ),
                     Bottom::Todo => (Cmd::Todo, &[]),
+                    Bottom::Assistant => (Cmd::Assistant, &[]),
                     Bottom::Tests => (
                         Cmd::TestsPanel,
                         &[(
@@ -7123,6 +7314,7 @@ impl GodApp {
             Bottom::Todo => self.todo_list(ui),
             Bottom::Debug => self.debug_panel(ui),
             Bottom::Tests => self.tests_list(ui),
+            Bottom::Assistant => self.assistant_panel(ui),
             Bottom::Response => {
                 let shown = if self.requesting.is_some() {
                     "Waiting for the answer…"
@@ -8518,6 +8710,8 @@ impl eframe::App for GodApp {
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
         storage.set_string("layouts", layouts_text(&self.layouts));
+        storage.set_string("assistant_provider", self.chat.provider.name().to_owned());
+        storage.set_string("assistant_model", self.chat.model.clone());
         storage.set_string("env_file", self.env_file.clone().unwrap_or_default());
         storage.set_string("environment", self.environment.clone().unwrap_or_default());
         let watched: Vec<&str> = self
@@ -8629,6 +8823,45 @@ fn load_themes() -> Result<(), String> {
     Ok(())
 }
 
+/// A talk with a language model about the code in front.
+struct Chat {
+    provider: crate::assistant::Provider,
+    model: String,
+    /// The models the provider has, once it was asked; and the answer awaited.
+    models: Vec<String>,
+    listed: bool,
+    listing: Option<Receiver<Result<Vec<String>, String>>>,
+    messages: Vec<crate::assistant::Message>,
+    /// The question being written, the answer awaited, why the last one did not come.
+    typed: String,
+    asking: Option<Receiver<Result<String, String>>>,
+    error: Option<String>,
+}
+
+impl Chat {
+    /// A talk not begun, with the provider and the model of the last time: before any
+    /// was chosen, Anthropic when its key is there, else a model of this machine.
+    fn new(provider: Option<&str>, model: String) -> Self {
+        use crate::assistant::Provider;
+        let both = [Provider::Anthropic, Provider::Ollama];
+        let named = both
+            .into_iter()
+            .find(|known| Some(known.name()) == provider);
+        let fallback = both.into_iter().find(|known| known.available());
+        Self {
+            provider: named.or(fallback).unwrap_or(Provider::Ollama),
+            model,
+            models: Vec::new(),
+            listed: false,
+            listing: None,
+            messages: Vec::new(),
+            typed: String::new(),
+            asking: None,
+            error: None,
+        }
+    }
+}
+
 /// What Docker has, as it last said; what its last command printed; and the answer awaited
 /// (what a command printed, the containers, the images).
 #[derive(Default)]
@@ -8650,13 +8883,14 @@ struct Merging {
 
 /// What can show beside the editor and under it, in the order layouts are written with.
 const SIDES: [Side; 4] = [Side::Explorer, Side::Search, Side::Git, Side::Structure];
-const BOTTOMS: [Bottom; 6] = [
+const BOTTOMS: [Bottom; 7] = [
     Bottom::Problems,
     Bottom::Todo,
     Bottom::Response,
     Bottom::Debug,
     Bottom::Tests,
     Bottom::Terminal,
+    Bottom::Assistant,
 ];
 
 /// How the window is laid out, kept under a name: what shows beside the editor and under

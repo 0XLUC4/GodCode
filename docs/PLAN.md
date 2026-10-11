@@ -220,8 +220,12 @@ API de plugins (WASM isolé) une fois le cœur stable.
 
 ### Phase 8 — IA (⏳, volontairement en dernier)
 
-Assistant contextuel, complétion multiligne, agents avec validation humaine, modèles
-locaux, MCP.
+Fait : assistant contextuel — panneau `ASSISTANT` (`Toggle Assistant`) : une question est envoyée avec la
+conversation, le texte du fichier en avant (60 000 caractères au plus) et la sélection. Modèles locaux
+par Ollama (`OLLAMA_HOST`, 127.0.0.1:11434 par défaut), ou API Anthropic quand `ANTHROPIC_API_KEY` est
+dans l'environnement ; passe par `curl`, la clé n'apparaît jamais sur la ligne de commande. Rien n'est
+envoyé tant qu'on n'a pas posé de question. Pas de réponse au fil de l'eau, réponses en texte brut.
+Reste : complétion multiligne, agents avec validation humaine, MCP.
 
 ### Hors périmètre tant que le reste n'est pas solide (❌)
 

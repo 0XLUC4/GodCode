@@ -10,7 +10,6 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 
 /// Who answers: a model running on this machine, or one of Anthropic.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     Ollama,
@@ -18,7 +17,6 @@ pub enum Provider {
 }
 
 /// One thing said in the conversation, by the user or by the model.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     pub from_user: bool,
@@ -26,7 +24,6 @@ pub struct Message {
 }
 
 /// Where to ask and what.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub provider: Provider,
@@ -34,7 +31,6 @@ pub struct Settings {
 }
 
 /// The models of Anthropic offered, the one to start with first.
-#[allow(dead_code)]
 pub const ANTHROPIC_MODELS: [&str; 3] = [
     "claude-sonnet-5-5",
     "claude-opus-5-5",
@@ -50,7 +46,6 @@ const PATIENCE: &str = "120";
 const MOST_OF_A_FILE: usize = 60_000;
 
 impl Provider {
-    #[allow(dead_code)]
     pub fn name(self) -> &'static str {
         match self {
             Self::Ollama => "Ollama",
@@ -60,7 +55,6 @@ impl Provider {
 
     /// Whether it can be asked at all: Anthropic needs a key. Whether Ollama runs is only
     /// known by asking.
-    #[allow(dead_code)]
     pub fn available(self) -> bool {
         match self {
             Self::Ollama => true,
@@ -295,7 +289,6 @@ fn ollama() -> String {
 }
 
 /// The models `provider` can be asked: those Ollama holds, or the ones of Anthropic.
-#[allow(dead_code)]
 pub fn models(provider: Provider) -> Result<Vec<String>, String> {
     match provider {
         Provider::Anthropic => Ok(ANTHROPIC_MODELS.map(str::to_owned).to_vec()),
@@ -308,7 +301,6 @@ pub fn models(provider: Provider) -> Result<Vec<String>, String> {
 
 /// Ask `messages`, the conversation so far, of the model of `settings`, told `system`
 /// first, and wait for what it answers: up to two minutes.
-#[allow(dead_code)]
 pub fn ask(settings: &Settings, system: &str, messages: &[Message]) -> Result<String, String> {
     let provider = settings.provider;
     let body = body(settings, system, messages);
@@ -353,7 +345,6 @@ fn beginning(text: &str, most: usize) -> (&str, bool) {
 
 /// What the model is told before the conversation: who it is, and the file in front,
 /// named `file`, written in `language`, holding `text`, with what is selected in it.
-#[allow(dead_code)]
 pub fn system(file: Option<&str>, language: &str, text: &str, selection: Option<&str>) -> String {
     let mut told = format!(
         "You are the assistant of GodCode, a code editor. Answer briefly and to the point. \
