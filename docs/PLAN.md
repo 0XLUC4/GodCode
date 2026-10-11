@@ -119,7 +119,10 @@ commandes) marche avec les deux. Il s'active par `Toggle Fast Rendering (Experim
 | Replis gardés d'une session à l'autre, repli par accolades ou par le serveur de langage | ⏳ |
 | Indices en ligne (inlay hints) : écrits dans la ligne sans faire partie du texte, redemandés à chaque changement ; le serveur TypeScript est réglé pour en donner, rust-analyzer et clangd en donnent d'eux-mêmes (non lancés ici) | ✅ derrière le réglage |
 | Réglage pour couper les indices, indices demandés pour les seules lignes visibles (aujourd'hui : tout le fichier) | ⏳ |
-| Sélection en colonnes, modes Vim/Emacs | ⏳ |
+| Sélection en colonnes : `Alt+Maj+glisser` ou `Ctrl+Alt+Maj+flèches` ; ce qui est tapé remplace chaque ligne du rectangle, puis chaque ligne garde un curseur | ✅ |
+| Touches Vim (`Switch Keys`) : modes normal, insertion, visuel et visuel ligne ; déplacements `h j k l w b e 0 ^ $ gg G` avec compte ; `d c y` avec déplacement ou doublés, `x D C p P r J o O i a I A u Ctrl+R /` ; mode affiché dans la barre d'état, curseur bloc dans le nouveau champ. Moteur pur et testé : `crates/core/src/modal.rs` | ✅ |
+| Touches Emacs : `Ctrl+F B N P A E`, `Alt+F B`, `Ctrl+D K Y W`, `Alt+W D`, marque `Ctrl+Espace`, `Ctrl+G`, `Ctrl+/`, `Ctrl+S` cherche, `Ctrl+X Ctrl+S` enregistre, `Ctrl+X Ctrl+F` ouvre | ✅ (moteur testé, non vu tourner à l'écran) |
+| Vim : `.`, `f t`, objets de texte (`iw`, `i(`), registres nommés, `:` ; annulation plus fine que celle du champ (par pauses de frappe) | ⏳ |
 | Bascule par défaut, puis retrait de l'ancien champ | ⏳ |
 
 ### Phase 4 — exécution, tests, débogage (⏳)

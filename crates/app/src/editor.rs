@@ -92,6 +92,8 @@ pub struct Config<'a> {
     pub lines_only: bool,
     /// What the language server writes in the lines; shown with `lines_only` alone.
     pub hints: &'a [field::Hint],
+    /// The caret covers its char: keys are commands (Vim). With `lines_only` alone.
+    pub block_caret: bool,
 }
 
 /// Layout key and caret a bracket pair was looked up for, and the pair found.
@@ -116,6 +118,12 @@ pub struct View {
     pub fold_at_caret: bool,
     /// The completion just picked, for the app to take: it may come with an import.
     pub accepted: Option<Completion>,
+    /// A rectangle of text being selected: the same columns on every line it crosses.
+    pub block: Option<Block>,
+    /// Move the far corner of that rectangle by lines and columns, on the next frame.
+    pub block_step: Option<(isize, isize)>,
+    /// Scroll no more than it takes to see the caret, on the next frame.
+    pub reveal: bool,
     layout: Option<Layout>,
     /// What the field that shows only the lines in view worked out of the text.
     index: Option<Arc<field::Index>>,
@@ -444,6 +452,180 @@ fn pair(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>) -> bool {
     !steps_over
 }
 
+/// A rectangle of text: two corners, each a line and a column. A column may be past the end
+/// of its line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    /// The corner that stays.
+    anchor: (usize, usize),
+    /// The corner that moves.
+    head: (usize, usize),
+    /// Where the caret of the text field was put for it, once it is: the rectangle is given
+    /// up when the caret is found elsewhere.
+    caret: Option<usize>,
+}
+
+/// The chars a block covers on each of its lines, from the first line down.
+fn block_ranges(text: &str, block: &Block) -> Vec<Range<usize>> {
+    let (first, last) = (
+        block.anchor.0.min(block.head.0),
+        block.anchor.0.max(block.head.0),
+    );
+    let (left, right) = (
+        block.anchor.1.min(block.head.1),
+        block.anchor.1.max(block.head.1),
+    );
+    let mut start = 0;
+    let mut ranges = Vec::new();
+    for (line, content) in text.split('\n').enumerate().take(last + 1) {
+        let len = content.chars().count();
+        if line >= first {
+            ranges.push(start + left.min(len)..start + right.min(len));
+        }
+        start += len + 1;
+    }
+    ranges
+}
+
+/// Write `written` over each of `ranges`, which come in order and apart. Returns the caret
+/// after each.
+fn write_over(text: &mut String, ranges: &[Range<usize>], written: &str) -> Vec<usize> {
+    let width = written.chars().count();
+    let mut grown = 0;
+    let mut shrunk = 0;
+    let carets = ranges.iter().map(|range| {
+        grown += width;
+        let caret = range.start + grown - shrunk;
+        shrunk += range.len();
+        caret
+    });
+    let carets = carets.collect();
+    // From the last one to the first, so that the places still to change stay put.
+    for range in ranges.iter().rev() {
+        let bytes =
+            godcode_core::byte_index(text, range.start)..godcode_core::byte_index(text, range.end);
+        text.replace_range(bytes, written);
+    }
+    carets
+}
+
+/// With a rectangle selected, what is typed is written over each of its lines; then each
+/// line keeps a caret. Returns whether the text changed.
+fn type_in_block(ui: &Ui, id: Id, text: &mut String, view: &mut View) -> bool {
+    enum Act {
+        Write(String),
+        Erase,
+        Copy,
+        Cut,
+        /// Back to carets, one on each line.
+        Carets,
+        Leave,
+    }
+    let caret = selection_of(ui.ctx(), id)
+        .filter(Range::is_empty)
+        .map(|selection| selection.start);
+    if let (Some((lines, columns)), Some(caret)) = (view.block_step.take(), caret) {
+        // Without a rectangle yet, it starts at the caret.
+        let mut block = view.block.unwrap_or_else(|| {
+            let before = &text[..godcode_core::byte_index(text, caret)];
+            let line = before.rsplit('\n').next().unwrap_or("");
+            let at = (before.matches('\n').count(), line.chars().count());
+            Block {
+                anchor: at,
+                head: at,
+                caret: None,
+            }
+        });
+        let last = text.matches('\n').count();
+        block.head.0 = block.head.0.saturating_add_signed(lines).min(last);
+        block.head.1 = block.head.1.saturating_add_signed(columns);
+        block.caret = None;
+        view.block = Some(block);
+        return false;
+    }
+    let Some(block) = view.block else {
+        return false;
+    };
+    if block.caret.is_some() && block.caret != caret {
+        view.block = None;
+        return false;
+    }
+    let ranges = block_ranges(text, &block);
+    let empty = ranges.iter().all(Range::is_empty);
+    let act = ui.input_mut(|input| {
+        if input.consume_key(Modifiers::NONE, Key::Escape) {
+            return Some(Act::Leave);
+        }
+        // Nothing selected: erasing is the business of the carets, one on each line.
+        let erases = input.key_pressed(Key::Backspace) || input.key_pressed(Key::Delete);
+        if erases && !empty {
+            input.consume_key(Modifiers::NONE, Key::Backspace);
+            input.consume_key(Modifiers::NONE, Key::Delete);
+            return Some(Act::Erase);
+        }
+        let act = input.events.iter().find_map(|event| match event {
+            Event::Text(typed) => Some(Act::Write(typed.clone())),
+            Event::Paste(pasted) if !pasted.contains('\n') => Some(Act::Write(pasted.clone())),
+            Event::Copy => Some(Act::Copy),
+            Event::Cut => Some(Act::Cut),
+            _ => None,
+        });
+        if act.is_some() {
+            let taken = |event: &Event| {
+                matches!(
+                    event,
+                    Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut
+                )
+            };
+            input.events.retain(|event| !taken(event));
+        } else if erases {
+            return Some(Act::Carets);
+        }
+        act
+    });
+    let Some(act) = act else {
+        return false;
+    };
+    let written = match &act {
+        Act::Leave => {
+            view.block = None;
+            return false;
+        }
+        Act::Carets => "",
+        Act::Copy | Act::Cut => {
+            let chars = |range: &Range<usize>| {
+                godcode_core::byte_index(text, range.start)
+                    ..godcode_core::byte_index(text, range.end)
+            };
+            let lines: Vec<&str> = ranges.iter().map(|range| &text[chars(range)]).collect();
+            ui.ctx().copy_text(lines.join("\n"));
+            if matches!(act, Act::Copy) {
+                return false;
+            }
+            ""
+        }
+        Act::Erase => "",
+        Act::Write(written) => written,
+    };
+    let before = text.len();
+    let carets = match &act {
+        Act::Carets => ranges.iter().map(|range| range.start).collect(),
+        _ => write_over(text, &ranges, written),
+    };
+    // The line of the corner that moved keeps the caret of the text field.
+    let main = if block.head.0 < block.anchor.0 {
+        carets.first()
+    } else {
+        carets.last()
+    };
+    view.block = None;
+    if let Some(main) = main.copied() {
+        view.extra = carets.into_iter().filter(|caret| *caret != main).collect();
+        set_selection(ui.ctx(), id, &(main..main));
+    }
+    text.len() != before || !written.is_empty()
+}
+
 /// With several carets, what is typed or erased happens at each of them. Returns whether
 /// the text changed.
 fn type_at_carets(ui: &Ui, id: Id, text: &mut String, view: &mut View) -> bool {
@@ -574,7 +756,7 @@ fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View
         }
         return false;
     }
-    if type_at_carets(ui, id, text, view) {
+    if type_in_block(ui, id, text, view) || type_at_carets(ui, id, text, view) {
         return true;
     }
     let pressed = |modifiers, key| ui.input_mut(|input| input.consume_key(modifiers, key));
@@ -854,6 +1036,7 @@ pub fn show(
                     margin: MARGIN,
                     min_size: body.size(),
                     hints: config.hints,
+                    block_caret: config.block_caret,
                 };
                 let (index, folded) = (&mut view.index, &mut view.folded);
                 let shown = field::show(ui, id, text, &look, index, folded);
@@ -944,10 +1127,49 @@ pub fn show(
             // Alt+click leaves a caret where the caret was; a plain click is one caret again.
             if response.clicked() {
                 match &selected_before {
-                    Some(old) if ui.input(|input| input.modifiers.alt) => {
+                    Some(old) if ui.input(|input| input.modifiers.alt && !input.modifiers.shift) => {
                         view.extra.push(old.start)
                     }
                     _ => view.extra.clear(),
+                }
+            }
+            // Alt+Shift and a drag select a rectangle, from where the button went down.
+            let columnar = ui.input(|input| input.modifiers.alt && input.modifiers.shift);
+            let pressed_at = ui.input(|input| input.pointer.press_origin());
+            if columnar
+                && response.dragged_by(egui::PointerButton::Primary)
+                && let (Some(from), Some(to)) = (pressed_at, response.interact_pointer_pos())
+            {
+                let cell = |pos: Pos2| {
+                    let within = pos - galley_pos;
+                    let column = (within.x / digit).round().max(0.0) as usize;
+                    (geometry.line_at(within.y.max(0.0)), column)
+                };
+                view.block = Some(Block {
+                    anchor: cell(from),
+                    head: cell(to),
+                    caret: None,
+                });
+            }
+            // The caret of the text field waits at the corner that moves.
+            let mut block_shown = Vec::new();
+            if let Some(block) = &mut view.block {
+                block_shown = block_ranges(text, block);
+                let at = if block.head.0 < block.anchor.0 {
+                    block_shown.first()
+                } else {
+                    block_shown.last()
+                };
+                if let (None, Some(at)) = (block.caret, at) {
+                    let caret = if block.head.1 < block.anchor.1 {
+                        at.start
+                    } else {
+                        at.end
+                    };
+                    set_selection(ui.ctx(), id, &(caret..caret));
+                    block.caret = Some(caret);
+                    selection = Some(caret..caret);
+                    view.extra.clear();
                 }
             }
             let jump = (response.clicked() && ui.input(|input| input.modifiers.command))
@@ -1064,6 +1286,19 @@ pub fn show(
                     ));
                 }
             }
+            // The rectangle: a band on each line, a bar where the line has nothing in it.
+            for range in &block_shown {
+                let from = geometry.pos(range.start).translate(origin);
+                let to = geometry.pos(range.end).translate(origin);
+                let right = to.min.x.max(from.min.x + 1.5);
+                let band = Rect::from_min_max(from.min, pos2(right, from.max.y));
+                let ink = if range.is_empty() {
+                    palette.text
+                } else {
+                    ui.visuals().selection.bg_fill
+                };
+                shapes.push(Shape::rect_filled(band, 0.0, ink));
+            }
             ui.painter().set(under, Shape::Vec(shapes));
             if let (Some(note), Some(range)) = (config.note, cursor_range) {
                 let index = range.primary.index.0;
@@ -1099,6 +1334,10 @@ pub fn show(
             if let Some(index) = view.scroll_to.take() {
                 let target = geometry.pos(index).translate(origin);
                 ui.scroll_to_rect(target.expand2(vec2(60.0, 0.0)), Some(Align::Center));
+            }
+            if let (true, Some(caret)) = (std::mem::take(&mut view.reveal), caret) {
+                let around = caret.translate(origin).expand2(vec2(4.0 * digit, row_height));
+                ui.scroll_to_rect(around, None);
             }
             changed |= typed;
             let caret_screen = caret.map(|caret| caret.translate(origin).left_bottom());
@@ -1513,6 +1752,7 @@ mod tests {
                 stopped: None,
                 lines_only: self.lines_only,
                 hints: &self.hints,
+                block_caret: false,
             };
             let mut output = None;
             let _ = self.ctx.run_ui(input, |ui| {
@@ -1743,6 +1983,39 @@ mod tests {
         harness.frame(Vec::new());
         harness.type_text("// top\n");
         assert_eq!(harness.view.folded, [5]);
+    }
+
+    #[test]
+    fn a_rectangle_is_selected_and_written_over_line_by_line() {
+        LINES_ONLY.set(true);
+        let mut harness = Harness::new("abcd\nef\nghij\n");
+        set_selection(&harness.ctx, editor_id(), &(1..1));
+        harness.frame(Vec::new());
+        // Two lines down, two columns right: the short line gives what it has.
+        for step in [(1, 0), (1, 0), (0, 2)] {
+            harness.view.block_step = Some(step);
+            harness.frame(Vec::new());
+        }
+        let block = harness.view.block.expect("a rectangle");
+        assert_eq!(block_ranges(&harness.text, &block), [1..3, 6..7, 9..11]);
+        assert_eq!(harness.frame(Vec::new()).selection, Some(11..11));
+        harness.type_text("X");
+        assert_eq!(harness.text, "aXd\neX\ngXj\n");
+        // Each line keeps a caret: what is typed next goes on all of them.
+        assert_eq!(harness.view.extra, [2, 6]);
+        harness.type_text("Y");
+        assert_eq!(harness.text, "aXYd\neXY\ngXYj\n");
+
+        // A column past the end of a line is its end.
+        let wide = Block {
+            anchor: (0, 9),
+            head: (1, 2),
+            caret: None,
+        };
+        assert_eq!(block_ranges("abc\nd\n", &wide), [2..3, 5..5]);
+        let mut text = "abc\nd\n".to_owned();
+        assert_eq!(write_over(&mut text, &[2..3, 5..5], "--"), [4, 8]);
+        assert_eq!(text, "ab--\nd--\n");
     }
 
     #[test]

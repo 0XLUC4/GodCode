@@ -19,6 +19,7 @@ use godcode_core::markdown;
 use godcode_core::outline::{self, Symbol};
 use godcode_core::search::{self, Hit, Match};
 use godcode_core::syntax::Language;
+use godcode_core::modal::{self, Ask, Stroke as Typed};
 use godcode_core::{Decoded, Indent, LineEnding, complete, edit, format, fuzzy};
 use godcode_lsp::Event as ServerEvent;
 
@@ -140,6 +141,7 @@ enum Cmd {
     Preview,
     Minimap,
     LinesOnly,
+    Keys,
     Fold,
     UnfoldAll,
     StickyScroll,
@@ -462,6 +464,12 @@ const COMMANDS: &[Spec] = &[
         "Toggle Fast Rendering (Experimental)",
         "",
     ),
+    spec(
+        Cmd::Keys,
+        icon::KEYBOARD,
+        "Switch Keys: Default / Vim / Emacs",
+        "",
+    ),
     spec(Cmd::Fold, icon::ROWS, "Fold / Unfold Block", ""),
     spec(Cmd::UnfoldAll, icon::ROWS, "Unfold All", ""),
     spec(
@@ -590,7 +598,9 @@ const COMMANDS: &[Spec] = &[
 ];
 
 /// Keys of the editor that are not commands, for the shortcut list.
-const EDITOR_KEYS: [(&str, &str); 8] = [
+const EDITOR_KEYS: [(&str, &str); 10] = [
+    ("Select a rectangle of text", "Alt+Shift+Drag"),
+    ("Grow the rectangle", "Ctrl+Alt+Shift+Arrows"),
     ("Go to the declaration of a name", "Ctrl+Click"),
     ("Search everywhere", "Ctrl+P"),
     ("Close the tag being typed", ">"),
@@ -692,6 +702,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Preview),
             Some(Cmd::Minimap),
             Some(Cmd::LinesOnly),
+            Some(Cmd::Keys),
             Some(Cmd::Fold),
             Some(Cmd::UnfoldAll),
             Some(Cmd::StickyScroll),
@@ -1139,6 +1150,52 @@ enum Asked {
     },
 }
 
+/// Whose keys the editor obeys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keys {
+    Default,
+    Vim,
+    Emacs,
+}
+
+/// The key of Vim (`commands`: it is not in insert mode) or of Emacs that a key of the
+/// keyboard is, if it is one. What is typed in Vim comes as text, not from here.
+fn stroke_of(key: Key, modifiers: Modifiers, vim: bool, commands: bool) -> Option<Typed> {
+    let (ctrl, alt) = (modifiers.command || modifiers.ctrl, modifiers.alt);
+    if vim {
+        return Some(match key {
+            Key::Escape if modifiers.is_none() => Typed::Escape,
+            Key::R if commands && ctrl && !alt && !modifiers.shift => Typed::Ctrl('r'),
+            _ if !commands || !modifiers.is_none() => return None,
+            Key::Enter => Typed::Enter,
+            Key::Backspace => Typed::Backspace,
+            Key::Delete => Typed::Delete,
+            Key::ArrowLeft => Typed::Left,
+            Key::ArrowRight => Typed::Right,
+            Key::ArrowUp => Typed::Up,
+            Key::ArrowDown => Typed::Down,
+            _ => return None,
+        });
+    }
+    let named = match key {
+        Key::Space => ' ',
+        Key::Slash => '/',
+        Key::Minus => '_',
+        key => {
+            let mut name = key.name().chars();
+            match (name.next(), name.next()) {
+                (Some(letter), None) if letter.is_ascii_alphabetic() => letter.to_ascii_lowercase(),
+                _ => return None,
+            }
+        }
+    };
+    match (ctrl, alt, modifiers.shift) {
+        (true, false, false) => Some(Typed::Ctrl(named)),
+        (false, true, false) => Some(Typed::Alt(named)),
+        _ => None,
+    }
+}
+
 /// Something the project can run: what it is called, and the command.
 type Task = (String, String);
 
@@ -1233,6 +1290,10 @@ pub struct GodApp {
     minimap: bool,
     /// The editor lays out only the lines in view: the new text field, still being tried.
     lines_only: bool,
+    /// Whose keys the editor obeys, and what Vim and Emacs remember between keys.
+    keys: Keys,
+    vim: modal::Vim,
+    emacs: modal::Emacs,
     /// The lines that open the blocks stay in view above the code.
     sticky: bool,
     /// Files are written a moment after each change.
@@ -1258,6 +1319,8 @@ pub struct GodApp {
     signature: Option<Call>,
     /// The foot of the caret on screen.
     caret_pos: Option<egui::Pos2>,
+    /// The editor in front had the keyboard the last time it showed.
+    editor_focused: bool,
     /// The definitions of the project last asked for by name, and that name.
     project_symbols: Vec<godcode_lsp::Named>,
     symbols_asked: String,
@@ -1394,6 +1457,13 @@ impl GodApp {
             top_line: 0.0,
             minimap: get("minimap").is_none_or(|value| value == "1"),
             lines_only: get("lines_only").is_some_and(|value| value == "1"),
+            keys: match get("keys").as_deref() {
+                Some("1") => Keys::Vim,
+                Some("2") => Keys::Emacs,
+                _ => Keys::Default,
+            },
+            vim: modal::Vim::default(),
+            emacs: modal::Emacs::default(),
             sticky: get("sticky").is_none_or(|value| value == "1"),
             autosave: get("autosave").is_some_and(|value| value == "1"),
             servers: Servers::default(),
@@ -1407,6 +1477,7 @@ impl GodApp {
             fixes: None,
             signature: None,
             caret_pos: None,
+            editor_focused: false,
             project_symbols: Vec::new(),
             symbols_asked: String::new(),
             served: Vec::new(),
@@ -4028,6 +4099,7 @@ impl GodApp {
             stopped: None,
             lines_only: false,
             hints: &[],
+            block_caret: false,
         };
         let id = tab.editor_id();
         if editor::run(ctx, id, &mut tab.text, &config, op) {
@@ -4335,6 +4407,20 @@ impl GodApp {
                     "Fast rendering off"
                 });
             }
+            Cmd::Keys => {
+                self.keys = match self.keys {
+                    Keys::Default => Keys::Vim,
+                    Keys::Vim => Keys::Emacs,
+                    Keys::Emacs => Keys::Default,
+                };
+                self.vim = modal::Vim::default();
+                self.emacs = modal::Emacs::default();
+                self.toasts.success(match self.keys {
+                    Keys::Default => "Keys: default",
+                    Keys::Vim => "Keys: Vim (normal mode; i to type, Esc to come back)",
+                    Keys::Emacs => "Keys: Emacs (Ctrl+X Ctrl+S saves, Ctrl+S searches)",
+                });
+            }
             Cmd::Documentation => self.ask_documentation(ctx),
             Cmd::LanguageServer => self.tell_server_state(ctx),
             Cmd::QuickFix => self.ask_fixes(ctx),
@@ -4575,7 +4661,98 @@ impl GodApp {
         });
     }
 
+    /// With the keys of Vim or Emacs, the keyboard goes through them first while the editor
+    /// has it: what they take reaches neither the text field nor the shortcuts.
+    fn modal_keys(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
+        let vim = self.keys == Keys::Vim;
+        let Some(tab) = self
+            .tabs
+            .get_mut(self.active)
+            .filter(|_| self.keys != Keys::Default)
+        else {
+            return;
+        };
+        let id = tab.editor_id();
+        // Escape takes the keyboard away from a text field before anything here sees it:
+        // in Vim it is a key like the others, and the editor keeps the keyboard.
+        let escaped =
+            vim && self.editor_focused && ctx.input(|input| input.key_pressed(Key::Escape));
+        if escaped {
+            tab.view.focus = true;
+        } else if !ctx.memory(|memory| memory.has_focus(id)) {
+            return;
+        }
+        let events = ctx.input(|input| input.events.clone());
+        let mut kept = Vec::with_capacity(events.len());
+        for event in events {
+            let commands = vim && self.vim.mode != modal::Mode::Insert;
+            let strokes: Vec<Typed> = match &event {
+                Event::Text(typed) if commands => typed.chars().map(Typed::Char).collect(),
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => stroke_of(*key, *modifiers, vim, commands)
+                    .into_iter()
+                    .collect(),
+                // Ctrl+X starts a command of Emacs: it cuts nothing.
+                Event::Cut if !vim => continue,
+                _ => Vec::new(),
+            };
+            let mut taken = false;
+            for stroke in strokes {
+                let done = if vim {
+                    self.vim.key(&mut tab.text, &tab.selection, stroke)
+                } else {
+                    self.emacs.key(&mut tab.text, &tab.selection, stroke)
+                };
+                let Some(done) = done else {
+                    continue;
+                };
+                taken = true;
+                if done.changed {
+                    tab.touched();
+                }
+                editor::set_selection(ctx, id, &done.selection);
+                tab.selection = done.selection;
+                tab.view.reveal = true;
+                if let Some(copied) = done.copied {
+                    ctx.copy_text(copied);
+                }
+                clicked.extend(done.ask.map(|ask| match ask {
+                    Ask::Undo => Cmd::Undo,
+                    Ask::Redo => Cmd::Redo,
+                    Ask::Find => Cmd::Find,
+                    Ask::Save => Cmd::Save,
+                    Ask::Open => Cmd::OpenFile,
+                }));
+            }
+            if !taken {
+                kept.push(event);
+            }
+        }
+        ctx.input_mut(|input| input.events = kept);
+    }
+
     fn shortcuts(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
+        self.modal_keys(ctx, clicked);
+        // A rectangle of text grows with Ctrl+Alt+Shift and the arrows: seen first, or they
+        // would be taken for Ctrl+Alt and an arrow.
+        let all = Modifiers::COMMAND | Modifiers::ALT | Modifiers::SHIFT;
+        let steps = [
+            (Key::ArrowUp, (-1, 0)),
+            (Key::ArrowDown, (1, 0)),
+            (Key::ArrowLeft, (0, -1)),
+            (Key::ArrowRight, (0, 1)),
+        ];
+        for (key, step) in steps {
+            if ctx.input_mut(|input| input.consume_key(all, key))
+                && let Some(tab) = self.tabs.get_mut(self.active)
+            {
+                tab.view.block_step = Some(step);
+            }
+        }
         let ctrl = Modifiers::COMMAND;
         let shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let alt = Modifiers::COMMAND | Modifiers::ALT;
@@ -4972,6 +5149,17 @@ impl GodApp {
                         if ui.add(server).on_hover_text(tip).clicked() {
                             clicked.push(Cmd::LanguageServer);
                         }
+                    }
+                    let keys = match (self.keys, self.vim.mode) {
+                        (Keys::Default, _) => "",
+                        (Keys::Emacs, _) => "Emacs",
+                        (Keys::Vim, modal::Mode::Normal) => "-- NORMAL --",
+                        (Keys::Vim, modal::Mode::Insert) => "-- INSERT --",
+                        (Keys::Vim, modal::Mode::Visual) => "-- VISUAL --",
+                        (Keys::Vim, modal::Mode::VisualLine) => "-- VISUAL LINE --",
+                    };
+                    if !keys.is_empty() {
+                        ui.label(dim(keys.to_owned()));
                     }
                     ui.label(dim(tab.ending.name().to_owned()));
                     ui.label(dim("UTF-8".to_owned()));
@@ -5635,6 +5823,7 @@ impl GodApp {
             stopped,
             lines_only: self.lines_only,
             hints: &tab.hints,
+            block_caret: front && self.keys == Keys::Vim && self.vim.mode != modal::Mode::Insert,
         };
         let id = tab.editor_id();
         let mut menu = |ui: &mut Ui| {
@@ -5670,6 +5859,7 @@ impl GodApp {
         }
         self.top_line = output.top_line;
         self.caret_pos = output.caret_pos;
+        self.editor_focused = focused;
         let pointed = output.pointed;
         // After a letter, a dot or a colon, the language server says what can follow; after
         // a bracket or a comma, which argument is being written.
@@ -6630,6 +6820,7 @@ impl eframe::App for GodApp {
         storage.set_string("preview", flag(self.preview));
         storage.set_string("minimap", flag(self.minimap));
         storage.set_string("lines_only", flag(self.lines_only));
+        storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("sticky", flag(self.sticky));
         storage.set_string("autosave", flag(self.autosave));
         storage.set_string("blame", flag(self.blame));

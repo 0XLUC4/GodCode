@@ -359,6 +359,8 @@ pub struct Look<'a> {
     pub min_size: Vec2,
     /// What a language server writes in the lines, sorted by line then by column.
     pub hints: &'a [Hint],
+    /// The caret covers its char instead of standing before it: keys are commands.
+    pub block_caret: bool,
 }
 
 pub struct Shown {
@@ -771,12 +773,17 @@ pub fn show(
     if let Some(pointer) = pointer.filter(|_| primary) {
         let at = lines.at(pointer - origin);
         let pressed = ui.input(|input| input.pointer.primary_pressed());
-        let shift = ui.input(|input| input.modifiers.shift);
+        let (shift, alt) = ui.input(|input| (input.modifiers.shift, input.modifiers.alt));
+        // With Alt and Shift a rectangle is being selected: that is the editor's to do.
+        let columnar = shift && alt;
         if pressed && response.hovered() {
             response.request_focus();
             let anchor = caret.filter(|_| shift).map_or(at, |old| old.anchor);
-            caret = Some(Caret { head: at, anchor });
+            if !columnar {
+                caret = Some(Caret { head: at, anchor });
+            }
         } else if response.dragged()
+            && !columnar
             && let Some(old) = caret
         {
             caret = Some(Caret { head: at, ..old });
@@ -828,8 +835,14 @@ pub fn show(
     }
     if focused && let Some(caret) = caret {
         let bar = lines.pos(caret.head).translate(origin.to_vec2());
-        let bar = Rect::from_min_size(bar.min, vec2(1.5, bar.height()));
-        painter.rect_filled(bar, 0.0, ui.visuals().text_cursor.stroke.color);
+        let ink = ui.visuals().text_cursor.stroke.color;
+        if look.block_caret {
+            let cell = Rect::from_min_size(bar.min, vec2(digit, bar.height()));
+            painter.rect_filled(cell, 0.0, ink.gamma_multiply(0.45));
+        } else {
+            let bar = Rect::from_min_size(bar.min, vec2(1.5, bar.height()));
+            painter.rect_filled(bar, 0.0, ink);
+        }
     }
 
     // The caret stays in view when the keyboard moved it.

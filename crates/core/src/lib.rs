@@ -10,6 +10,7 @@ pub mod fuzzy;
 pub mod git;
 pub mod http;
 pub mod markdown;
+pub mod modal;
 pub mod outline;
 pub mod search;
 pub mod syntax;
