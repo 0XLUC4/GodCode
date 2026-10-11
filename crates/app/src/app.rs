@@ -3060,33 +3060,31 @@ impl GodApp {
             ui.add_space(10.0);
             ui.label(RichText::new("COMMIT").size(12.0).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
                 ui.add_space(4.0);
                 refresh =
                     widgets::small_icon_button(ui, icon::ARROWS_CLOCKWISE, "Refresh").clicked();
-            });
-        });
-        // What is done with the repository, a click away as the changes are: on a row of
-        // its own, which goes on below when the bar is narrow.
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(6.0);
-            let tools = [
-                (
-                    icon::ARROW_LINE_DOWN,
-                    "Update project: pull (Ctrl+T)",
-                    Cmd::GitPull,
-                ),
-                (icon::ARROW_LINE_UP, "Push", Cmd::GitPush),
-                (icon::CLOUD_ARROW_DOWN, "Fetch", Cmd::GitFetch),
-                (icon::TRAY_ARROW_DOWN, "Stash the changes", Cmd::Stash),
-                (icon::TRAY_ARROW_UP, "Stash pop", Cmd::StashPop),
-                (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
-                (icon::GRAPH, "Git graph", Cmd::GitGraph),
-            ];
-            for (glyph, tip, cmd) in tools {
-                if widgets::small_icon_button(ui, glyph, tip).clicked() {
-                    self.pending.push(cmd);
+                // What is done with the repository, a click away as the changes are. The
+                // bar is never narrower than this row needs.
+                let tools = [
+                    (icon::GRAPH, "Git graph", Cmd::GitGraph),
+                    (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
+                    (icon::TRAY_ARROW_UP, "Stash pop", Cmd::StashPop),
+                    (icon::TRAY_ARROW_DOWN, "Stash the changes", Cmd::Stash),
+                    (icon::CLOUD_ARROW_DOWN, "Fetch", Cmd::GitFetch),
+                    (icon::ARROW_LINE_UP, "Push", Cmd::GitPush),
+                    (
+                        icon::ARROW_LINE_DOWN,
+                        "Update project: pull (Ctrl+T)",
+                        Cmd::GitPull,
+                    ),
+                ];
+                for (glyph, tip, cmd) in tools {
+                    if widgets::small_icon_button(ui, glyph, tip).clicked() {
+                        self.pending.push(cmd);
+                    }
                 }
-            }
+            });
         });
         ui.add_space(4.0);
         let note = |ui: &mut Ui, text: &str| {
@@ -10017,8 +10015,8 @@ impl eframe::App for GodApp {
             if self.sidebar && !zen {
                 Panel::left("side-bar")
                     .resizable(true)
-                    .default_size(260.0)
-                    .size_range(180.0..=520.0)
+                    .default_size(SIDE_LEAST + 10.0)
+                    .size_range(SIDE_LEAST..=520.0)
                     .frame(plain(palette.bg, Margin::symmetric(0, 8)))
                     .show(ui, |ui| {
                         // A view that has little to show keeps the width it was given:
@@ -10266,6 +10264,10 @@ struct Ghost {
 /// Seconds without a key before the model is asked what comes next, when it is asked
 /// while typing.
 const SUGGEST_PAUSE: f64 = 0.7;
+
+/// The least width of the bar beside the code: what the title and the row of buttons of
+/// its widest view, the commit one, need to stand side by side.
+const SIDE_LEAST: f32 = 280.0;
 
 /// How many times in a row a model may ask for tools before it is stopped.
 const TOOL_ROUNDS: usize = 8;
