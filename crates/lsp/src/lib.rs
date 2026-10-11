@@ -89,6 +89,25 @@ pub struct Hint {
     pub label: String,
 }
 
+/// What a stretch of lines that folds is, when the server says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldKind {
+    Comment,
+    Imports,
+    /// Between two marks written for that: `// #region` and `// #endregion`.
+    Region,
+}
+
+/// Lines the server says can be folded away: from `first` to `last`, both counted from 0
+/// and both part of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fold {
+    pub first: usize,
+    pub last: usize,
+    /// Nothing for plain code: a function, a block, a list.
+    pub kind: Option<FoldKind>,
+}
+
 /// What the server said.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -139,6 +158,11 @@ pub enum Event {
         id: u64,
         list: Vec<Hint>,
     },
+    /// What can be folded in the file asked about, from its top down.
+    Folds {
+        id: u64,
+        list: Vec<Fold>,
+    },
     /// The server is gone, or refused to start: what it said, when it said something.
     Exited {
         why: String,
@@ -159,6 +183,7 @@ enum Asked {
     Signature,
     Symbols,
     Hints,
+    Folds,
     /// What can be called at a position was asked, to then ask for its callers (`true`) or
     /// for what it calls.
     Callable(bool),
@@ -494,6 +519,7 @@ impl Server {
                     "callHierarchy": {},
                     "signatureHelp": {},
                     "inlayHint": {},
+                    "foldingRange": { "lineFoldingOnly": true },
                     "rename": {},
                     "formatting": {},
                     "codeAction": {
@@ -691,6 +717,12 @@ impl Server {
         self.request("textDocument/inlayHint", params, Asked::Hints)
     }
 
+    /// Ask what can be folded in a file; answered by [`Event::Folds`].
+    pub fn folds(&mut self, path: &Path) -> u64 {
+        let params = json!({ "textDocument": { "uri": uri_of(path) } });
+        self.request("textDocument/foldingRange", params, Asked::Folds)
+    }
+
     /// Ask for the definitions of the project whose name looks like `query`; answered by
     /// [`Event::Symbols`].
     pub fn symbols(&mut self, query: &str) -> u64 {
@@ -864,6 +896,10 @@ impl Server {
             Asked::Hints => events.push(Event::Hints {
                 id,
                 list: hints(result),
+            }),
+            Asked::Folds => events.push(Event::Folds {
+                id,
+                list: folds(result),
             }),
             Asked::References => {
                 let list = result.as_array().into_iter().flatten();
@@ -1041,6 +1077,32 @@ fn hints(result: &Value) -> Vec<Hint> {
         .collect();
     hints.sort_by_key(|hint| (hint.line, hint.column));
     hints
+}
+
+/// The `FoldingRange`s of an answer, from the top of the file down, each stretch of lines
+/// once. One that ends on the line it starts on folds nothing, and is left out.
+fn folds(result: &Value) -> Vec<Fold> {
+    let list = result.as_array().into_iter().flatten();
+    let mut folds: Vec<Fold> = list
+        .filter_map(|found| {
+            let line = |key: &str| Some(found[key].as_u64()? as usize);
+            let kind = match found["kind"].as_str() {
+                Some("comment") => Some(FoldKind::Comment),
+                Some("imports") => Some(FoldKind::Imports),
+                Some("region") => Some(FoldKind::Region),
+                _ => None,
+            };
+            Some(Fold {
+                first: line("startLine")?,
+                last: line("endLine")?,
+                kind,
+            })
+        })
+        .filter(|fold| fold.last > fold.first)
+        .collect();
+    folds.sort_by_key(|fold| (fold.first, fold.last));
+    folds.dedup_by_key(|fold| (fold.first, fold.last));
+    folds
 }
 
 fn diagnostics(params: &Value) -> Option<Event> {
@@ -1241,6 +1303,41 @@ mod tests {
             [hint(0, 9, ": number"), hint(2, 4, "count: ")]
         );
         assert!(hints(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn folds_are_read_in_order_and_one_line_ones_left_out() {
+        let answer = json!([
+            { "startLine": 9, "endLine": 12, "kind": "region" },
+            { "startLine": 4, "endLine": 7, "startCharacter": 20, "endCharacter": 1 },
+            { "startLine": 0, "endLine": 2, "kind": "imports" },
+            { "startLine": 4, "endLine": 6, "kind": "comment" },
+            // The same lines twice: the first one said is kept.
+            { "startLine": 4, "endLine": 7, "kind": "comment" },
+            // A kind this client does not know is plain code.
+            { "startLine": 14, "endLine": 15, "kind": "custom" },
+            // Nothing to hide: one line, an end before its start.
+            { "startLine": 8, "endLine": 8 },
+            { "startLine": 8, "endLine": 3 },
+            // Not ranges at all.
+            { "startLine": 5 },
+            { "endLine": 5, "kind": "comment" },
+            { "startLine": "1", "endLine": 5 },
+            "nothing",
+        ]);
+        let fold = |first, last, kind| Fold { first, last, kind };
+        assert_eq!(
+            folds(&answer),
+            [
+                fold(0, 2, Some(FoldKind::Imports)),
+                fold(4, 6, Some(FoldKind::Comment)),
+                fold(4, 7, None),
+                fold(9, 12, Some(FoldKind::Region)),
+                fold(14, 15, None),
+            ]
+        );
+        assert!(folds(&Value::Null).is_empty());
+        assert!(folds(&json!([])).is_empty());
     }
 
     #[test]
