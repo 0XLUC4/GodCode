@@ -7,6 +7,7 @@ mod branding;
 mod editor;
 mod explorer;
 mod field;
+mod lang;
 mod live;
 mod platform;
 mod preview;
