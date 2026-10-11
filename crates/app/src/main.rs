@@ -10,6 +10,7 @@ mod field;
 mod live;
 mod mcp;
 mod platform;
+mod plugins;
 mod postgres;
 mod preview;
 mod servers;
