@@ -38,6 +38,9 @@ pub struct Index {
     widest: usize,
     /// Columns of white space leading each line; `None` for a blank line.
     pub indents: Vec<Option<usize>>,
+    /// What the brackets of each line do, kept so that `closes` is made again after a
+    /// change without the text being read again.
+    brackets: Vec<Brackets>,
     /// For a line that leaves a bracket open, the line that closes it.
     closes: Vec<Option<usize>>,
     /// What a language server said folds, and the number its answer came with: it is
@@ -48,22 +51,27 @@ pub struct Index {
 /// A block as a language server tells it: the line that opens it, the last line it hides.
 pub type Fold = (usize, usize);
 
-/// For each line that leaves a bracket open, the line that closes it. Brackets in strings
-/// and in comments do not count; prose has none that open a block.
-fn closers(text: &str, lines: usize, spans: &[Span], language: &Language) -> Vec<Option<usize>> {
-    let mut closes = vec![None; lines];
+/// What the brackets of a line do: how many it closes of those the lines above left open,
+/// then how many it leaves open itself.
+type Brackets = (usize, usize);
+
+/// What the brackets of each line of `region` do; `region` is whole lines of the text the
+/// `spans` are of, and starts at its byte `from`. Brackets in strings and in comments do
+/// not count; prose has none that open a block.
+fn brackets_of(region: &str, from: usize, spans: &[Span], language: &Language) -> Vec<Brackets> {
     if matches!(language.name, "Plain Text" | "Markdown") {
-        return closes;
+        return region.split('\n').map(|_| (0, 0)).collect();
     }
-    // The lines of the brackets still open.
-    let mut open: Vec<usize> = Vec::new();
-    let (mut line, mut span) = (0, 0);
-    for (at, byte) in text.bytes().enumerate() {
+    let mut lines = Vec::new();
+    let (mut closed, mut left_open) = (0, 0);
+    let mut span = spans.partition_point(|span| span.end <= from);
+    for (at, byte) in region.bytes().enumerate() {
         let opens = matches!(byte, b'(' | b'[' | b'{');
         if byte == b'\n' {
-            line += 1;
+            lines.push((closed, left_open));
+            (closed, left_open) = (0, 0);
         } else if opens || matches!(byte, b')' | b']' | b'}') {
-            while spans.get(span).is_some_and(|span| span.end <= at) {
+            while spans.get(span).is_some_and(|span| span.end <= from + at) {
                 span += 1;
             }
             let token = spans.get(span).map(|span| span.token);
@@ -71,11 +79,38 @@ fn closers(text: &str, lines: usize, spans: &[Span], language: &Language) -> Vec
                 continue;
             }
             if opens {
-                open.push(line);
-            } else if let Some(opened) = open.pop().filter(|opened| *opened < line) {
-                // Of several left open on a line, the first one closes last: it is kept.
-                closes[opened] = Some(line);
+                left_open += 1;
+            } else if left_open > 0 {
+                left_open -= 1;
+            } else {
+                closed += 1;
             }
+        }
+    }
+    lines.push((closed, left_open));
+    lines
+}
+
+/// For each line that leaves a bracket open, the line that closes it; when not all of
+/// those it leaves open get closed, the line that closed one last.
+fn closers(brackets: &[Brackets]) -> Vec<Option<usize>> {
+    let mut closes = vec![None; brackets.len()];
+    // The lines with brackets still open, and how many each has.
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    for (line, (closed, left_open)) in brackets.iter().enumerate() {
+        let mut closed = *closed;
+        while closed > 0
+            && let Some((opened, count)) = open.pop()
+        {
+            // Of several left open on a line, the first one closes last: it is kept.
+            closes[opened] = Some(line);
+            if count > closed {
+                open.push((opened, count - closed));
+            }
+            closed = closed.saturating_sub(count);
+        }
+        if *left_open > 0 {
+            open.push((line, *left_open));
         }
     }
     closes
@@ -91,8 +126,14 @@ impl Index {
     }
 
     /// What is known of `text`. `before`: what was known of it before one change, and
-    /// that change; its colours are then worked out from the lines changed alone.
+    /// that change; only the lines the change has coloured again are then read.
     fn after(key: u64, text: &str, language: &Language, before: Option<(&Index, Change)>) -> Self {
+        let followed = before.and_then(|(index, change)| index.follow(key, text, language, change));
+        followed.unwrap_or_else(|| Self::read(key, text, language))
+    }
+
+    /// What is known of `text`, all of it read.
+    fn read(key: u64, text: &str, language: &Language) -> Self {
         let mut starts = vec![0];
         starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
         starts.push(text.len() + 1);
@@ -105,17 +146,9 @@ impl Index {
             count += length + 1;
         }
         chars.push(count);
-        // The text the colours known are of is this one less the change, in this language.
-        let known = before.and_then(|(index, (old, new))| {
-            let was = index.starts.last()? - 1;
-            let fits = was + new.len() == text.len() + old.len() && index.language == language.name;
-            let mut coloured = index.coloured.clone().filter(|_| fits)?;
-            coloured.edit(text, language, old, new);
-            Some(coloured)
-        });
         // A text without colours keeps no more than its one span.
         let plain = std::ptr::eq(language, Language::plain());
-        let coloured = known.or_else(|| (!plain).then(|| syntax::Coloured::new(text, language)));
+        let coloured = (!plain).then(|| syntax::Coloured::new(text, language));
         let coloured = coloured.filter(|coloured| coloured.spans().len() > 1);
         let flat = match &coloured {
             Some(_) => Vec::new(),
@@ -124,9 +157,11 @@ impl Index {
         let spans = coloured
             .as_ref()
             .map_or(&flat[..], |coloured| coloured.spans());
+        let brackets = brackets_of(text, 0, spans, language);
         Self {
             key,
-            closes: closers(text, starts.len() - 1, spans, language),
+            closes: closers(&brackets),
+            brackets,
             given: None,
             starts,
             chars,
@@ -136,6 +171,124 @@ impl Index {
             widest,
             indents: crate::editor::indents_of(text),
         }
+    }
+
+    /// What is known of `text`, worked out from what was known of it before the change
+    /// `(old, new)`: the lines coloured again are read, the others are told by what was
+    /// known of them. `None` when that cannot be: a text without colours, before or
+    /// after; another language; a change that is not one from the text known.
+    fn follow(
+        &self,
+        key: u64,
+        text: &str,
+        language: &Language,
+        (old, new): Change,
+    ) -> Option<Self> {
+        let lines = self.lines();
+        let was = self.starts[lines] - 1;
+        let fits = self.language == language.name
+            && old.start == new.start
+            && old.start <= old.end
+            && old.end <= was
+            && new.start <= new.end
+            && new.end <= text.len()
+            && was - old.end == text.len() - new.end;
+        if !fits {
+            return None;
+        }
+        // Where the colouring starts again: the line of the byte before the change.
+        let above = self.starts[..lines].partition_point(|start| *start < new.start);
+        let first = above.saturating_sub(1);
+        let restart = self.starts[first];
+        if restart > 0 && text.as_bytes().get(restart - 1) != Some(&b'\n') {
+            return None;
+        }
+        let mut coloured = self.coloured.clone()?;
+        coloured.edit(text, language, old.clone(), new.clone());
+        // Where it stopped: a line from which the colours are those known.
+        let stop = restart + coloured.last_read();
+        if coloured.spans().len() < 2 || stop < new.end || stop > text.len() {
+            return None;
+        }
+        // The lines read again, as they are now, and the line known that follows them.
+        let (region, past) = if stop < text.len() {
+            let region = text.get(restart..stop)?.strip_suffix('\n')?;
+            let known = stop - new.end + old.end;
+            (region, self.starts[..lines].binary_search(&known).ok()?)
+        } else {
+            (text.get(restart..)?, lines)
+        };
+        if past < first {
+            return None;
+        }
+        let size = lines + 1 + region.len() / 16;
+        let (mut starts, mut chars) = (Vec::with_capacity(size), Vec::with_capacity(size));
+        starts.extend_from_slice(&self.starts[..first]);
+        chars.extend_from_slice(&self.chars[..first]);
+        let (mut byte, mut count, mut longest) = (restart, self.chars[first], 0);
+        for content in region.split('\n') {
+            starts.push(byte);
+            chars.push(count);
+            let length = content.chars().count();
+            longest = longest.max(length);
+            byte += content.len() + 1;
+            count += length + 1;
+        }
+        // What follows moves along.
+        let (from, chars_from) = (self.starts[past], self.chars[past]);
+        starts.extend(self.starts[past..].iter().map(|start| start - from + byte));
+        chars.extend(
+            self.chars[past..]
+                .iter()
+                .map(|start| start - chars_from + count),
+        );
+        // The longest line is looked for again only when it was one of those read again
+        // and none of them is as long now; the lengths tell it, not the text.
+        let had = (first..past).map(|line| self.length(line)).max();
+        let widest = if longest >= self.widest {
+            longest
+        } else if had.is_none_or(|had| had < self.widest) {
+            self.widest
+        } else {
+            let lengths = chars.windows(2).map(|line| line[1] - line[0] - 1);
+            lengths.max().unwrap_or(0)
+        };
+        let mut indents = Vec::with_capacity(size);
+        indents.extend_from_slice(&self.indents[..first]);
+        indents.extend(crate::editor::indents_of(region));
+        indents.extend_from_slice(&self.indents[past..]);
+        let mut brackets = Vec::with_capacity(size);
+        brackets.extend_from_slice(&self.brackets[..first]);
+        brackets.extend(brackets_of(region, restart, coloured.spans(), language));
+        brackets.extend_from_slice(&self.brackets[past..]);
+        Some(Self {
+            key,
+            closes: closers(&brackets),
+            brackets,
+            given: None,
+            starts,
+            chars,
+            coloured: Some(coloured),
+            flat: Vec::new(),
+            language: language.name,
+            widest,
+            indents,
+        })
+    }
+
+    /// All that is known of the text is the same, the key and what a server said left out.
+    #[cfg(test)]
+    fn same_as(&self, other: &Index) -> bool {
+        self.starts == other.starts
+            && self.chars == other.chars
+            && self.coloured.is_some() == other.coloured.is_some()
+            && self.spans() == other.spans()
+            && self.flat == other.flat
+            && self.language == other.language
+            && self.widest == other.widest
+            && self.indents == other.indents
+            && self.brackets == other.brackets
+            && self.closes == other.closes
     }
 
     /// Chars of the text.
@@ -198,6 +351,8 @@ impl Index {
         self.chars.splice(first..=last, chars);
         self.indents
             .splice(first..=last, crate::editor::indents_of(region));
+        self.brackets
+            .splice(first..=last, std::iter::repeat_n((0, 0), added));
         self.closes
             .splice(first..=last, std::iter::repeat_n(None, added));
         // What follows moves along.
@@ -2076,5 +2231,345 @@ fn a() {
                 .sections
                 .is_empty()
         );
+    }
+
+    /// The line that closes each line, as reading the whole text tells it: the way it was
+    /// worked out before the lines kept what their brackets do.
+    fn closes_read_through(text: &str, spans: &[Span], language: &Language) -> Vec<Option<usize>> {
+        let mut closes = vec![None; text.split('\n').count()];
+        if matches!(language.name, "Plain Text" | "Markdown") {
+            return closes;
+        }
+        let mut open: Vec<usize> = Vec::new();
+        let (mut line, mut span) = (0, 0);
+        for (at, byte) in text.bytes().enumerate() {
+            let opens = matches!(byte, b'(' | b'[' | b'{');
+            if byte == b'\n' {
+                line += 1;
+            } else if opens || matches!(byte, b')' | b']' | b'}') {
+                while spans.get(span).is_some_and(|span| span.end <= at) {
+                    span += 1;
+                }
+                let token = spans.get(span).map(|span| span.token);
+                if matches!(token, Some(syntax::Token::String | syntax::Token::Comment)) {
+                    continue;
+                }
+                if opens {
+                    open.push(line);
+                } else if let Some(opened) = open.pop().filter(|opened| *opened < line) {
+                    closes[opened] = Some(line);
+                }
+            }
+        }
+        closes
+    }
+
+    /// Write `written` over the bytes `old` of `text` and tell what is known of it from
+    /// what `index` knew: it has to be what reading the whole text tells. Returns it, and
+    /// whether it was told without the text being read through.
+    fn edited(
+        index: &Index,
+        text: &mut String,
+        language: &Language,
+        old: Range<usize>,
+        written: &str,
+    ) -> (Index, bool) {
+        let was = text.clone();
+        text.replace_range(old.clone(), written);
+        let change = (old.clone(), old.start..old.start + written.len());
+        let after = Index::after(1, text, language, Some((index, change.clone())));
+        let read = Index::new(1, text, language);
+        let told = format!(
+            "{}: {written:?} over {old:?} of {was:?} gives {text:?}",
+            language.name
+        );
+        assert!(after.same_as(&read), "{told}");
+        assert_eq!(
+            read.closes,
+            closes_read_through(text, read.spans(), language),
+            "{told}"
+        );
+        let followed = index.follow(1, text, language, change).is_some();
+        (after, followed)
+    }
+
+    /// The languages the edits are tried in: code, a page, prose, and no colours at all.
+    fn languages() -> Vec<&'static Language> {
+        ["a.rs", "a.js", "a.py", "a.html", "a.md", "a.txt"]
+            .iter()
+            .map(|name| Language::of(std::path::Path::new(name)))
+            .collect()
+    }
+
+    #[test]
+    fn what_is_known_of_a_coloured_text_follows_any_edit() {
+        // What changes the colours and the blocks of the lines below, and chars of
+        // several bytes.
+        let pieces = [
+            "\n",
+            "\n",
+            "\n",
+            "\r\n",
+            "(",
+            ")",
+            "[",
+            "]",
+            "{",
+            "}",
+            "{\n",
+            "}\n",
+            "\"",
+            "'",
+            "`",
+            "/*",
+            "*/",
+            "//",
+            "#",
+            "<!--",
+            "-->",
+            "<p>",
+            "</p>",
+            "```",
+            "\\",
+            "r#\"",
+            "\"#",
+            "\"\"\"",
+            "\t",
+            "    ",
+            " ",
+            "é",
+            "😀",
+            "fn a",
+            "let x = 1;",
+            "# ",
+            "= ",
+        ];
+        for (number, language) in languages().into_iter().enumerate() {
+            // The same edits each time the test runs.
+            let mut seed = 0x9E37_79B9_7F4A_7C15_u64.wrapping_add(number as u64);
+            let mut random = |below: usize| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % below.max(1) as u64) as usize
+            };
+            let mut text = "fn a() {\n    let s = \"one\"; // (\n}\n".to_owned();
+            let mut index = Index::new(0, &text, language);
+            let mut followed = 0;
+            for _ in 0..3000 {
+                // At the start, at the end, or anywhere; on whole chars.
+                let mut start = match random(12) {
+                    0 => 0,
+                    1 => text.len(),
+                    _ => random(text.len() + 1),
+                };
+                while !text.is_char_boundary(start) {
+                    start -= 1;
+                }
+                // A long text loses more than it gets, a short one is only written in.
+                let most = [0, 0, 3, 6, 40][random(3) + text.len().min(400) / 200];
+                let mut end = (start + random(most + 1)).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                let written: String = (0..random(4))
+                    .map(|_| pieces[random(pieces.len())])
+                    .collect();
+                let (after, incremental) =
+                    edited(&index, &mut text, language, start..end, &written);
+                index = after;
+                followed += usize::from(incremental);
+            }
+            // The edits were followed, not read through, wherever there are colours.
+            let coloured = !std::ptr::eq(language, Language::plain());
+            assert_eq!(followed > 2500, coloured, "{}: {followed}", language.name);
+        }
+    }
+
+    #[test]
+    fn what_is_known_of_a_coloured_text_follows_what_is_typed() {
+        for language in languages() {
+            let code = matches!(language.name, "Rust" | "JavaScript" | "Python");
+            let mut text = "fn a() {\r\n    let s = \"é\";\r\n}\n\n// end".to_owned();
+            let mut index = Index::new(0, &text, language);
+            let end = text.len();
+            // Typed in a line, a line end added and removed, the very start and the very
+            // end written in, a line end of two bytes cut in two and taken away.
+            let edits: [(Range<usize>, &str); 10] = [
+                (16..16, "t"),
+                (17..17, "\n"),
+                (17..18, ""),
+                (0..0, "x"),
+                (0..0, "\n"),
+                (0..2, ""),
+                (end + 1..end + 1, "!"),
+                (end + 2..end + 2, "\nlast\n"),
+                (9..9, "\n"),
+                (8..11, ""),
+            ];
+            for (old, written) in edits {
+                let (after, followed) = edited(&index, &mut text, language, old, written);
+                // A page without a tag, prose without a mark have no more colours than
+                // a plain text; code always has some here.
+                let colours = !index.plain() && !after.plain();
+                assert_eq!(followed, colours, "{}: {text:?}", language.name);
+                assert!(colours || !code, "{}: {text:?}", language.name);
+                index = after;
+            }
+            assert_eq!(text, "fn a() {    lett s = \"é\";\r\n}\n\n// end!\nlast\n");
+        }
+    }
+
+    #[test]
+    fn the_blocks_follow_a_bracket_or_a_string_opened_above_them() {
+        let language = Language::of(std::path::Path::new("a.rs"));
+        let mut text =
+            "fn a() {\n    b(\n        1,\n    );\n}\nfn c() {\n    d();\n}\n".to_owned();
+        let mut index = Index::new(0, &text, language);
+        // The line that closes what each of the lines asked about leaves open.
+        let closes = |index: &Index, lines: &[usize]| -> Vec<Option<usize>> {
+            lines.iter().map(|line| index.closes[*line]).collect()
+        };
+        assert_eq!(closes(&index, &[0, 1, 5]), [Some(4), Some(3), Some(7)]);
+        let mut write = |old: Range<usize>, written: &str, index: &mut Index| {
+            let (after, followed) = edited(index, &mut text, language, old, written);
+            assert!(followed, "{text:?}");
+            *index = after;
+        };
+        // A bracket opened on a line of its own under the first: it takes the brace that
+        // closed the block, which nothing closes any more.
+        write(9..9, "(\n", &mut index);
+        assert_eq!(
+            closes(&index, &[0, 1, 2, 6]),
+            [None, Some(5), Some(4), Some(8)]
+        );
+        // Closed on the line it was opened on: the blocks are what they were, a line down.
+        write(10..10, ")", &mut index);
+        assert_eq!(
+            closes(&index, &[0, 1, 2, 6]),
+            [Some(5), None, Some(4), Some(8)]
+        );
+        // A string opened on the third line swallows the brackets down to the end.
+        write(12..12, "let s = \"", &mut index);
+        assert!(index.closes.iter().all(Option::is_none));
+        // Closed: the brackets below count again.
+        write(21..21, "\";", &mut index);
+        assert_eq!(closes(&index, &[0, 2, 6]), [Some(5), Some(4), Some(8)]);
+        // The brace that closes the first block taken away: the next block keeps its own.
+        write(48..49, "", &mut index);
+        assert_eq!(closes(&index, &[0, 2, 6]), [None, Some(4), Some(8)]);
+        // The line end before it taken away too: the lines below come up by one.
+        write(47..48, "", &mut index);
+        assert_eq!(closes(&index, &[0, 2, 5]), [None, Some(4), Some(7)]);
+        // A comment opened under the first line and never closed: nothing below counts.
+        write(9..9, "/* ", &mut index);
+        assert!(index.closes.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn the_longest_line_is_found_again_once_it_is_shortened() {
+        let language = Language::of(std::path::Path::new("a.rs"));
+        let mut text = "let a = 1;\nlet longest = \"é\";\nlet b = 22;\n".to_owned();
+        let mut index = Index::new(0, &text, language);
+        assert_eq!(index.widest, 18);
+        // Each edit, and the chars of the longest line after it: shortened, it is still
+        // the longest; shortened again, another one is; removed with its line end; then
+        // a line grows past them all.
+        let edits: [(Range<usize>, &str, usize); 4] = [
+            (15..22, "", 11),
+            (11..16, "", 11),
+            (0..11, "", 11),
+            (0..0, "let widest = 333;", 23),
+        ];
+        for (old, written, widest) in edits {
+            let (after, followed) = edited(&index, &mut text, language, old, written);
+            assert!(followed, "{text:?}");
+            assert_eq!(after.widest, widest, "{text:?}");
+            index = after;
+        }
+    }
+
+    #[test]
+    fn a_text_is_read_through_when_what_was_known_cannot_tell_it() {
+        let language = Language::of(std::path::Path::new("a.rs"));
+        // An empty text has no colours to start from, nor does one emptied.
+        let mut text = String::new();
+        let index = Index::new(0, &text, language);
+        let (index, followed) = edited(&index, &mut text, language, 0..0, "fn a() {\n}\n");
+        assert!(!followed);
+        let (index, followed) = edited(&index, &mut text, language, 9..9, "    b();\n");
+        assert!(followed);
+        let (emptied, followed) = edited(&index, &mut text, language, 0..20, "");
+        assert!(!followed && emptied.lines() == 1);
+        // A change that is not one from the text known: the sizes do not add up, it
+        // starts elsewhere, it ends past the text.
+        let text = "fn b() {}\n";
+        let read = Index::new(2, text, language);
+        for change in [(0..1, 0..2), (0..1, 1..2), (0..25, 0..5)] {
+            assert!(index.follow(2, text, language, change.clone()).is_none());
+            let after = Index::after(2, text, language, Some((&index, change)));
+            assert!(after.same_as(&read));
+        }
+        // Nor are the lines of another language believed, or those of a text that was
+        // followed as a plain one.
+        let script = Language::of(std::path::Path::new("a.js"));
+        let known = Index::new(3, text, language);
+        assert!(known.follow(3, text, script, (0..0, 0..0)).is_none());
+        assert!(known.follow(3, text, language, (0..0, 0..0)).is_some());
+        let plain = Index::new(3, text, Language::plain());
+        assert!(
+            plain
+                .follow(3, text, Language::plain(), (0..0, 0..0))
+                .is_none()
+        );
+    }
+
+    /// What a keystroke costs in a big coloured file, read through and followed.
+    /// `cargo test -p godcode --release -- --ignored keystroke --nocapture`.
+    #[test]
+    #[ignore = "a measure, not a check"]
+    fn a_keystroke_in_a_big_coloured_file_is_measured() {
+        let language = Language::of(std::path::Path::new("a.rs"));
+        let block = "fn name(alpha: u32) -> u32 {\n    let total = compute(alpha, \"text\", 42); // a note about it\n    if total > 3 {\n        return total;\n    }\n    total\n}\n\n";
+        let text = block.repeat(25_000);
+        let index = Index::new(0, &text, language);
+        println!("{} lines, {} bytes", index.lines(), text.len());
+        // The best of a few runs.
+        let timed = |name: &str, work: &mut dyn FnMut()| {
+            let best = (0..7).map(|_| {
+                let start = std::time::Instant::now();
+                work();
+                start.elapsed()
+            });
+            println!("{name}: {:?}", best.min().unwrap_or_default());
+        };
+        timed("read through", &mut || {
+            std::hint::black_box(Index::new(0, &text, language).lines());
+        });
+        timed("the colours alone copied", &mut || {
+            std::hint::black_box(index.coloured.clone());
+        });
+        timed("the blocks told again by the brackets", &mut || {
+            std::hint::black_box(closers(&index.brackets));
+        });
+        let middle = index.starts[index.lines() / 2 + 1] + 8;
+        for (place, at) in [("the middle", middle), ("the start", 0)] {
+            for written in ["x", "\n", "{"] {
+                let mut typed = text.clone();
+                typed.insert_str(at, written);
+                let change = (at..at, at..at + written.len());
+                let mut after = None;
+                timed(
+                    &format!("{written:?} typed at {place}, followed"),
+                    &mut || {
+                        let before = Some((&index, change.clone()));
+                        after = Some(Index::after(1, &typed, language, before));
+                    },
+                );
+                assert!(index.follow(1, &typed, language, change).is_some());
+                let read = Index::new(1, &typed, language);
+                assert!(after.is_some_and(|after| after.same_as(&read)));
+            }
+        }
     }
 }
