@@ -541,7 +541,6 @@ fn completion(answer: &str, before: &str, after: &str) -> String {
 
 /// What a model would write at the caret, given the code before and after it; empty when
 /// it has nothing to add.
-#[allow(dead_code)]
 pub fn complete(
     settings: &Settings,
     file: Option<&str>,
@@ -558,7 +557,6 @@ pub fn complete(
 
 /// Whether `text` is too long for a model to be given it whole, and so to answer with
 /// the whole of it changed.
-#[allow(dead_code)]
 pub fn too_long_to_edit(text: &str) -> bool {
     beginning(text, MOST_OF_A_FILE).1
 }
@@ -566,7 +564,6 @@ pub fn too_long_to_edit(text: &str) -> bool {
 /// The instructions for a model asked to change the file in front: it answers with the
 /// whole new text of the file in one fenced block, after one short sentence saying what
 /// it changed.
-#[allow(dead_code)]
 pub fn edit_system(
     file: Option<&str>,
     language: &str,
@@ -611,7 +608,6 @@ fn fence(line: &str) -> Option<(char, usize, &str)> {
 ///
 /// The text is what the last fenced block of the answer holds, as it is written there.
 /// Any fenced block is taken for a whole file: nothing here knows the file.
-#[allow(dead_code)]
 pub fn proposed(answer: &str) -> Option<(String, String)> {
     // The fence that is open: its mark, its length, where its line starts and ends.
     let mut open = None;

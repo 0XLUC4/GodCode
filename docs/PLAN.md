@@ -235,7 +235,12 @@ par Ollama (`OLLAMA_HOST`, 127.0.0.1:11434 par défaut), ou API Anthropic quand 
 dans l'environnement ; passe par `curl`, la clé n'apparaît jamais sur la ligne de commande. Rien n'est
 envoyé tant qu'on n'a pas posé de question. Les réponses sont mises en page comme un fichier Markdown
 (code en blocs), `Copy` copie leur texte. Pas de réponse au fil de l'eau.
-Reste : complétion multiligne, agents avec validation humaine, MCP.
+Complétion : `Assistant: Complete Here` (`Alt+\`) demande au modèle la suite au curseur ; elle s'affiche en
+grisé (première ligne et nombre de lignes de plus), `Tab` la prend, `Échap` ou toute frappe la laisse.
+À la demande seulement : rien ne part pendant qu'on tape.
+Modification avec validation : `Edit file` demande un changement du fichier en avant (10 000 caractères
+au plus) ; rien n'est écrit avant `Apply`, `Review` montre l'avant et l'après côte à côte, `Discard` laisse.
+Reste : outils MCP dans la conversation, agents qui enchaînent plusieurs étapes.
 
 ### Hors périmètre tant que le reste n'est pas solide (❌)
 

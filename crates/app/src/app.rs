@@ -183,6 +183,7 @@ enum Cmd {
     EditThemes,
     Response,
     Assistant,
+    Suggest,
     Debug,
     StopDebug,
     StepOver,
@@ -592,6 +593,12 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::Snippets, icon::CODE_BLOCK, "Edit Snippets", ""),
     spec(Cmd::EditThemes, icon::PALETTE, "Edit My Themes", ""),
     spec(Cmd::Response, icon::GLOBE, "Toggle HTTP Response", ""),
+    spec(
+        Cmd::Suggest,
+        icon::ROWS,
+        "Assistant: Complete Here",
+        "Alt+\\",
+    ),
     spec(Cmd::Assistant, icon::ROWS, "Toggle Assistant", ""),
     spec(Cmd::Debug, icon::BUG, "Debug File", "Ctrl+F5"),
     spec(Cmd::StopDebug, icon::STOP, "Stop Debugging", "Shift+F5"),
@@ -841,6 +848,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::LivePreviewBrowser),
             Some(Cmd::Response),
             Some(Cmd::Assistant),
+            Some(Cmd::Suggest),
             Some(Cmd::Check),
             None,
             Some(Cmd::ToggleTerminal),
@@ -1545,6 +1553,10 @@ pub struct GodApp {
     docker: Option<Docker>,
     /// What was said with the assistant, and to which model.
     chat: Chat,
+    /// What the model would write at the caret, shown until it is taken or left; and
+    /// the one awaited, with the tab, the revision and the caret it was asked for.
+    ghost: Option<Ghost>,
+    suggesting: Option<(Answered, u64, u64, usize)>,
     /// The layouts kept under a name; and the one chosen while they are picked from.
     layouts: Vec<Arrangement>,
     layout_pick: Option<usize>,
@@ -1775,6 +1787,8 @@ impl GodApp {
             env_file: get("env_file").filter(|name| !name.is_empty()),
             env_pick: None,
             docker: None,
+            ghost: None,
+            suggesting: None,
             chat: Chat::new(
                 get("assistant_provider").as_deref(),
                 get("assistant_model").unwrap_or_default(),
@@ -2312,6 +2326,26 @@ impl GodApp {
 
     /// Collect what the background threads produced.
     fn poll(&mut self) {
+        if let Some((receiver, tab, revision, at)) = &self.suggesting
+            && let Ok(written) = receiver.try_recv()
+        {
+            let (tab, revision, at) = (*tab, *revision, *at);
+            self.suggesting = None;
+            match written {
+                Ok(text) if text.is_empty() => {
+                    self.toasts.success("The model has nothing to add here");
+                }
+                Ok(text) => {
+                    self.ghost = Some(Ghost {
+                        tab,
+                        revision,
+                        at,
+                        text,
+                    });
+                }
+                Err(err) => self.toasts.error(err),
+            }
+        }
         if let Some(receiver) = &self.requesting
             && let Ok(answer) = receiver.try_recv()
         {
@@ -4295,6 +4329,61 @@ impl GodApp {
         }
     }
 
+    /// Ask the model what it would write at the caret of the file in front.
+    fn suggest(&mut self, ctx: &Context) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if self.chat.model.is_empty() {
+            self.toasts
+                .error("Choose a model in the Assistant panel first");
+            return;
+        }
+        let at = tab.selection.end;
+        let (before, after) = tab.text.split_at(godcode_core::byte_index(&tab.text, at));
+        let (before, after) = (before.to_owned(), after.to_owned());
+        let (name, language) = (tab.name.clone(), tab.language.name);
+        let settings = crate::assistant::Settings {
+            provider: self.chat.provider,
+            model: self.chat.model.clone(),
+        };
+        let (sender, receiver) = channel();
+        let waking = ctx.clone();
+        std::thread::spawn(move || {
+            let written =
+                crate::assistant::complete(&settings, Some(&name), language, &before, &after);
+            // The window may be gone: nobody listens then.
+            let _ = sender.send(written);
+            waking.request_repaint();
+        });
+        self.suggesting = Some((receiver, tab.id, tab.revision, at));
+        self.ghost = None;
+    }
+
+    /// Tab takes what the model would write at the caret, Escape leaves it; so does
+    /// anything that changes the text or moves the caret.
+    fn ghost_keys(&mut self, ctx: &Context) {
+        let Some(ghost) = self.ghost.take() else {
+            return;
+        };
+        let here = |tab: &&mut Tab| {
+            let caret = ghost.at..ghost.at;
+            tab.id == ghost.tab && tab.revision == ghost.revision && tab.selection == caret
+        };
+        let Some(tab) = self.tabs.get_mut(self.active).filter(here) else {
+            return;
+        };
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab)) {
+            let place = godcode_core::byte_index(&tab.text, ghost.at);
+            tab.text.insert_str(place, &ghost.text);
+            tab.touched();
+            let end = ghost.at + ghost.text.chars().count();
+            tab.select(ctx, end..end);
+        } else if !ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.ghost = Some(ghost);
+        }
+    }
+
     /// Ask the provider of the assistant which models it has, out of the way.
     fn list_models(&mut self, ctx: &Context) {
         let provider = self.chat.provider;
@@ -4310,8 +4399,22 @@ impl GodApp {
     }
 
     /// Send what was written to the model, with the talk so far and the file in front.
-    fn ask_assistant(&mut self, ctx: &Context) {
+    fn ask_assistant(&mut self, ctx: &Context, edit: bool) {
         use crate::assistant::{self, Message, Settings};
+        let front = self.tabs.get(self.active);
+        let long = |tab: &Tab| tab.text.chars().count() > EDIT_CHARS;
+        let refused = match (edit, front) {
+            (true, None) => Some("There is no file to change"),
+            (true, Some(tab)) if long(tab) || assistant::too_long_to_edit(&tab.text) => Some(
+                "This file is too long to be written again by the model (10,000 characters at most)",
+            ),
+            _ => None,
+        };
+        if let Some(why) = refused {
+            self.chat.error = Some(why.to_owned());
+            return;
+        }
+        self.chat.editing = front.filter(|_| edit).map(|tab| tab.id);
         let question = std::mem::take(&mut self.chat.typed);
         if question.trim().is_empty() {
             return;
@@ -4327,7 +4430,11 @@ impl GodApp {
                 let chars = tab.text.chars().skip(start.min(end));
                 let chosen: String = chars.take(start.abs_diff(end)).collect();
                 let chosen = Some(chosen.as_str()).filter(|chosen| !chosen.is_empty());
-                assistant::system(Some(&tab.name), tab.language.name, &tab.text, chosen)
+                let written = match edit {
+                    true => assistant::edit_system,
+                    false => assistant::system,
+                };
+                written(Some(&tab.name), tab.language.name, &tab.text, chosen)
             }
             None => assistant::system(None, "", "", None),
         };
@@ -4361,6 +4468,21 @@ impl GodApp {
             Some(Ok(Ok(text))) => {
                 self.chat.asking = None;
                 let from_user = false;
+                // A change that was asked for is kept apart, to be looked at first: what
+                // shows in the talk is what the model said of it.
+                let target = self.chat.editing.take();
+                let tab = target.and_then(|id| self.tabs.iter().find(|tab| tab.id == id));
+                let change = tab.zip(crate::assistant::proposed(&text));
+                let text = match change {
+                    Some((tab, (said, new))) => {
+                        self.chat.proposal = Some((tab.id, tab.name.clone(), new));
+                        match said.is_empty() {
+                            true => "A change is proposed.".to_owned(),
+                            false => said,
+                        }
+                    }
+                    None => text,
+                };
                 self.chat.laid.push(markdown::blocks(&text));
                 self.chat.messages.push(Message { from_user, text });
             }
@@ -4385,6 +4507,8 @@ impl GodApp {
             self.list_models(&ctx);
         }
         let asking = self.chat.asking.is_some();
+        // What is done with the change proposed: looked at, made, or left.
+        let mut verdict = None;
         let zoom = self.zoom;
         let mut provider = self.chat.provider;
         ui.horizontal(|ui| {
@@ -4463,15 +4587,50 @@ impl GodApp {
                     if let Some(error) = &self.chat.error {
                         ui.colored_label(palette.error, error);
                     }
+                    // Nothing of a change proposed is in the file until it is applied.
+                    if let Some((_, name, _)) = &self.chat.proposal {
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("Change proposed for {name}"));
+                            for (label, what) in [("Review", 0), ("Apply", 1), ("Discard", 2)] {
+                                if ui.button(label).clicked() {
+                                    verdict = Some(what);
+                                }
+                            }
+                        });
+                    }
                 });
         });
+        let proposal = verdict.and_then(|what| Some((what, self.chat.proposal.clone()?)));
+        if let Some((what, (id, name, new))) = proposal {
+            let tab = self.tabs.iter_mut().find(|tab| tab.id == id);
+            match (what, tab) {
+                (0, Some(tab)) => {
+                    let title = format!("{name}: now  |  proposed");
+                    self.diff = Some((title, rows_between(&tab.text, &new)));
+                }
+                (1, Some(tab)) => {
+                    tab.text = new;
+                    tab.touched();
+                    self.chat.proposal = None;
+                    self.toasts
+                        .success(format!("{name} changed: Ctrl+Z takes it back"));
+                }
+                (2, _) => self.chat.proposal = None,
+                _ => {
+                    self.chat.proposal = None;
+                    self.toasts
+                        .error(format!("{name} was closed: nothing was changed"));
+                }
+            }
+        }
         let mut send = false;
+        let mut edit = false;
         ui.horizontal(|ui| {
             ui.add_space(10.0);
             let field = TextEdit::singleline(&mut self.chat.typed)
                 .margin(crate::widgets::FIELD_MARGIN)
                 .hint_text("Ask about this file…")
-                .desired_width(ui.available_width() - 80.0);
+                .desired_width(ui.available_width() - 170.0);
             let field = ui.add(field);
             let entered = field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
             if entered {
@@ -4479,9 +4638,12 @@ impl GodApp {
             }
             let button = ui.add_enabled(!asking, Button::new("Send"));
             send = (button.clicked() || entered) && !asking;
+            let tip = "Ask for a change to the file in front: it is shown for you to accept";
+            let change = ui.add_enabled(!asking, Button::new("Edit file"));
+            edit = change.on_hover_text(tip).clicked();
         });
-        if send {
-            self.ask_assistant(&ctx);
+        if send || edit {
+            self.ask_assistant(&ctx, edit);
         }
     }
 
@@ -6422,6 +6584,7 @@ impl GodApp {
                 let shown = self.bottom == Some(Bottom::Response);
                 self.bottom = (!shown).then_some(Bottom::Response);
             }
+            Cmd::Suggest => self.suggest(ctx),
             Cmd::Assistant => {
                 let shown = self.bottom == Some(Bottom::Assistant);
                 self.bottom = (!shown).then_some(Bottom::Assistant);
@@ -6622,6 +6785,7 @@ impl GodApp {
     }
 
     fn shortcuts(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
+        self.ghost_keys(ctx);
         self.modal_keys(ctx, clicked);
         // A rectangle of text grows with Ctrl+Alt+Shift and the arrows: seen first, or they
         // would be taken for Ctrl+Alt and an arrow.
@@ -6671,6 +6835,7 @@ impl GodApp {
             (shift, Key::T, Cmd::RunTests),
             (ctrl, Key::Backslash, Cmd::Split),
             (Modifiers::ALT, Key::F7, Cmd::FindUsages),
+            (Modifiers::ALT, Key::Backslash, Cmd::Suggest),
             (Modifiers::ALT, Key::F1, Cmd::Reveal),
             (Modifiers::ALT, Key::F12, Cmd::ToggleTerminal),
             (Modifiers::SHIFT, Key::F6, Cmd::Rename),
@@ -7723,6 +7888,35 @@ impl GodApp {
         let at = self.debug_at.as_ref();
         let stopped = at.filter(|(path, _)| self.tabs[index].path.as_deref() == Some(path));
         let stopped = stopped.map(|(_, line)| *line);
+        // What the model would write at the caret shows there, dim, as the hints do: its
+        // first line, and how many more Tab would bring.
+        let mut hinted = Vec::new();
+        let shown = &self.tabs[index];
+        if let Some(ghost) = self
+            .ghost
+            .as_ref()
+            .filter(|ghost| front && ghost.tab == shown.id)
+        {
+            let (line, column) = godcode_core::line_col(&shown.text, ghost.at);
+            let (line, column) = (line - 1, column - 1);
+            let mut lines = ghost.text.lines();
+            let first = lines.next().unwrap_or_default();
+            let label = match lines.count() {
+                0 => first.to_owned(),
+                more => format!("{first} ⏎ +{more} lines"),
+            };
+            hinted.clone_from(&shown.hints);
+            let before = |hint: &Hint| (hint.line, hint.column) <= (line, column);
+            let place = hinted.partition_point(before);
+            hinted.insert(
+                place,
+                Hint {
+                    line,
+                    column,
+                    label,
+                },
+            );
+        }
         let root = self.run_root().filter(|_| !self.coverage.is_empty());
         let coverage = match (&self.tabs[index].path, &root) {
             (Some(path), Some(root)) => godcode_core::coverage::of_file(&self.coverage, path, root)
@@ -7764,7 +7958,10 @@ impl GodApp {
             conditional: &conditional,
             stopped,
             coverage,
-            hints: &tab.hints,
+            hints: match hinted.is_empty() {
+                true => &tab.hints,
+                false => &hinted,
+            },
             folds: tab.folds.as_ref().map(|(stamp, list)| (*stamp, &**list)),
             revision: tab.revision,
             block_caret: front && self.keys == Keys::Vim && self.vim.mode != modal::Mode::Insert,
@@ -8942,6 +9139,50 @@ fn load_themes() -> Result<(), String> {
     Ok(())
 }
 
+/// Where what a model answers comes in: its words, or why there are none.
+type Answered = Receiver<Result<String, String>>;
+
+/// What a model would write at the caret of a tab: shown dim there, Tab takes it.
+struct Ghost {
+    tab: u64,
+    /// The text and the caret it was written for: it is nothing for others.
+    revision: u64,
+    at: usize,
+    text: String,
+}
+
+/// Chars of the longest file a model is asked to write again whole: its answers are cut
+/// well before the files it can read.
+const EDIT_CHARS: usize = 10_000;
+
+/// The rows that set `old` beside `new`, the lines that differ facing each other.
+fn rows_between(old: &str, new: &str) -> Vec<git::Row> {
+    let (was, now): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let numbered = |lines: &[&str], at: usize| Some((at + 1, (*lines.get(at)?).to_owned()));
+    let mut rows = Vec::new();
+    let (mut left, mut right) = (0, 0);
+    let ends = std::iter::once((was.len()..was.len(), now.len()..now.len()));
+    let edits = godcode_core::merge::diff(old, new).into_iter();
+    for (old, new) in edits.map(|edit| (edit.old, edit.new)).chain(ends) {
+        // What stands between two changes is the same on both sides.
+        while left < old.start.min(was.len()) {
+            rows.push(git::Row {
+                old: numbered(&was, left),
+                new: numbered(&now, right),
+            });
+            (left, right) = (left + 1, right + 1);
+        }
+        for step in 0..old.len().max(new.len()) {
+            rows.push(git::Row {
+                old: numbered(&was, old.start + step).filter(|_| step < old.len()),
+                new: numbered(&now, new.start + step).filter(|_| step < new.len()),
+            });
+        }
+        (left, right) = (old.end, new.end);
+    }
+    rows
+}
+
 /// A talk with a language model about the code in front.
 struct Chat {
     provider: crate::assistant::Provider,
@@ -8958,6 +9199,10 @@ struct Chat {
     typed: String,
     asking: Option<Receiver<Result<String, String>>>,
     error: Option<String>,
+    /// The tab the answer awaited is to change, when a change was asked for.
+    editing: Option<u64>,
+    /// A change the model proposes, not made yet: the tab, its name, its new text.
+    proposal: Option<(u64, String, String)>,
 }
 
 impl Chat {
@@ -8981,6 +9226,8 @@ impl Chat {
             typed: String::new(),
             asking: None,
             error: None,
+            editing: None,
+            proposal: None,
         }
     }
 }
@@ -9581,6 +9828,23 @@ mod tests {
         assert_eq!(layouts_of(&layouts_text(&layouts)), layouts);
         // A line that is not a layout is left out.
         assert!(layouts_of("only a name\nx\t9\t1\t-\t1\t1\t1\n").is_empty());
+        // Texts set side by side: what changed faces what it became.
+        let rows = rows_between("a\nb\nc\nd\n", "a\nB\nc\nd\ne\n");
+        let sides = |row: &git::Row| {
+            let text = |side: &Option<(usize, String)>| side.as_ref().map(|line| line.1.clone());
+            (text(&row.old), text(&row.new))
+        };
+        let shown: Vec<_> = rows.iter().map(sides).collect();
+        let pair = |old: &str, new: &str| (Some(old.to_owned()), Some(new.to_owned()));
+        let expected = [
+            pair("a", "a"),
+            pair("b", "B"),
+            pair("c", "c"),
+            pair("d", "d"),
+            (None, Some("e".to_owned())),
+        ];
+        assert_eq!(shown, expected);
+        assert_eq!(rows[4].new.as_ref().map(|line| line.0), Some(5));
         let mut folds = std::collections::HashMap::new();
         folds.insert(PathBuf::from("C:/code/a b.rs"), vec![3, 12]);
         let text = folds_text(&folds);
