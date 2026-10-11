@@ -228,7 +228,6 @@ pub fn scheme(index: usize) -> Option<&'static Scheme> {
 
 /// The names of all the schemes, each at its index: the built-in ones, then those of the user.
 // Waiting to be wired: the theme picker of `app.rs` still lists `SCHEMES` alone.
-#[allow(dead_code)]
 pub fn scheme_names() -> Vec<&'static str> {
     let user = USER_SCHEMES.read().unwrap_or_else(PoisonError::into_inner);
     let all = SCHEMES.iter().chain(user.iter().copied());
@@ -238,7 +237,6 @@ pub fn scheme_names() -> Vec<&'static str> {
 /// The index of the scheme of this name. The index of a theme of the user changes when the
 /// user's file does, its name does not: the name is what to remember between two runs.
 // Waiting to be wired.
-#[allow(dead_code)]
 pub fn scheme_index(name: &str) -> Option<usize> {
     scheme_names().iter().position(|known| *known == name)
 }
@@ -339,7 +337,6 @@ pub fn token_color(token: Token, _dark: bool) -> Color32 {
 /// What the file of the user's themes holds the first time. JSON has no comments: a key
 /// that starts with `//` is one.
 // Waiting to be wired: `app.rs` writes it into the file it opens when there is none.
-#[allow(dead_code)]
 pub const EXAMPLE: &str = r##"{
   "// 1": "Each theme below is listed with the built-in ones, after them.",
   "// 2": "A key that starts with // is a comment. A colour is #rgb, #rrggbb or #rrggbbaa.",
@@ -592,7 +589,6 @@ fn user_theme(nth: usize, value: &Value) -> Result<UserTheme, String> {
 /// out is that of the first built-in scheme, or of the second when the theme is light. Of
 /// two themes of one name, the later is kept. The error names the key or the value at fault.
 // Waiting to be wired: `app.rs` reads the file of the user at startup and when it is saved.
-#[allow(dead_code)]
 pub fn parse_user_themes(json: &str) -> Result<Vec<UserTheme>, String> {
     let root: Value =
         serde_json::from_str(json).map_err(|error| format!("this is not JSON: {error}"))?;
@@ -620,7 +616,6 @@ pub fn parse_user_themes(json: &str) -> Result<Vec<UserTheme>, String> {
 /// after the built-in ones, in this order. The scheme in use stays as it is, even when it is
 /// one of those replaced, until [`apply`] chooses again.
 // Waiting to be wired.
-#[allow(dead_code)]
 pub fn set_user_themes(themes: Vec<UserTheme>) {
     let schemes = themes.into_iter().map(UserTheme::leak).collect();
     *USER_SCHEMES.write().unwrap_or_else(PoisonError::into_inner) = schemes;

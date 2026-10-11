@@ -902,7 +902,8 @@ pub struct Shown {
 fn key_of(text_hash: u64, look: &Look<'_>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text_hash.hash(&mut hasher);
-    theme::current().name.hash(&mut hasher);
+    // A theme of the user read again keeps its name, not its place.
+    std::ptr::from_ref(theme::current()).hash(&mut hasher);
     look.language.name.hash(&mut hasher);
     look.font.size.to_bits().hash(&mut hasher);
     look.dark.hash(&mut hasher);

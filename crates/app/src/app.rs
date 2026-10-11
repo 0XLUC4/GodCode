@@ -175,6 +175,7 @@ enum Cmd {
     Stash,
     StashPop,
     Snippets,
+    EditThemes,
     Response,
     Debug,
     StopDebug,
@@ -579,6 +580,7 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::Stash, icon::PACKAGE, "Git Stash", ""),
     spec(Cmd::StashPop, icon::PACKAGE, "Git Stash Pop", ""),
     spec(Cmd::Snippets, icon::CODE_BLOCK, "Edit Snippets", ""),
+    spec(Cmd::EditThemes, icon::PALETTE, "Edit My Themes", ""),
     spec(Cmd::Response, icon::GLOBE, "Toggle HTTP Response", ""),
     spec(Cmd::Debug, icon::BUG, "Debug File", "Ctrl+F5"),
     spec(Cmd::StopDebug, icon::STOP, "Stop Debugging", "Shift+F5"),
@@ -725,6 +727,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::ToggleCase),
             None,
             Some(Cmd::Snippets),
+            Some(Cmd::EditThemes),
         ],
     ),
     (
@@ -1600,11 +1603,14 @@ impl GodApp {
                 zoom.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
             });
         // The scheme last chosen; before there were schemes, dark or light.
-        let scheme = get("scheme")
+        // A theme of the user that cannot be read is told when its file is next saved.
+        let _ = load_themes();
+        let named = get("scheme_name").and_then(|name| theme::scheme_index(&name));
+        let numbered = get("scheme")
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|index| *index < theme::SCHEMES.len())
-            .unwrap_or(usize::from(!dark));
-        let dark = theme::SCHEMES[scheme].dark;
+            .filter(|index| *index < theme::SCHEMES.len());
+        let scheme = named.or(numbered).unwrap_or(usize::from(!dark));
+        let dark = theme::scheme(scheme).is_none_or(|scheme| scheme.dark);
         theme::install(&cc.egui_ctx, scheme);
         // The font the user chose for the code, when its file is still there and is one.
         let font = get("font")
@@ -1966,6 +1972,14 @@ impl GodApp {
         }
         if snippets_file().as_deref() == Some(path.as_path()) {
             self.snippets = load_snippets();
+        }
+        if settings_file("themes.json").as_deref() == Some(path.as_path()) {
+            // The one in use is found again by its name, and shows as it is now written.
+            let name = theme::current().name;
+            match load_themes() {
+                Ok(()) => self.set_scheme(ctx, theme::scheme_index(name).unwrap_or(0)),
+                Err(err) => self.toasts.error(err),
+            }
         }
         if settings_file("keymap.json").as_deref() == Some(path.as_path()) {
             self.keymap = load_keymap();
@@ -4127,9 +4141,12 @@ impl GodApp {
 
     /// Switch to the colour scheme at `index`.
     fn set_scheme(&mut self, ctx: &Context, index: usize) {
-        self.scheme = index.min(theme::SCHEMES.len() - 1);
-        self.dark = theme::SCHEMES[self.scheme].dark;
-        theme::apply(ctx, self.scheme);
+        let Some(scheme) = theme::scheme(index) else {
+            return;
+        };
+        self.scheme = index;
+        self.dark = scheme.dark;
+        theme::apply(ctx, index);
     }
 
     /// The colour schemes: the one chosen shows at once, Escape keeps it.
@@ -4137,10 +4154,8 @@ impl GodApp {
         let Some(mut selected) = self.themes.take() else {
             return;
         };
-        let rows: Vec<String> = theme::SCHEMES
-            .iter()
-            .map(|scheme| scheme.name.to_owned())
-            .collect();
+        let names = theme::scheme_names();
+        let rows: Vec<String> = names.into_iter().map(str::to_owned).collect();
         let before = selected;
         let answer = list_dialog(ctx, "Color theme", &rows, &mut selected, None);
         // Moving in the list tries the scheme on.
@@ -5497,6 +5512,21 @@ impl GodApp {
                     None => self.toasts.error("Open a folder first"),
                 }
             }
+            Cmd::EditThemes => match settings_file("themes.json") {
+                Some(file) => {
+                    if !file.exists() {
+                        let folder = file.parent().unwrap_or(&file);
+                        let _ = std::fs::create_dir_all(folder);
+                        let _ = std::fs::write(&file, theme::EXAMPLE);
+                    }
+                    self.open_file(ctx, &file);
+                    self.toasts
+                        .success("Saved, its themes are listed in Color Theme…");
+                }
+                None => self
+                    .toasts
+                    .error("No place to keep the themes on this system"),
+            },
             Cmd::Snippets => match snippets_file() {
                 Some(file) => {
                     if !file.exists() {
@@ -7882,6 +7912,8 @@ impl eframe::App for GodApp {
         storage.set_string("format_on_save", flag(self.format_on_save));
         storage.set_string("blame", flag(self.blame));
         storage.set_string("scheme", self.scheme.to_string());
+        // The themes of the user move in the list: theirs is known by its name.
+        storage.set_string("scheme_name", theme::current().name.to_owned());
         let font = self.font.as_ref().map(|path| path.display().to_string());
         storage.set_string("font", font.unwrap_or_default());
         // What is open, to come back to it at the next start.
@@ -7965,6 +7997,15 @@ fn stops_of(tab: &Tab) -> Vec<godcode_lsp::dap::Stop> {
 }
 
 /// A settings file of the user, by its name.
+/// Read the themes of the user from their file; none when there is no file. What cannot
+/// be read leaves the themes as they were and says why.
+fn load_themes() -> Result<(), String> {
+    let written = settings_file("themes.json").and_then(|file| std::fs::read_to_string(file).ok());
+    let themes = written.map_or(Ok(Vec::new()), |text| theme::parse_user_themes(&text))?;
+    theme::set_user_themes(themes);
+    Ok(())
+}
+
 fn settings_file(name: &str) -> Option<PathBuf> {
     Some(eframe::storage_dir(APP_NAME)?.join(name))
 }

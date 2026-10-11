@@ -198,7 +198,10 @@ Reste : bases de données (SQLite et PostgreSQL d'abord), Docker.
 Fait : 6 thèmes (GodCode Dark/Light, Darcula, Monokai, Solarized Light, High Contrast),
 mode Zen (`Ctrl+Alt+Z`). `Editor Font…` choisit le fichier de police (.ttf, .otf) qui dessine le code,
 `Reset Editor Font` revient à celle d'origine ; une police à chasse fixe est attendue.
-Reste : créateur de thèmes, dispositions enregistrables,
+Thèmes de l'utilisateur : `Edit My Themes` ouvre `themes.json` (exemple commenté écrit la première fois) ;
+chaque thème y donne son nom, sombre ou clair, les couleurs qu'il change (le reste vient de GodCode
+Dark/Light) ; enregistré, il est relu, listé dans `Color Theme…` et appliqué s'il est en cours.
+Reste : dispositions enregistrables,
 langues d'interface ;
 API de plugins (WASM isolé) une fois le cœur stable.
 
