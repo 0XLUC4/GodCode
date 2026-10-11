@@ -248,7 +248,9 @@ Outils MCP : `Assistant: Edit MCP Servers` ouvre `mcp.json` (même forme que Cla
 par une commande) ; leurs outils sont proposés au modèle. Quand il en demande, l'outil et ses arguments
 s'affichent et rien ne tourne avant `Allow` ; `Refuse` le lui dit. Il peut enchaîner jusqu'à 8 tours
 d'outils par question. Les serveurs démarrent à la première ouverture du panneau.
-Reste : complétion automatique pendant la frappe, serveurs MCP par HTTP.
+`Assistant: Toggle Completion While Typing` (éteint par défaut) demande la suite à chaque pause de 0,7 s dans
+la frappe : le code autour du curseur part alors au modèle sans autre geste, et c'est dit en l'allumant.
+Reste : serveurs MCP par HTTP.
 
 ### Hors périmètre tant que le reste n'est pas solide (❌)
 

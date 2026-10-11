@@ -186,6 +186,7 @@ enum Cmd {
     Response,
     Assistant,
     Suggest,
+    AutoSuggest,
     Debug,
     StopDebug,
     StepOver,
@@ -603,6 +604,12 @@ const COMMANDS: &[Spec] = &[
         "Assistant: Complete Here",
         "Alt+\\",
     ),
+    spec(
+        Cmd::AutoSuggest,
+        icon::ROWS,
+        "Assistant: Toggle Completion While Typing",
+        "",
+    ),
     spec(Cmd::Assistant, icon::ROWS, "Toggle Assistant", ""),
     spec(Cmd::Debug, icon::BUG, "Debug File", "Ctrl+F5"),
     spec(Cmd::StopDebug, icon::STOP, "Stop Debugging", "Shift+F5"),
@@ -854,6 +861,7 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::Response),
             Some(Cmd::Assistant),
             Some(Cmd::Suggest),
+            Some(Cmd::AutoSuggest),
             Some(Cmd::EditMcp),
             Some(Cmd::Check),
             None,
@@ -1575,6 +1583,11 @@ pub struct GodApp {
     /// the one awaited, with the tab, the revision and the caret it was asked for.
     ghost: Option<Ghost>,
     suggesting: Option<(Answered, u64, u64, usize)>,
+    /// The model is asked what comes next at each pause in the typing. The tab and the
+    /// revision last seen, since when; and the ones it was last asked for.
+    auto_suggest: bool,
+    suggest_seen: Option<(u64, u64, f64)>,
+    suggest_done: Option<(u64, u64)>,
     /// The layouts kept under a name; and the one chosen while they are picked from.
     layouts: Vec<Arrangement>,
     layout_pick: Option<usize>,
@@ -1811,6 +1824,9 @@ impl GodApp {
             mcp_started: false,
             ghost: None,
             suggesting: None,
+            auto_suggest: get("auto_suggest").is_some_and(|value| value == "1"),
+            suggest_seen: None,
+            suggest_done: None,
             chat: Chat::new(
                 get("assistant_provider").as_deref(),
                 get("assistant_model").unwrap_or_default(),
@@ -4562,6 +4578,41 @@ impl GodApp {
         self.ghost = None;
     }
 
+    /// Ask the model what comes next once the typing has paused, when that is wanted:
+    /// once for each state of the text, and never for a file that was only opened.
+    fn suggest_at_a_pause(&mut self, ctx: &Context) {
+        let idle = self.suggesting.is_none() && self.ghost.is_none();
+        let Some(tab) = self
+            .tabs
+            .get(self.active)
+            .filter(|_| self.auto_suggest && idle)
+        else {
+            return;
+        };
+        let (now, here) = (ctx.input(|input| input.time), (tab.id, tab.revision));
+        let caret = tab.selection.start == tab.selection.end;
+        match self.suggest_seen {
+            Some((id, revision, since)) if (id, revision) == here => {
+                let waited = now - since >= SUGGEST_PAUSE;
+                let wanted = self.suggest_done != Some(here) && self.editor_focused && caret;
+                if waited && wanted && !self.chat.model.is_empty() {
+                    self.suggest_done = Some(here);
+                    self.suggest(ctx);
+                }
+            }
+            Some((id, ..)) if id == here.0 => {
+                self.suggest_seen = Some((here.0, here.1, now));
+                // Seen again once the pause is over, if nothing else wakes the window.
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(SUGGEST_PAUSE));
+            }
+            // Another file: nothing was typed in it yet.
+            _ => {
+                self.suggest_seen = Some((here.0, here.1, now));
+                self.suggest_done = Some(here);
+            }
+        }
+    }
+
     /// Tab takes what the model would write at the caret, Escape leaves it; so does
     /// anything that changes the text or moves the caret.
     fn ghost_keys(&mut self, ctx: &Context) {
@@ -7025,6 +7076,17 @@ impl GodApp {
                 self.bottom = (!shown).then_some(Bottom::Response);
             }
             Cmd::Suggest => self.suggest(ctx),
+            Cmd::AutoSuggest => {
+                self.auto_suggest = !self.auto_suggest;
+                self.suggest_seen = None;
+                self.toasts.success(match self.auto_suggest {
+                    true => {
+                        "Completion while typing is on: at each pause, the code around the \
+                         caret is sent to the model"
+                    }
+                    false => "Completion while typing is off: nothing is sent unless asked",
+                });
+            }
             Cmd::Assistant => {
                 let shown = self.bottom == Some(Bottom::Assistant);
                 self.bottom = (!shown).then_some(Bottom::Assistant);
@@ -9319,6 +9381,7 @@ impl eframe::App for GodApp {
         // After the servers were heard: one that just said what it can do is asked at once.
         self.ask_hints();
         self.ask_folds();
+        self.suggest_at_a_pause(&ctx);
         self.poll_debug(&ctx);
         self.poll_tests();
         // The tab in front is the most recent of the recent files.
@@ -9471,6 +9534,7 @@ impl eframe::App for GodApp {
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
         storage.set_string("layouts", layouts_text(&self.layouts));
+        storage.set_string("auto_suggest", flag(self.auto_suggest));
         storage.set_string("assistant_provider", self.chat.provider.name().to_owned());
         storage.set_string("assistant_model", self.chat.model.clone());
         storage.set_string("env_file", self.env_file.clone().unwrap_or_default());
@@ -9595,6 +9659,10 @@ struct Ghost {
     at: usize,
     text: String,
 }
+
+/// Seconds without a key before the model is asked what comes next, when it is asked
+/// while typing.
+const SUGGEST_PAUSE: f64 = 0.7;
 
 /// How many times in a row a model may ask for tools before it is stopped.
 const TOOL_ROUNDS: usize = 8;
