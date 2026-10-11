@@ -127,6 +127,49 @@ pub fn complete(text: &str, caret: usize, language: &Language) -> Vec<Completion
         kind,
     };
 
+    // Inside a tag, what can be written is an attribute of its element.
+    if let Some(element) = language
+        .is_markup()
+        .then(|| tag_being_written(&text[..end]))
+        .flatten()
+    {
+        let own = ATTRIBUTES.iter().filter(|(of, _)| *of == element);
+        let known = own
+            .chain(&ATTRIBUTES[..1])
+            .flat_map(|(_, names)| names.iter());
+        let fitting = known.filter(|name| fits(name)).map(|name| {
+            // One that is there or not takes no value.
+            let body = match SWITCHES.contains(name) {
+                true => (*name).to_owned(),
+                false => format!("{name}=\"$0\""),
+            };
+            completion(name, &body, Kind::Keyword)
+        });
+        return fitting.take(MAX_COMPLETIONS).collect();
+    }
+    // In a style sheet: a property at the start of a line of a block, its values after it.
+    if language.name == "CSS" {
+        let before = &text[..end];
+        let line = &before[before.rfind('\n').map_or(0, |found| found + 1)..];
+        let in_block = before.matches('{').count() > before.matches('}').count();
+        let stem = line[..line.len() - prefix.len()].trim();
+        if in_block && stem.is_empty() {
+            let fitting = CSS_PROPERTIES.iter().filter(|name| fits(name));
+            let offered =
+                fitting.map(|name| completion(name, &format!("{name}: $0;"), Kind::Keyword));
+            return offered.take(MAX_COMPLETIONS).collect();
+        }
+        if let Some((property, _)) = stem.split_once(':').filter(|_| in_block) {
+            let own = CSS_VALUES.iter().filter(|(of, _)| *of == property.trim());
+            let known = own
+                .chain(&CSS_VALUES[..1])
+                .flat_map(|(_, values)| values.iter());
+            let fitting = known.filter(|value| fits(value));
+            let offered = fitting.map(|value| completion(value, value, Kind::Keyword));
+            return offered.take(MAX_COMPLETIONS).collect();
+        }
+    }
+
     let snippets = SNIPPETS
         .iter()
         .find(|(name, _)| *name == language.name)
@@ -157,6 +200,295 @@ pub fn complete(text: &str, caret: usize, language: &Language) -> Vec<Completion
     );
     found.truncate(MAX_COMPLETIONS);
     found
+}
+
+/// The attributes of the elements, by element; the first are those of all of them.
+const ATTRIBUTES: &[(&str, &[&str])] = &[
+    (
+        "",
+        &[
+            "class",
+            "id",
+            "style",
+            "title",
+            "hidden",
+            "lang",
+            "tabindex",
+            "role",
+            "aria-label",
+            "data-",
+        ],
+    ),
+    ("a", &["href", "target", "rel", "download"]),
+    ("img", &["src", "alt", "width", "height", "loading"]),
+    (
+        "input",
+        &[
+            "type",
+            "name",
+            "value",
+            "placeholder",
+            "required",
+            "disabled",
+            "checked",
+            "min",
+            "max",
+        ],
+    ),
+    ("form", &["action", "method"]),
+    ("button", &["type", "disabled"]),
+    ("link", &["rel", "href"]),
+    ("script", &["src", "type", "defer", "async"]),
+    ("meta", &["name", "content", "charset"]),
+    ("label", &["for"]),
+    ("select", &["name", "required", "disabled"]),
+    (
+        "textarea",
+        &["name", "rows", "cols", "placeholder", "required"],
+    ),
+    ("option", &["value", "selected"]),
+    ("td", &["colspan", "rowspan"]),
+    ("th", &["colspan", "rowspan", "scope"]),
+    ("iframe", &["src", "width", "height"]),
+    (
+        "video",
+        &["src", "controls", "autoplay", "loop", "muted", "poster"],
+    ),
+    ("audio", &["src", "controls", "autoplay", "loop", "muted"]),
+    ("source", &["src", "type"]),
+];
+
+/// The attributes that are there or not, and take no value.
+const SWITCHES: [&str; 12] = [
+    "hidden", "required", "disabled", "checked", "selected", "defer", "async", "controls",
+    "autoplay", "loop", "muted", "download",
+];
+
+/// The properties of a style sheet most often written.
+const CSS_PROPERTIES: [&str; 62] = [
+    "align-items",
+    "align-self",
+    "background",
+    "background-color",
+    "background-image",
+    "border",
+    "border-bottom",
+    "border-color",
+    "border-left",
+    "border-radius",
+    "border-right",
+    "border-top",
+    "bottom",
+    "box-shadow",
+    "box-sizing",
+    "color",
+    "cursor",
+    "display",
+    "flex",
+    "flex-direction",
+    "flex-wrap",
+    "float",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
+    "gap",
+    "grid-template-columns",
+    "grid-template-rows",
+    "height",
+    "justify-content",
+    "left",
+    "letter-spacing",
+    "line-height",
+    "list-style",
+    "margin",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "margin-top",
+    "max-height",
+    "max-width",
+    "min-height",
+    "min-width",
+    "opacity",
+    "outline",
+    "overflow",
+    "padding",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "padding-top",
+    "position",
+    "right",
+    "text-align",
+    "text-decoration",
+    "text-transform",
+    "top",
+    "transform",
+    "transition",
+    "width",
+    "z-index",
+];
+
+/// The words a property takes as values; the first are those any of them takes.
+const CSS_VALUES: &[(&str, &[&str])] = &[
+    ("", &["inherit", "initial", "unset", "auto", "none"]),
+    (
+        "display",
+        &[
+            "block",
+            "inline",
+            "inline-block",
+            "flex",
+            "grid",
+            "inline-flex",
+            "contents",
+        ],
+    ),
+    (
+        "position",
+        &["static", "relative", "absolute", "fixed", "sticky"],
+    ),
+    (
+        "flex-direction",
+        &["row", "column", "row-reverse", "column-reverse"],
+    ),
+    ("flex-wrap", &["wrap", "nowrap"]),
+    (
+        "justify-content",
+        &[
+            "center",
+            "flex-start",
+            "flex-end",
+            "space-between",
+            "space-around",
+            "space-evenly",
+        ],
+    ),
+    (
+        "align-items",
+        &["center", "flex-start", "flex-end", "stretch", "baseline"],
+    ),
+    (
+        "align-self",
+        &["center", "flex-start", "flex-end", "stretch", "baseline"],
+    ),
+    ("text-align", &["left", "right", "center", "justify"]),
+    (
+        "text-decoration",
+        &["underline", "line-through", "overline"],
+    ),
+    ("text-transform", &["uppercase", "lowercase", "capitalize"]),
+    ("font-weight", &["bold", "normal", "lighter", "bolder"]),
+    ("font-style", &["italic", "normal", "oblique"]),
+    ("overflow", &["hidden", "visible", "scroll"]),
+    (
+        "cursor",
+        &["pointer", "default", "text", "move", "not-allowed", "grab"],
+    ),
+    ("box-sizing", &["border-box", "content-box"]),
+    ("float", &["left", "right"]),
+    ("list-style", &["disc", "circle", "square", "decimal"]),
+];
+
+/// The element whose tag is being written at the end of `before`, once its name is: what
+/// is typed next is one of its attributes. Not between the quotes of a value.
+fn tag_being_written(before: &str) -> Option<&str> {
+    let tag = &before[before.rfind('<')? + 1..];
+    if tag.contains('>') || tag.starts_with(['/', '!', '?']) || tag.matches('"').count() % 2 == 1 {
+        return None;
+    }
+    let (name, _) = tag.split_once(char::is_whitespace)?;
+    (!name.is_empty() && name.chars().all(in_tag_name)).then_some(name)
+}
+
+/// A tag of a text: where its name is, in bytes, whether it closes an element, and
+/// whether it holds nothing and so goes with no other.
+struct Tag {
+    name: Range<usize>,
+    closes: bool,
+    alone: bool,
+    /// It is written to its end: one still being typed goes with no other yet.
+    whole: bool,
+}
+
+fn tags_of(text: &str) -> Vec<Tag> {
+    let found = text.match_indices('<').filter_map(|(at, _)| {
+        let rest = &text[at + 1..];
+        let closes = rest.starts_with('/');
+        let start = at + 1 + usize::from(closes);
+        let length: usize = text[start..]
+            .chars()
+            .take_while(|ch| in_tag_name(*ch))
+            .map(char::len_utf8)
+            .sum();
+        let name = &text[start..start + length];
+        // `a < b` is no tag; `</>` is one whose name was taken out.
+        let after = text[start + length..].chars().next();
+        let tag = after.is_some_and(|ch| ch == '>' || ch == '/' || ch.is_whitespace());
+        if !tag || (name.is_empty() && !closes && after != Some('>')) {
+            return None;
+        }
+        let end = rest
+            .find(['<', '>'])
+            .filter(|end| rest[*end..].starts_with('>'));
+        let alone = end.is_some_and(|end| rest[..end].ends_with('/'))
+            || crate::format::VOID_TAGS.contains(&name.to_ascii_lowercase().as_str());
+        Some(Tag {
+            name: start..start + length,
+            closes,
+            alone: alone && !closes,
+            whole: end.is_some(),
+        })
+    });
+    found.collect()
+}
+
+/// Whether one name is the other with one char more.
+fn one_char_apart(one: &str, other: &str) -> bool {
+    let (long, short) = match one.len() > other.len() {
+        true => (one, other),
+        false => (other, one),
+    };
+    let same = long.chars().zip(short.chars()).take_while(|(a, b)| a == b);
+    let prefix: usize = same.map(|(ch, _)| ch.len_utf8()).sum();
+    let skipped = long[prefix..].chars().next().map_or(0, char::len_utf8);
+    long.len() != short.len() && long[prefix + skipped..] == short[prefix..]
+}
+
+/// After the name of a tag was edited at the byte `caret`: where the name of the tag that
+/// goes with it is, and the name to write there for the two to go together again. `None`
+/// when the caret is in no name, or the tag that would go with it bore another name.
+pub fn twin_tag(text: &str, caret: usize) -> Option<(Range<usize>, String)> {
+    let all = tags_of(text);
+    let at = all
+        .iter()
+        .position(|tag| tag.name.start <= caret && caret <= tag.name.end)?;
+    let edited = &all[at];
+    if edited.alone || !edited.whole {
+        return None;
+    }
+    // The tag that goes with it: the first one, the way it looks, that pairs with none
+    // of those between.
+    let mut depth = 0_usize;
+    let pairs = |tag: &&Tag| {
+        if tag.alone || !tag.whole {
+            return false;
+        }
+        if tag.closes == edited.closes {
+            depth += 1;
+            return false;
+        }
+        let found = depth == 0;
+        depth = depth.saturating_sub(1);
+        found
+    };
+    let twin = match edited.closes {
+        false => all[at + 1..].iter().find(pairs),
+        true => all[..at].iter().rev().find(pairs),
+    }?;
+    let (name, other) = (&text[edited.name.clone()], &text[twin.name.clone()]);
+    one_char_apart(name, other).then(|| (twin.name.clone(), name.to_owned()))
 }
 
 /// What a tag may be named with.
@@ -360,6 +692,74 @@ mod tests {
         assert_eq!(closing_tag("<p", "<p>a</p>").as_deref(), Some("</p>"));
         // A name that only starts the same is another element.
         assert_eq!(closing_tag("<b", "</body>").as_deref(), Some("</b>"));
+    }
+
+    #[test]
+    fn attributes_and_styles_are_offered_where_they_go() {
+        let offered = |text: &str, file: &str| {
+            let found = complete(text, text.chars().count(), Language::of(Path::new(file)));
+            found
+                .into_iter()
+                .map(|completion| completion.body)
+                .collect::<Vec<_>>()
+        };
+        // In a tag: the attributes of its element, then those of any element.
+        assert_eq!(offered("<a h", "a.html"), ["href=\"$0\"", "hidden"]);
+        assert_eq!(offered("<input class=\"a\" re", "a.html"), ["required"]);
+        assert_eq!(offered("<p cl", "a.html"), ["class=\"$0\""]);
+        // Not in the value of one, nor outside a tag.
+        assert!(!offered("<p class=\"cl", "a.html").contains(&"class=\"$0\"".to_owned()));
+        assert!(!offered("<p>cl", "a.html").contains(&"class=\"$0\"".to_owned()));
+        // In a style sheet: properties in a block, values after a property.
+        assert_eq!(offered("a {\n  disp", "a.css"), ["display: $0;"]);
+        assert_eq!(offered("a {\n  display: fl", "a.css"), ["flex"]);
+        assert_eq!(offered("a {\n  color: in", "a.css"), ["inherit", "initial"]);
+        assert!(!offered("disp", "a.css").contains(&"display: $0;".to_owned()));
+    }
+
+    #[test]
+    fn the_tag_that_goes_with_an_edited_one_is_found() {
+        let twin = |text: &str, caret: usize| twin_tag(text, caret);
+        // A char typed in the name of the opening tag: the closing one takes the name.
+        assert_eq!(
+            twin("<divx><p>a</p></div>", 5),
+            Some((16..19, "divx".to_owned()))
+        );
+        // A char erased in the closing tag: the opening one follows.
+        assert_eq!(
+            twin("<div><br>a<img/></di>", 20),
+            Some((1..4, "di".to_owned()))
+        );
+        // Down to no name at all, and back.
+        assert_eq!(twin("<><b>x</b></p>", 1), Some((12..13, String::new())));
+        assert_eq!(twin("<h><b>x</b></>", 2), Some((13..13, "h".to_owned())));
+        // Tags that did not go together are left alone: so are those that already do.
+        assert_eq!(twin("<div>a</span>", 3), None);
+        assert_eq!(twin("<div>a</div>", 3), None);
+        assert_eq!(twin("<br>a", 2), None);
+        assert_eq!(twin("a < b", 3), None);
+        assert_eq!(twin("<div>a</div>", 5), None);
+        // A tag still being typed is the start of a new element, not the old one renamed.
+        assert_eq!(
+            twin(
+                "<div>
+<di
+</div>",
+                9
+            ),
+            None
+        );
+        assert_eq!(
+            twin(
+                "<div>
+<di 
+</div>",
+                9
+            ),
+            None
+        );
+        assert!(one_char_apart("div", "dv") && one_char_apart("", "a"));
+        assert!(!one_char_apart("div", "div") && !one_char_apart("div", "span"));
     }
 
     #[test]

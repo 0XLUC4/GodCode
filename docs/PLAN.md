@@ -61,8 +61,9 @@ thèmes sombre/clair, zoom.
 | Historique local (une version à chaque sauvegarde, 40 gardées) | ✅ |
 | Snippets personnalisables (`Edit Snippets` : un fichier JSON par langage) | ✅ |
 | Raccourcis configurables (`Edit Keyboard Shortcuts` : nom de la commande → raccourci) | ✅ |
-| Mise en forme pendant la frappe : Entrée indente après `{ [ ( :` et, en HTML/XML, après une balise ouvrante ; entre `<body>` et `</body>` comme entre deux crochets, ce qui ferme passe sur sa ligne ; un `} ] )` tapé en début de ligne se range sous la ligne qui l'ouvre | ✅ |
-| Balises : `>` écrit la balise fermante sauf si une fermante l'attend déjà plus bas ; `</` écrit le nom de l'élément encore ouvert, sous sa balise ouvrante | ✅ |
+| Mise en forme pendant la frappe : Entrée indente après `{ [ ( :` (même suivis d'un commentaire) et, en HTML/XML, après une balise ouvrante ; entre `<body>` et `</body>` comme entre deux crochets, ce qui ferme passe sur sa ligne ; un `} ] )` tapé en début de ligne se range sous la ligne qui l'ouvre. Pas encore : blocs `then` / `do` … `end` (Lua, Ruby) | ✅ |
+| Balises : `>` écrit la balise fermante sauf si une fermante l'attend déjà plus bas ; `</` écrit le nom de l'élément encore ouvert, sous sa balise ouvrante ; renommer une balise renomme sa jumelle (ouvrante ou fermante) au fil de la frappe | ✅ |
+| Complétion web : attributs dans une balise (ceux de l'élément puis les communs, `class=""` avec le curseur entre les guillemets), propriétés CSS en début de ligne d'un bloc (`display: ;`) et leurs valeurs courantes. Pas encore : CSS dans `<style>` et attribut `style`, valeurs des attributs | ✅ |
 | Abréviations HTML à la Emmet, avec Tab : `ul>li.item$*3`, `#id`, `.classe`, `[attributs]`, `{texte}`, `>` `+` `*n`, `!` pour une page entière (`crates/core/src/emmet.rs`). Pas encore : groupes `( )`, remontée `^`, abréviations CSS | ✅ |
 
 ### Phase 2 — moteur de langages (🔨)

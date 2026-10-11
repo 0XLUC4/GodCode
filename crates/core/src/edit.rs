@@ -51,7 +51,13 @@ pub fn newline(text: &mut String, selection: Range<usize>, unit: &str, markup: b
         .chars()
         .take_while(|ch| *ch == ' ' || *ch == '\t')
         .collect();
-    let before = line.trim_end().chars().next_back();
+    // A comment after what opens a block does not hide that it opens one.
+    let code = [" //", " #", "\t//", "\t#"]
+        .iter()
+        .filter_map(|marker| Some(line[..line.rfind(marker)?].trim_end()))
+        .find(|code| code.ends_with(['{', '[', '(', ':']))
+        .unwrap_or(line.trim_end());
+    let before = code.chars().next_back();
     let after = text[end..].chars().next();
     let element = markup.then(|| opened_tag(line)).flatten();
     let mut inserted = format!("\n{lead}");
@@ -398,6 +404,16 @@ mod tests {
         assert_eq!(broken("<!doctype html>", 15).0, "<!doctype html>\n");
         // What holds another element still splits from its own closing tag only.
         assert_eq!(broken("<p></b>", 3).0, "<p>\n  </b>");
+        // A comment after the bracket changes nothing; one after anything else neither.
+        let mut noted = "fn a() { // why".to_owned();
+        newline(&mut noted, 15..15, "    ", false);
+        assert_eq!(noted, "fn a() { // why\n    ");
+        let mut python = "if ok:  # sure".to_owned();
+        newline(&mut python, 14..14, "    ", false);
+        assert_eq!(python, "if ok:  # sure\n    ");
+        let mut plain = "let a = 1; // see http://x".to_owned();
+        newline(&mut plain, 26..26, "    ", false);
+        assert_eq!(plain, "let a = 1; // see http://x\n");
         // In code a `>` ends no tag.
         let mut code = "let a: Vec<String>".to_owned();
         newline(&mut code, 18..18, "    ", false);

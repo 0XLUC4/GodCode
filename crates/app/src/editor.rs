@@ -125,6 +125,9 @@ pub struct View {
     pub block_step: Option<(isize, isize)>,
     /// Scroll no more than it takes to see the caret, on the next frame.
     pub reveal: bool,
+    /// Something was typed in markup: the tag that goes with the one edited, if one was,
+    /// is to take its name on the next frame.
+    retag: bool,
     layout: Option<Layout>,
     /// What the text field worked out of the text.
     index: field::Cache,
@@ -721,6 +724,30 @@ fn type_at_carets(ui: &Ui, id: Id, text: &mut String, view: &mut View) -> bool {
     text.len() != before
 }
 
+/// The name of a tag was typed in: the tag that goes with it takes the same name, so that
+/// the two are renamed as one. Returns whether the text changed.
+fn retag(ui: &Ui, id: Id, text: &mut String, view: &mut View) -> bool {
+    if !std::mem::take(&mut view.retag) {
+        return false;
+    }
+    let Some(caret) = selection_of(ui.ctx(), id).filter(Range::is_empty) else {
+        return false;
+    };
+    let at = godcode_core::byte_index(text, caret.start);
+    let Some((twin, name)) = complete::twin_tag(text, at) else {
+        return false;
+    };
+    // A twin before the caret moves it along with what changes there.
+    let before = twin.end <= at;
+    let (was, now) = (text[twin.clone()].chars().count(), name.chars().count());
+    text.replace_range(twin, &name);
+    if before {
+        let moved = caret.start + now - was;
+        set_selection(ui.ctx(), id, &(moved..moved));
+    }
+    true
+}
+
 /// Keys the plain text field would handle without knowing it holds code.
 fn keys(ui: &Ui, id: Id, text: &mut String, config: &Config<'_>, view: &mut View) -> bool {
     if !ui.memory(|memory| memory.has_focus(id)) {
@@ -968,7 +995,7 @@ pub fn show(
     let palette = Palette::of(ui);
     let dark = ui.visuals().dark_mode;
     let font = FontId::monospace(config.font_size);
-    let mut changed = keys(ui, id, text, config, view);
+    let mut changed = retag(ui, id, text, view) | keys(ui, id, text, config, view);
     let selected_before = selection_of(ui.ctx(), id);
 
     // Counted when the text was last read through: it only tells how wide the numbers are.
@@ -1270,6 +1297,7 @@ pub fn show(
                 ui.scroll_to_rect(around, None);
             }
             changed |= typed;
+            view.retag = typed && config.language.is_markup();
             let caret_screen = caret.map(|caret| caret.translate(origin).left_bottom());
             (
                 geometry,
@@ -1792,6 +1820,29 @@ mod tests {
         harness.frame(Vec::new());
         harness.key(Key::Tab, Modifiers::NONE);
         assert!(!harness.text.contains('<'), "{}", harness.text);
+    }
+
+    #[test]
+    fn the_two_tags_of_an_element_are_renamed_as_one() {
+        let mut harness = Harness::of("index.html", "<div>\n  <p>a</p>\n</div>", false);
+        // The name of the opening tag is erased and typed again: the closing one follows.
+        set_selection(&harness.ctx, editor_id(), &(4..4));
+        harness.frame(Vec::new());
+        for _ in 0..3 {
+            harness.key(Key::Backspace, Modifiers::NONE);
+        }
+        assert_eq!(harness.text, "<>\n  <p>a</p>\n</>");
+        for letter in ["n", "a", "v"] {
+            harness.type_text(letter);
+        }
+        assert_eq!(harness.text, "<nav>\n  <p>a</p>\n</nav>");
+        // From the closing tag too, the caret staying where it types.
+        let end = harness.text.chars().count() - 1;
+        set_selection(&harness.ctx, editor_id(), &(end..end));
+        harness.frame(Vec::new());
+        let out = harness.type_text("x");
+        assert_eq!(harness.text, "<navx>\n  <p>a</p>\n</navx>");
+        assert_eq!(out.selection, Some(end + 2..end + 2));
     }
 
     #[test]
