@@ -214,8 +214,8 @@ chaque thème y donne son nom, sombre ou clair, les couleurs qu'il change (le re
 Dark/Light) ; enregistré, il est relu, listé dans `Color Theme…` et appliqué s'il est en cours.
 Dispositions : `Save Layout…` garde sous un nom ce qui se montre (panneau de côté, panneau du bas,
 minimap, sticky scroll, zen), `Layout…` en remet une ; gardées d'une session à l'autre.
+L'interface est en anglais, et le reste : pas d'autres langues.
 Reste :
-langues d'interface ;
 API de plugins (WASM isolé) une fois le cœur stable.
 
 ### Phase 8 — IA (⏳, volontairement en dernier)
