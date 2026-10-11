@@ -1477,6 +1477,8 @@ pub struct GodApp {
     /// Whose keys the editor obeys, and what Vim and Emacs remember between keys.
     keys: Keys,
     vim: modal::Vim,
+    /// The tab the marks of Vim were set in: they are no marks of another text.
+    vim_tab: u64,
     emacs: modal::Emacs,
     /// The language server writes hints in the lines: types, names of arguments.
     hints: bool,
@@ -1727,6 +1729,7 @@ impl GodApp {
                 _ => Keys::Default,
             },
             vim: modal::Vim::default(),
+            vim_tab: 0,
             emacs: modal::Emacs::default(),
             hints: get("hints").is_none_or(|value| value == "1"),
             folds: folds_of(&get("folds").unwrap_or_default()),
@@ -6496,6 +6499,9 @@ impl GodApp {
         else {
             return;
         };
+        if std::mem::replace(&mut self.vim_tab, tab.id) != tab.id {
+            self.vim.forget_marks();
+        }
         let id = tab.editor_id();
         // Escape takes the keyboard away from a text field before anything here sees it:
         // in Vim it is a key like the others, and the editor keeps the keyboard.
