@@ -34,6 +34,11 @@ pub enum Event {
     Variables(Vec<(String, String)>),
     /// What the program printed.
     Output(String),
+    /// What an expression is worth where the program is stopped, or why it cannot be told.
+    Watched {
+        expression: String,
+        value: String,
+    },
     Ended,
     /// The debugger refused: why.
     Failed(String),
@@ -45,6 +50,8 @@ enum Asked {
     Stack,
     Scopes,
     Variables,
+    /// The worth of this expression.
+    Evaluate(String),
     Other,
 }
 
@@ -57,6 +64,8 @@ pub struct Session {
     pending: HashMap<u64, Asked>,
     /// The thread that stopped last.
     thread: u64,
+    /// The call of the stack being looked at: expressions are worked out there.
+    frame: u64,
     /// What to launch, sent once the debugger answered `initialize`.
     launch: Value,
     /// The breakpoints to set once the debugger is ready for them.
@@ -84,6 +93,7 @@ impl Session {
             seq: 0,
             pending: HashMap::new(),
             thread: 0,
+            frame: 0,
             launch,
             breakpoints,
             ended: false,
@@ -146,7 +156,21 @@ impl Session {
 
     /// Ask for the variables of a call of the stack; answered by [`Event::Variables`].
     pub fn inspect(&mut self, frame: u64) {
+        self.frame = frame;
         self.request("scopes", json!({ "frameId": frame }), Asked::Scopes);
+    }
+
+    /// Ask what `expressions` are worth in the call being looked at; each is answered by
+    /// an [`Event::Watched`].
+    pub fn watch(&mut self, expressions: &[String]) {
+        for expression in expressions {
+            let arguments = json!({
+                "expression": expression,
+                "frameId": self.frame,
+                "context": "watch",
+            });
+            self.request("evaluate", arguments, Asked::Evaluate(expression.clone()));
+        }
     }
 
     /// Stop the program and the debugger.
@@ -231,6 +255,10 @@ impl Session {
                             self.request("variables", arguments, Asked::Variables);
                         }
                     }
+                    Some(Asked::Evaluate(expression)) => events.push(Event::Watched {
+                        expression,
+                        value: worth(message),
+                    }),
                     Some(Asked::Variables) => {
                         let list = body["variables"].as_array().into_iter().flatten();
                         let text = |value: &Value| value.as_str().unwrap_or("").to_owned();
@@ -258,6 +286,18 @@ impl Session {
     }
 }
 
+/// What the answer to `evaluate` says an expression is worth, or why it has no worth.
+fn worth(message: &Value) -> String {
+    let said = match message["success"].as_bool() {
+        Some(false) => message["message"]
+            .as_str()
+            .unwrap_or("cannot be worked out"),
+        _ => message["body"]["result"].as_str().unwrap_or(""),
+    };
+    // One line: the first of what was said.
+    said.lines().next().unwrap_or("").to_owned()
+}
+
 fn frames(body: &Value) -> Vec<Frame> {
     let list = body["stackFrames"].as_array().into_iter().flatten();
     list.map(|frame| Frame {
@@ -278,6 +318,16 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_worth_of_an_expression_is_read_or_why_it_has_none() {
+        let known = json!({ "success": true, "body": { "result": "[1, 2]", "type": "list" } });
+        assert_eq!(worth(&known), "[1, 2]");
+        let unknown =
+            json!({ "success": false, "message": "NameError: name 'x' is not defined\nmore" });
+        assert_eq!(worth(&unknown), "NameError: name 'x' is not defined");
+        assert_eq!(worth(&json!({ "success": false })), "cannot be worked out");
+    }
 
     #[test]
     fn the_stack_is_read_with_lines_from_zero() {

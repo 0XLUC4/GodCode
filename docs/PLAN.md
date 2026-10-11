@@ -126,23 +126,25 @@ d'egui les gardait (l'état rangé sous son id), ce que lisent les commandes de 
 | Historique d'annulation par différences : seul ce qui change est gardé (64 Mo au plus), donc autant de niveaux dans un gros fichier que dans un petit ; une frappe groupée par pauses d'une seconde ; un changement fait ailleurs (commande, Vim, serveur de langage) est trouvé par comparaison | ✅ |
 | Gros fichiers : frappe en temps constant partout (corde ou tampon à trou au lieu d'une `String`) ; Entrée, Tab et les touches Vim relisent encore tout le texte ; couleurs refaites pour les seules lignes changées | ⏳ |
 
-### Phase 4 — exécution, tests, débogage (⏳)
+### Phase 4 — exécution, tests, débogage (🔨)
 
-Fait : `Run Task…` (`Ctrl+Shift+R`) liste les scripts npm, les commandes cargo et go, les
-cibles du Makefile. Fait : `Run Test at Caret` (`Ctrl+Shift+F10`) lance le test sous le curseur (Rust, Python,
-Go, JS/TS). Fait : `Run Tests` (`Ctrl+Shift+T`) lance la commande de test du projet (cargo, npm, go,
-pytest, maven, gradle) dans le terminal.
+| Fonction | État |
+|---|---|
+| `Run File` (`F5`) lance le fichier en avant dans le terminal | ✅ |
+| `Run Task…` (`Ctrl+Shift+R`) : scripts npm, commandes cargo et go, cibles du Makefile | ✅ |
+| Configurations d'exécution du projet : `Edit Run Configurations` ouvre `.godcode/run.json` (nom → commande, avec `${file}`, `${fileName}`, `${folder}`) ; elles viennent en tête de `Run Task…` ; `Run Last Task` (`Ctrl+Alt+R`) relance la dernière | ✅ |
+| `Run Tests` (`Ctrl+Shift+T`) : la commande de test du projet (cargo, npm, go, pytest, maven, gradle) dans le terminal ; `Run Test at Caret` (`Ctrl+Shift+F10`) : le test sous le curseur (Rust, Python, Go, JS/TS) | ✅ |
+| Panneau **Tests** : les tests du fichier ouvert, un clic lance celui choisi | ✅ |
+| **Débogueur** (`crates/lsp/src/dap.rs`, client DAP) : points d'arrêt (clic sur le numéro de ligne ou `F9`), `Ctrl+F5` lance, `F5` continue, `F10` / `F11` / `Shift+F11` pas à pas, `Shift+F5` arrête ; panneau Debug avec pile d'appels, variables et sortie du programme | ✅ |
+| Expressions surveillées (watch) : tapées dans le panneau Debug, recalculées à chaque arrêt et quand on change d'appel dans la pile, gardées d'une session à l'autre ; un clic en retire une | ✅ |
+| Autres langages que Python : `Edit Debug Configurations` (adaptateur + réglages de lancement, `${file}` et `${folder}`) ; mécanisme fait, aucun autre adaptateur vérifié ici | ✅ |
+| Explorateur de tests du projet (tous les fichiers), résultats réussis / échoués lus dans la sortie, couverture | ⏳ |
+| Débogueur : points d'arrêt conditionnels, variables dépliables (objets, listes), survol d'une variable dans le code | ⏳ |
 
-Fait : **débogueur** (`crates/lsp/src/dap.rs`, client DAP) — points d'arrêt (clic sur le
-numéro de ligne ou `F9`), `Ctrl+F5` lance, `F5` continue, `F10` / `F11` / `Shift+F11` pas à
-pas, `Shift+F5` arrête ; panneau Debug avec pile d'appels, variables et sortie du
-programme. Vérifié de bout en bout avec Python (debugpy). Les autres langages se règlent
-dans `Edit Debug Configurations` (adaptateur + réglages de lancement, `${file}` et
-`${folder}`) : mécanisme fait, aucun autre adaptateur vérifié ici.
-
-Fait : panneau **Tests** — les tests du fichier ouvert, un clic lance celui choisi. Reste : configurations d'exécution, tâches, explorateur de tests (cargo test, pytest, vitest, go
-test, JUnit), couverture ; puis client DAP : points d'arrêt, pas à pas, variables, pile
-d'appels, watch.
+Vérifié de bout en bout avec le vrai débogueur Python (debugpy) : arrêt sur un point d'arrêt,
+pile, variables, expressions surveillées, reprise jusqu'à la fin.
+`cargo test -p godcode-lsp --test python -- --ignored` le rejoue ; il lui faut debugpy
+(`pip install debugpy`, ou son dossier dans `GODCODE_DEBUGPY`).
 
 ### Phase 5 — Git complet et projets (⏳)
 

@@ -1432,6 +1432,9 @@ pub struct GodApp {
     /// Where it is stopped: the calls, the variables of one of them, the file and line.
     frames: Vec<godcode_lsp::dap::Frame>,
     variables: Vec<(String, String)>,
+    /// The expressions watched, each with what it was last worth; and the one being typed.
+    watches: Vec<(String, String)>,
+    watch_typed: String,
     debug_at: Option<(PathBuf, usize)>,
     /// What it printed.
     debug_output: String,
@@ -1583,6 +1586,12 @@ impl GodApp {
             debug_stopped: false,
             frames: Vec::new(),
             variables: Vec::new(),
+            watches: get("watches")
+                .unwrap_or_default()
+                .lines()
+                .map(|expression| (expression.to_owned(), String::new()))
+                .collect(),
+            watch_typed: String::new(),
             debug_at: None,
             debug_output: String::new(),
             live: None,
@@ -3091,6 +3100,8 @@ impl GodApp {
         self.debug_at = None;
         self.frames.clear();
         self.variables.clear();
+        // Running, nothing can be said of what the expressions are worth.
+        self.watches.iter_mut().for_each(|(_, worth)| worth.clear());
     }
 
     /// Run the file in front under the debugger of its language.
@@ -3195,7 +3206,25 @@ impl GodApp {
                         self.debug_at = Some((path, line));
                     }
                 }
-                Event::Variables(variables) => self.variables = variables,
+                Event::Variables(variables) => {
+                    self.variables = variables;
+                    // The call looked at changed: so may what the expressions are worth.
+                    let watched: Vec<String> = self
+                        .watches
+                        .iter()
+                        .map(|(expression, _)| expression.clone())
+                        .collect();
+                    if let Some(session) = &mut self.debug {
+                        session.watch(&watched);
+                    }
+                }
+                Event::Watched { expression, value } => {
+                    let same = self
+                        .watches
+                        .iter_mut()
+                        .filter(|(watched, _)| *watched == expression);
+                    same.for_each(|(_, worth)| worth.clone_from(&value));
+                }
                 Event::Output(printed) => self.debug_output.push_str(&printed),
                 Event::Ended => {
                     // Having said nothing at all, it never started.
@@ -3235,6 +3264,8 @@ impl GodApp {
         });
         ui.add_space(4.0);
         let mut inspect = None;
+        // An expression to watch from now on, and one to watch no more.
+        let (mut watch, mut unwatch) = (None, None);
         ui.columns(3, |columns| {
             let titled = |ui: &mut Ui, title: &str| {
                 ui.horizontal(|ui| {
@@ -3261,6 +3292,29 @@ impl GodApp {
                         }
                     }
                 });
+            titled(&mut columns[1], "WATCH");
+            columns[1].horizontal(|ui| {
+                ui.add_space(10.0);
+                let field = TextEdit::singleline(&mut self.watch_typed)
+                    .hint_text("An expression, then Enter")
+                    .desired_width(ui.available_width() - 10.0);
+                let typed = ui.add(field);
+                let entered = ui.input(|input| input.key_pressed(Key::Enter));
+                let expression = self.watch_typed.trim();
+                if typed.lost_focus() && entered && !expression.is_empty() {
+                    watch = Some(expression.to_owned());
+                    self.watch_typed.clear();
+                }
+            });
+            for (index, (expression, worth)) in self.watches.iter().enumerate() {
+                let worth = if worth.is_empty() { "…" } else { worth };
+                let label = format!("{expression} = {worth}");
+                let row = list_row(&mut columns[1], &palette, &label, 10.0, palette.text);
+                if row.on_hover_text("Click to stop watching it").clicked() {
+                    unwatch = Some(index);
+                }
+            }
+            columns[1].add_space(6.0);
             titled(&mut columns[1], "VARIABLES");
             ScrollArea::vertical()
                 .id_salt("debug-variables")
@@ -3282,6 +3336,16 @@ impl GodApp {
                     ui.add(egui::Label::new(text).selectable(true));
                 });
         });
+        if let Some(index) = unwatch {
+            self.watches.remove(index);
+        }
+        if let Some(expression) = watch {
+            // Stopped, it is worked out at once; running, at the next stop.
+            if let (Some(session), true) = (&mut self.debug, self.debug_stopped) {
+                session.watch(std::slice::from_ref(&expression));
+            }
+            self.watches.push((expression, String::new()));
+        }
         // A call of the stack is looked at: its line shows, its variables are asked for.
         let Some(frame) = inspect else {
             return;
@@ -7143,6 +7207,12 @@ impl eframe::App for GodApp {
         storage.set_string("minimap", flag(self.minimap));
         storage.set_string("keys", (self.keys as u8).to_string());
         storage.set_string("hints", flag(self.hints));
+        let watched: Vec<&str> = self
+            .watches
+            .iter()
+            .map(|(expression, _)| &**expression)
+            .collect();
+        storage.set_string("watches", watched.join("\n"));
         for tab in &self.tabs {
             keep_folds(&mut self.folds, tab);
         }
