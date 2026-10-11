@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// A language the interface can be shown in.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tongue {
     #[default]
@@ -10,6 +11,7 @@ pub enum Tongue {
     French,
 }
 
+#[allow(dead_code)]
 impl Tongue {
     pub const ALL: [Tongue; 2] = [Tongue::English, Tongue::French];
 
@@ -39,11 +41,13 @@ impl Tongue {
 static IN_USE: AtomicU8 = AtomicU8::new(0);
 
 /// Shows the interface in `tongue` from now on, in the whole process.
+#[allow(dead_code)]
 pub fn set(tongue: Tongue) {
     IN_USE.store(tongue as u8, Ordering::Relaxed);
 }
 
 /// The tongue the interface is shown in.
+#[allow(dead_code)]
 pub fn current() -> Tongue {
     match IN_USE.load(Ordering::Relaxed) {
         1 => Tongue::French,
@@ -52,11 +56,13 @@ pub fn current() -> Tongue {
 }
 
 /// `text` in the tongue in use; `text` itself when it is English or has no translation.
+#[allow(dead_code)]
 pub fn tr(text: &'static str) -> &'static str {
     in_tongue(current(), text)
 }
 
 /// `text` in `tongue`; `text` itself in English or when it has no translation.
+#[allow(dead_code)]
 pub fn in_tongue(tongue: Tongue, text: &'static str) -> &'static str {
     match tongue {
         Tongue::English => text,
@@ -69,8 +75,8 @@ pub fn in_tongue(tongue: Tongue, text: &'static str) -> &'static str {
 /// The French of each English text of the interface, sorted by the English for the binary
 /// search. Sentence case, a space before `:`, and the nouns developers keep in English
 /// (Git, commit, stash, merge, rebase, blame…) left as they are.
+#[allow(dead_code)]
 const FRENCH: &[(&str, &str)] = &[
-    ("ASSISTANT", "ASSISTANT IA"),
     ("Add Caret Above", "Ajouter un curseur au-dessus"),
     ("Add Caret Below", "Ajouter un curseur en dessous"),
     ("All mine", "Ma version partout"),
@@ -180,7 +186,6 @@ const FRENCH: &[(&str, &str)] = &[
     ("Help", "Aide"),
     ("Indent Lines", "Indenter les lignes"),
     ("Initialize repository", "Initialiser le dépôt"),
-    ("Interface Language", "Langue de l'interface"),
     ("Join Lines", "Joindre les lignes"),
     ("Keyboard Shortcuts", "Raccourcis clavier"),
     ("Keyboard shortcuts", "Raccourcis clavier"),
@@ -317,7 +322,6 @@ const FRENCH: &[(&str, &str)] = &[
         "Changer de branche ou en créer une",
     ),
     ("Theirs", "Leur version"),
-    ("Toggle Assistant", "Basculer l'assistant"),
     ("Toggle Auto Save", "Basculer l'enregistrement automatique"),
     ("Toggle Breakpoint", "Basculer le point d'arrêt"),
     ("Toggle Case", "Basculer la casse"),
