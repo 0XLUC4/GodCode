@@ -3060,31 +3060,34 @@ impl GodApp {
             ui.add_space(10.0);
             ui.label(RichText::new("COMMIT").size(12.0).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
                 ui.add_space(4.0);
                 refresh =
                     widgets::small_icon_button(ui, icon::ARROWS_CLOCKWISE, "Refresh").clicked();
-                // What is done with the repository, a click away as the changes are. The
-                // bar is never narrower than this row needs.
-                let tools = [
-                    (icon::GRAPH, "Git graph", Cmd::GitGraph),
-                    (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
-                    (icon::TRAY_ARROW_UP, "Stash pop", Cmd::StashPop),
-                    (icon::TRAY_ARROW_DOWN, "Stash the changes", Cmd::Stash),
-                    (icon::CLOUD_ARROW_DOWN, "Fetch", Cmd::GitFetch),
-                    (icon::ARROW_LINE_UP, "Push", Cmd::GitPush),
-                    (
-                        icon::ARROW_LINE_DOWN,
-                        "Update project: pull (Ctrl+T)",
-                        Cmd::GitPull,
-                    ),
-                ];
-                for (glyph, tip, cmd) in tools {
-                    if widgets::small_icon_button(ui, glyph, tip).clicked() {
-                        self.pending.push(cmd);
-                    }
-                }
             });
+        });
+        // What is done with the repository, a click away as the changes are: on a row of
+        // its own under the title. The bar is never narrower than this row needs.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.add_space(8.0);
+            let tools = [
+                (
+                    icon::ARROW_LINE_DOWN,
+                    "Update project: pull (Ctrl+T)",
+                    Cmd::GitPull,
+                ),
+                (icon::ARROW_LINE_UP, "Push", Cmd::GitPush),
+                (icon::CLOUD_ARROW_DOWN, "Fetch", Cmd::GitFetch),
+                (icon::TRAY_ARROW_DOWN, "Stash the changes", Cmd::Stash),
+                (icon::TRAY_ARROW_UP, "Stash pop", Cmd::StashPop),
+                (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
+                (icon::GRAPH, "Git graph", Cmd::GitGraph),
+            ];
+            for (glyph, tip, cmd) in tools {
+                if widgets::small_icon_button(ui, glyph, tip).clicked() {
+                    self.pending.push(cmd);
+                }
+            }
         });
         ui.add_space(4.0);
         let note = |ui: &mut Ui, text: &str| {

@@ -1450,7 +1450,9 @@ mod tests {
         let (target, played) = server(|stream| scram_server(stream, Ending::Forged));
         let refused = Connection::open(&target).unwrap_err();
         assert!(refused.contains("did not prove"), "{refused}");
-        played.join().unwrap();
+        // Hung up on in the middle of what it had left to say, the server may fail to
+        // say it: that is the refusal seen from its side.
+        let _ = played.join();
     }
 
     #[test]
@@ -1458,7 +1460,8 @@ mod tests {
         let (target, played) = server(|stream| scram_server(stream, Ending::Silent));
         let refused = Connection::open(&target).unwrap_err();
         assert!(refused.contains("without proving"), "{refused}");
-        played.join().unwrap();
+        // The same: the server may be hung up on before it has said everything.
+        let _ = played.join();
     }
 
     #[test]
