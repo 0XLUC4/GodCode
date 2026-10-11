@@ -207,7 +207,11 @@ Docker compose : quand le dossier a un fichier compose, ses services sont nommé
 `Stop` et `Logs`.
 `Shell` ouvre un `sh` dans un conteneur lancé, dans le terminal (sans invite : le terminal d'ici n'est
 pas un vrai terminal).
-Reste : requêtes SQL, PostgreSQL.
+Requêtes : la fenêtre a un champ de question — un `SELECT` sur une table (`WHERE`, `ORDER BY`, `LIMIT`,
+`DISTINCT`, `count` / `sum` / `avg` / `min` / `max`, `LIKE`, `IN`, `BETWEEN`, quelques fonctions), vérifié contre le
+vrai SQLite sur 250 requêtes ; ni `JOIN` ni `GROUP BY`, et un nombre n'y égale jamais un texte (pas
+d'affinité de type). 1 000 lignes gardées au plus.
+Reste : PostgreSQL.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 

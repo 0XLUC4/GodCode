@@ -1963,6 +1963,8 @@ impl GodApp {
                         rows: Vec::new(),
                         error: None,
                         behind,
+                        asked: String::new(),
+                        answer: None,
                     };
                     browsing.read();
                     self.database = Some(browsing);
@@ -3835,6 +3837,8 @@ impl GodApp {
         let palette = Palette::of_ctx(ctx);
         let (mut table, mut page) = (browsing.table, browsing.page);
         let mut open = true;
+        // A question to answer; the answer on show to leave for the table.
+        let (mut run, mut leave) = (false, false);
         egui::Window::new(format!("Database: {}", browsing.name))
             .id(Id::new("database-window"))
             .open(&mut open)
@@ -3857,42 +3861,75 @@ impl GodApp {
                             for (index, found) in tables.iter().enumerate() {
                                 let row = ui.selectable_label(index == table, &found.name);
                                 if row.on_hover_text(&found.sql).clicked() {
-                                    (table, page) = (index, 0);
+                                    (table, page, leave) = (index, 0, true);
                                 }
                             }
                         });
                     });
                     ui.separator();
                     ui.vertical(|ui| {
-                        let pages = browsing.count.div_ceil(DATABASE_PAGE).max(1);
                         ui.horizontal(|ui| {
-                            ui.label(format!("{} rows", browsing.count));
-                            let earlier = Button::new("Previous");
-                            if ui.add_enabled(page > 0, earlier).clicked() {
-                                page -= 1;
+                            let field = TextEdit::singleline(&mut browsing.asked)
+                                .margin(crate::widgets::FIELD_MARGIN)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("SELECT * FROM … WHERE … ORDER BY … LIMIT …")
+                                .desired_width(ui.available_width() - 70.0);
+                            let field = ui.add(field);
+                            let entered = field.lost_focus()
+                                && ui.input(|input| input.key_pressed(Key::Enter));
+                            run = ui.button("Run").clicked() || entered;
+                        });
+                        let answered = browsing.answer.as_ref();
+                        let pages = browsing.count.div_ceil(DATABASE_PAGE).max(1);
+                        ui.horizontal(|ui| match answered {
+                            Some(Ok(answer)) => {
+                                let more = match answer.cut {
+                                    true => ", more were left out",
+                                    false => "",
+                                };
+                                ui.label(format!("{} rows answered{more}", answer.rows.len()));
+                                leave |= ui.button("Back to the table").clicked();
                             }
-                            ui.label(format!("{} / {pages}", page + 1));
-                            if ui
-                                .add_enabled(page + 1 < pages, Button::new("Next"))
-                                .clicked()
-                            {
-                                page += 1;
+                            Some(Err(_)) => leave |= ui.button("Back to the table").clicked(),
+                            None => {
+                                ui.label(format!("{} rows", browsing.count));
+                                let earlier = Button::new("Previous");
+                                if ui.add_enabled(page > 0, earlier).clicked() {
+                                    page -= 1;
+                                }
+                                ui.label(format!("{} / {pages}", page + 1));
+                                if ui
+                                    .add_enabled(page + 1 < pages, Button::new("Next"))
+                                    .clicked()
+                                {
+                                    page += 1;
+                                }
                             }
                         });
-                        if let Some(error) = &browsing.error {
+                        let refused = answered.and_then(|answer| answer.as_ref().err());
+                        if let Some(error) = refused.or(browsing.error.as_ref()) {
                             ui.colored_label(palette.error, error);
                         }
-                        let columns = tables.get(browsing.table).map(|found| &found.columns);
+                        // The answer to the question when there is one, else the table.
+                        let answer = answered.and_then(|answer| answer.as_ref().ok());
+                        let of_table = tables.get(browsing.table);
+                        let (columns, rows) = match answer {
+                            Some(answer) => (&answer.columns[..], &answer.rows),
+                            None => (
+                                of_table.map_or(&[][..], |found| &found.columns[..]),
+                                &browsing.rows,
+                            ),
+                        };
                         let grid = ScrollArea::both().id_salt("database-rows");
                         grid.auto_shrink(false).show(ui, |ui| {
                             egui::Grid::new("database-grid")
                                 .striped(true)
                                 .show(ui, |ui| {
-                                    for column in columns.into_iter().flatten() {
+                                    for column in columns {
                                         ui.strong(column);
                                     }
                                     ui.end_row();
-                                    for row in &browsing.rows {
+                                    for row in rows {
                                         for value in row {
                                             // One line of it, and not all of a long one.
                                             let written =
@@ -3914,6 +3951,14 @@ impl GodApp {
         if (table, page) != (browsing.table, browsing.page) {
             (browsing.table, browsing.page) = (table, page);
             browsing.read();
+        }
+        if leave {
+            browsing.answer = None;
+        }
+        if run && !browsing.asked.trim().is_empty() {
+            let asked =
+                godcode_core::sql::select(&browsing.database, &browsing.asked, DATABASE_ANSWER);
+            browsing.answer = Some(asked);
         }
         if open {
             self.database = Some(browsing);
@@ -9035,6 +9080,8 @@ const RESPONSES_KEPT: usize = 20;
 
 /// Rows of a table shown at a time.
 const DATABASE_PAGE: usize = 200;
+/// Rows kept of what a question answers.
+const DATABASE_ANSWER: usize = 1000;
 /// Chars of a value shown in the grid.
 const DATABASE_CELL: usize = 120;
 
@@ -9051,6 +9098,9 @@ struct Browsing {
     error: Option<String>,
     /// Its write-ahead log holds changes that are not read here.
     behind: bool,
+    /// The question written for it, and what the last one asked answered.
+    asked: String,
+    answer: Option<Result<godcode_core::sql::Answer, String>>,
 }
 
 impl Browsing {
