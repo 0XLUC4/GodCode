@@ -1436,6 +1436,9 @@ pub struct GodApp {
     web_wanted: Option<String>,
     /// The address of that page, as it shows and as it is typed.
     web_address: String,
+    /// The address the page was last seen at, and the file last shown as a page.
+    web_shown: String,
+    web_file: Option<PathBuf>,
     /// The project templates are shown, and the one chosen.
     templates: Option<usize>,
     /// The shortcuts of the user: they win over the built-in ones.
@@ -1578,6 +1581,8 @@ impl GodApp {
             web_open: false,
             web_wanted: None,
             web_address: String::new(),
+            web_shown: String::new(),
+            web_file: None,
             templates: None,
             keymap: load_keymap(),
             split_down: false,
@@ -3383,6 +3388,7 @@ impl GodApp {
             return;
         };
         if !in_browser {
+            self.web_file = self.tabs.get(self.active).and_then(|tab| tab.path.clone());
             self.web_wanted = Some(url);
             return;
         }
@@ -3392,11 +3398,32 @@ impl GodApp {
         }
     }
 
+    /// The preview follows the editor: another page of the folder served, brought in
+    /// front, takes the place of the one on show. An address typed by hand is left alone.
+    fn follow_preview(&mut self) {
+        let front = self.tabs.get(self.active).and_then(|tab| tab.path.as_ref());
+        let (true, Some(live), Some(path)) = (self.web_open, &self.live, front) else {
+            return;
+        };
+        if self.web_file.as_ref() == Some(path) {
+            return;
+        }
+        self.web_file = Some(path.clone());
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        let page = matches!(extension, Some("html" | "htm"));
+        let ours = self
+            .web_shown
+            .starts_with(&format!("http://127.0.0.1:{}/", live.port));
+        if page && ours {
+            self.web_wanted = live.url_of(path);
+        }
+    }
+
     /// The panel of the page shown inside the window: its address and what can be done
     /// with it. Returns the place left for the page itself.
     fn web_panel(&mut self, ui: &mut Ui) -> Option<Rect> {
         let web = self.web.as_ref()?;
-        let url = web.url().to_owned();
+        let url = web.url();
         let mut close = false;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -3421,6 +3448,12 @@ impl GodApp {
                 }
                 if button(ui, icon::ARROW_CLOCKWISE, "Reload") {
                     web.reload();
+                }
+                if button(ui, icon::ARROW_RIGHT, "Forward") {
+                    web.step(false);
+                }
+                if button(ui, icon::ARROW_LEFT, "Back") {
+                    web.step(true);
                 }
                 // The address takes what is left: any page can be typed there, a
                 // development server of this computer to begin with.
@@ -3452,14 +3485,18 @@ impl GodApp {
             self.web_address.clone_from(&url);
             match &mut self.web {
                 Some(web) => web.go(&url),
-                None => match crate::webview::Web::open(frame, &url) {
-                    Ok(web) => self.web = Some(web),
-                    // No web view to show it in: the browser has one.
-                    Err(err) => {
-                        self.toasts.error(err);
-                        let _ = tools::open_in_browser(&url);
+                None => {
+                    let waking = ctx.clone();
+                    let wake = move || waking.request_repaint();
+                    match crate::webview::Web::open(frame, &url, wake) {
+                        Ok(web) => self.web = Some(web),
+                        // No web view to show it in: the browser has one.
+                        Err(err) => {
+                            self.toasts.error(err);
+                            let _ = tools::open_in_browser(&url);
+                        }
                     }
-                },
+                }
             }
             self.web_open = self.web.is_some();
             ctx.request_repaint();
@@ -3473,6 +3510,12 @@ impl GodApp {
                 web.release_keyboard();
             }
             web.place(rect.filter(|_| !covered), ctx.pixels_per_point());
+            // A link followed in the page: the address says where it led.
+            let now = web.url();
+            if now != self.web_shown {
+                self.web_address.clone_from(&now);
+                self.web_shown = now;
+            }
         }
     }
 
@@ -7025,6 +7068,7 @@ impl eframe::App for GodApp {
                 .frame(Frame::new().fill(palette.bg))
                 .show(ui, |ui| self.editor_area(ui, &mut clicked));
         }
+        self.follow_preview();
         self.place_web(&ctx, frame, web_rect);
         for cmd in clicked {
             self.run(&ctx, cmd);

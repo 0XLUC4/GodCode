@@ -158,7 +158,7 @@ Fait : **aperçu web en direct** — le dossier est servi sur 127.0.0.1 uniqueme
 recharge seule à chaque sauvegarde. `Live Preview` l'affiche dans la fenêtre, à droite de
 l'éditeur ; `Live Preview in Browser` l'ouvre dans le navigateur. Le panneau a une barre
 d'adresse (n'importe quelle page, un serveur de développement comme `localhost:5173`),
-recharger, ouvrir dans le navigateur, et **inspecter** : les outils de développement de la
+précédent / suivant, recharger, ouvrir dans le navigateur, et **inspecter** : les outils de développement de la
 page (éléments, console, réseau).
 
 L'aperçu intégré passe par la vue web du système (WebView2, par la bibliothèque `wry`) :
@@ -167,8 +167,10 @@ Windows seulement pour l'instant ; ailleurs la page s'ouvre dans le navigateur. 
 est une fenêtre posée sur la nôtre : elle s'efface quand un menu ou une boîte de dialogue
 a besoin de la place.
 
-Reste : précédent / suivant dans l'aperçu, aperçu qui suit le fichier en avant, bases de
-données (SQLite et PostgreSQL d'abord), Docker.
+L'adresse suit les liens cliqués dans la page, et l'aperçu suit l'éditeur : une autre page
+HTML du dossier servi, mise en avant, prend la place de celle affichée.
+
+Reste : bases de données (SQLite et PostgreSQL d'abord), Docker.
 
 ### Phase 7 — personnalisation et extensions (⏳)
 

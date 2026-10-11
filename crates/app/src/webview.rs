@@ -15,10 +15,16 @@ pub struct Web {
 #[cfg(windows)]
 impl Web {
     /// A web view in the window of `frame`, showing `url`. It stays hidden until it is
-    /// given a place.
-    pub fn open(frame: &eframe::Frame, url: &str) -> Result<Self, String> {
+    /// given a place. `wake` is called when it starts or ends loading a page: there may be
+    /// another address to show.
+    pub fn open(
+        frame: &eframe::Frame,
+        url: &str,
+        wake: impl Fn() + 'static,
+    ) -> Result<Self, String> {
         let view = wry::WebViewBuilder::new()
             .with_url(url)
+            .with_on_page_load_handler(move |_, _| wake())
             .with_devtools(true)
             .with_visible(false)
             .build_as_child(frame)
@@ -30,8 +36,19 @@ impl Web {
         })
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    /// The address of the page on show: a link followed in it changes it.
+    pub fn url(&self) -> String {
+        self.view.url().unwrap_or_else(|_| self.url.clone())
+    }
+
+    /// Go to the page seen before this one (`back`), or to the one left by going back.
+    pub fn step(&self, back: bool) {
+        let script = if back {
+            "history.back()"
+        } else {
+            "history.forward()"
+        };
+        let _ = self.view.evaluate_script(script);
     }
 
     /// Show another page.
@@ -94,13 +111,19 @@ pub struct Web {
 
 #[cfg(not(windows))]
 impl Web {
-    pub fn open(_frame: &eframe::Frame, _url: &str) -> Result<Self, String> {
+    pub fn open(
+        _frame: &eframe::Frame,
+        _url: &str,
+        _wake: impl Fn() + 'static,
+    ) -> Result<Self, String> {
         Err("Pages show inside the window on Windows only: opened in the browser".to_owned())
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    pub fn url(&self) -> String {
+        self.url.clone()
     }
+
+    pub fn step(&self, _back: bool) {}
 
     pub fn go(&mut self, _url: &str) {}
 
