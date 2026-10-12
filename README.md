@@ -46,8 +46,6 @@ tried against test doubles, not real services: PostgreSQL, the assistant, MCP to
 client in particular. The PostgreSQL client has no encryption and is meant for a local or development server.
 Expect rough edges, and please report what breaks.
 
-The plan, phase by phase, with what is done and what is not: [docs/PLAN.md](docs/PLAN.md) (in French).
-
 ## Build
 
 Requires a recent Rust toolchain (built here with 1.94).
