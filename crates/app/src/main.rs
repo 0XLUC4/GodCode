@@ -18,6 +18,7 @@ mod terminal;
 mod theme;
 mod toasts;
 mod tools;
+mod updates;
 mod websocket;
 mod webview;
 mod widgets;

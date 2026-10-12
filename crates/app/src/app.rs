@@ -1611,6 +1611,7 @@ type Diff = (u64, u64, Vec<Hunk>);
 type CheckResult = Result<(PathBuf, String), String>;
 
 pub struct GodApp {
+    updates: crate::updates::Updates,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
@@ -1915,6 +1916,7 @@ impl GodApp {
         let code = font.as_deref().and_then(|path| std::fs::read(path).ok());
         widgets::install_fonts(&cc.egui_ctx, code.filter(|bytes| widgets::is_font(bytes)));
         let mut app = Self {
+            updates: crate::updates::Updates::default(),
             tabs: Vec::new(),
             active: 0,
             next_id: 0,
@@ -2098,6 +2100,7 @@ impl GodApp {
             test_scan: None,
             branch_action: Cmd::Branches,
         };
+        app.updates.start(&cc.egui_ctx);
         if paths.is_empty() {
             // Nothing was asked for: back to where the last session was left.
             let folder = get("session_folder").map(PathBuf::from);
@@ -8154,6 +8157,8 @@ impl GodApp {
         if requested && !self.quit && self.tabs.iter().any(|tab| tab.dirty) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.closing = Some(Closing::Window);
+        } else if requested {
+            self.updates.relaunch();
         }
     }
 
@@ -8194,6 +8199,7 @@ impl GodApp {
                 if widgets::small_icon_button(ui, glyph, tip).clicked() {
                     clicked.push(Cmd::ToggleTheme);
                 }
+                self.updates.button(ui);
                 // What is done all day is a click away, from the right: finding, running,
                 // then what Git does with the project and the branch it is on.
                 let mut tools = vec![
@@ -10442,6 +10448,7 @@ impl eframe::App for GodApp {
         self.database_window(&ctx);
         self.log_dialog(&ctx);
         self.templates_dialog(&ctx);
+        self.updates.show(&ctx);
         self.toasts.show(&ctx);
     }
 

@@ -56,6 +56,7 @@ pub fn install_fonts(ctx: &Context, code: Option<Vec<u8>>) {
     fonts
         .families
         .insert(FontFamily::Name(LOGOS.into()), vec![LOGOS.into()]);
+    crate::updates::add_bold_font(&mut fonts);
     ctx.set_fonts(fonts);
 }
 
