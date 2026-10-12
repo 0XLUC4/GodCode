@@ -9,6 +9,7 @@
 
 Windows: get `GodCode-windows-x64.exe` from the [latest release](https://github.com/0XLUC4/GodCode/releases/latest).
 It is a single file, nothing to install. It is not signed, so Windows SmartScreen may ask before running it.
+New versions come through the Updates button: it downloads one and restarts on it.
 
 ## What it does
 
