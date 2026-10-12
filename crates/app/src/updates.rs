@@ -401,7 +401,8 @@ fn markdown(ui: &mut Ui, text: &str) {
                 ui.horizontal_top(|ui| {
                     ui.label(RichText::new("•").size(size).color(color));
                     let width = ui.available_width();
-                    ui.label(line_job(item, size, false, width));
+                    // In a row a label runs on: this one is told to go to the next line.
+                    ui.add(egui::Label::new(line_job(item, size, false, width)).wrap());
                 });
             }
             None => {
