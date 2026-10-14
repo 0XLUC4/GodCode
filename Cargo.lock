@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "godcode"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1483,14 +1483,15 @@ dependencies = [
 
 [[package]]
 name = "godcode-core"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "regex",
+ "serde_json",
 ]
 
 [[package]]
 name = "godcode-lsp"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "serde_json",
 ]

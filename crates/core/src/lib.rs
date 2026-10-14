@@ -15,12 +15,16 @@ pub mod git;
 pub mod http;
 pub mod markdown;
 pub mod merge;
+pub mod mock;
 pub mod modal;
 pub mod outline;
+pub mod ports;
 pub mod search;
+pub mod secrets;
 pub mod sql;
 pub mod sqlite;
 pub mod syntax;
+pub mod xray;
 
 /// Line end a file uses on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

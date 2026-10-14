@@ -37,6 +37,12 @@ New versions come through the Updates button: it downloads one and restarts on i
 - Assistant: a local model through Ollama, or Anthropic with your own key; it can propose an edit you review first
 - Plugins: WebAssembly modules run in a sandbox
 
+**Guards and insight, built in**
+- Secret guard: before a commit, the ticked files are read for API keys, tokens, private keys and passwords written in clear (AWS, GitHub, GitLab, Anthropic, OpenAI, Google, Stripe, Slack, Discord, npm, Hugging Face, SendGrid, `.env` and key files). The commit waits and shows each line; a scan of the whole project is one command away
+- Ports in use: every port that listens on the computer, the program that holds it, open it in the browser or end it in two clicks. No more "port 3000 is already in use"
+- Project X-ray: lines per language, the biggest files, the notes left in the code (TODO, FIXME, HACK), the dependencies of `Cargo.toml` and `package.json` with the ones that have a new major version
+- Mock API: write the answers under the requests of a `.http` file and serve them on `localhost`, with `{id}` in paths, CORS, a log of the requests, answers that follow the file as it is edited
+
 **Looks**
 - Six themes plus your own, a font of your choice, layouts you can save, Zen mode
 
@@ -60,7 +66,7 @@ cargo test --workspace
 
 | Crate | Role |
 |-------|------|
-| `crates/core` (`godcode-core`) | Text logic with no interface: syntax, completion, editing, Vim, Git parsing, SQLite reader, merge |
+| `crates/core` (`godcode-core`) | Logic with no interface: syntax, completion, editing, Vim, Git parsing, SQLite reader, merge, secrets, ports, mock API |
 | `crates/lsp` (`godcode-lsp`) | Language server and debug adapter clients |
 | `crates/app` (`godcode`) | The `egui`/`eframe` desktop app |
 

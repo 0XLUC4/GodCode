@@ -32,6 +32,8 @@ use crate::toasts::Toasts;
 use crate::widgets::{self, icon, with_icon};
 use crate::{APP_NAME, branding, editor, platform, preview, tools};
 
+mod insight;
+
 const TAB_HEIGHT: f32 = 34.0;
 /// Widest a tab's file name gets before it is cut with an ellipsis.
 const TAB_TEXT_MAX: f32 = 180.0;
@@ -224,6 +226,10 @@ enum Cmd {
     AcceptTheirs,
     AcceptBoth,
     DebugSettings,
+    ScanSecrets,
+    Ports,
+    Xray,
+    MockServer,
 }
 
 /// How a command shows in the menus, the command palette and the shortcut list.
@@ -588,6 +594,20 @@ const COMMANDS: &[Spec] = &[
     spec(Cmd::EnvFile, icon::ROWS, "Choose .env File…", ""),
     spec(Cmd::Docker, icon::ROWS, "Docker…", ""),
     spec(Cmd::Postgres, icon::ROWS, "Connect to PostgreSQL…", ""),
+    spec(Cmd::Xray, icon::CHART_PIE_SLICE, "Project X-ray…", ""),
+    spec(
+        Cmd::ScanSecrets,
+        icon::SHIELD_CHECK,
+        "Scan Project for Secrets…",
+        "",
+    ),
+    spec(Cmd::Ports, icon::PLUGS, "Ports in Use…", ""),
+    spec(
+        Cmd::MockServer,
+        icon::BROADCAST,
+        "Mock API from This .http File…",
+        "",
+    ),
     spec(
         Cmd::GitPull,
         icon::ARROW_LINE_DOWN,
@@ -916,6 +936,11 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             None,
             Some(Cmd::Docker),
             Some(Cmd::Postgres),
+            None,
+            Some(Cmd::Xray),
+            Some(Cmd::ScanSecrets),
+            Some(Cmd::Ports),
+            Some(Cmd::MockServer),
             None,
             Some(Cmd::Plugins),
             Some(Cmd::PluginsFolder),
@@ -1753,6 +1778,8 @@ pub struct GodApp {
     env_pick: Option<(Vec<String>, usize)>,
     /// What Docker has, while it is looked at.
     docker: Option<Docker>,
+    /// Secrets, ports, project X-ray and mock API windows.
+    insight: insight::Insight,
     /// The PostgreSQL server being asked questions.
     postgres: Option<Postgres>,
     /// What Git is doing with another computer (a pull, a push, a fetch), and its name.
@@ -2025,6 +2052,7 @@ impl GodApp {
             env_file: get("env_file").filter(|name| !name.is_empty()),
             env_pick: None,
             docker: None,
+            insight: insight::Insight::default(),
             postgres: None,
             git_job: None,
             left_out: Default::default(),
@@ -3015,6 +3043,10 @@ impl GodApp {
         let Some(root) = self.folder() else {
             return;
         };
+        // API keys, tokens and private keys stay out of the history.
+        if !self.commit_message.trim().is_empty() && self.secrets_stop_commit(&root, push) {
+            return;
+        }
         let message = self.commit_message.trim();
         if message.is_empty() {
             self.toasts.error("Write a commit message first");
@@ -7572,6 +7604,10 @@ impl GodApp {
                     focus: true,
                 });
             }
+            Cmd::ScanSecrets => self.scan_secrets(ctx),
+            Cmd::Ports => self.open_ports(ctx),
+            Cmd::Xray => self.open_xray(ctx),
+            Cmd::MockServer => self.open_mock(),
             Cmd::Docker => {
                 // The services the folder says it is made of, when it has a compose file.
                 let written = self.folder().and_then(|root| {
@@ -8617,6 +8653,8 @@ impl GodApp {
                 ui.separator();
                 let windows = [
                     (icon::CUBE, "Docker", Cmd::Docker),
+                    (icon::CHART_PIE_SLICE, "Project X-ray", Cmd::Xray),
+                    (icon::PLUGS, "Ports in use", Cmd::Ports),
                     (icon::DATABASE, "Connect to PostgreSQL", Cmd::Postgres),
                     (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
                 ];
@@ -10440,6 +10478,10 @@ impl eframe::App for GodApp {
         self.layouts_dialog(&ctx);
         self.env_dialog(&ctx);
         self.docker_window(&ctx);
+        self.secrets_window(&ctx);
+        self.ports_window(&ctx);
+        self.xray_window(&ctx);
+        self.mock_window(&ctx);
         self.postgres_window(&ctx);
         self.plugins_dialog(&ctx);
         self.plugin_consent(&ctx);
