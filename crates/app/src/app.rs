@@ -33,6 +33,7 @@ use crate::widgets::{self, icon, with_icon};
 use crate::{APP_NAME, branding, editor, platform, preview, tools};
 
 mod insight;
+mod power;
 
 const TAB_HEIGHT: f32 = 34.0;
 /// Widest a tab's file name gets before it is cut with an ellipsis.
@@ -230,6 +231,9 @@ enum Cmd {
     Ports,
     Xray,
     MockServer,
+    Toolbox,
+    RegexLab,
+    CodingTime,
 }
 
 /// How a command shows in the menus, the command palette and the shortcut list.
@@ -609,6 +613,14 @@ const COMMANDS: &[Spec] = &[
         "",
     ),
     spec(
+        Cmd::Toolbox,
+        icon::TOOLBOX,
+        "Developer Toolbox (JWT, Base64, JSON, Time…)…",
+        "",
+    ),
+    spec(Cmd::RegexLab, icon::ASTERISK, "Regex Lab…", ""),
+    spec(Cmd::CodingTime, icon::TIMER, "Coding Time…", ""),
+    spec(
         Cmd::GitPull,
         icon::ARROW_LINE_DOWN,
         "Git Update Project (Pull)",
@@ -941,6 +953,10 @@ const MENUS: &[(&str, &[Option<Cmd>])] = &[
             Some(Cmd::ScanSecrets),
             Some(Cmd::Ports),
             Some(Cmd::MockServer),
+            None,
+            Some(Cmd::Toolbox),
+            Some(Cmd::RegexLab),
+            Some(Cmd::CodingTime),
             None,
             Some(Cmd::Plugins),
             Some(Cmd::PluginsFolder),
@@ -1780,6 +1796,8 @@ pub struct GodApp {
     docker: Option<Docker>,
     /// Secrets, ports, project X-ray and mock API windows.
     insight: insight::Insight,
+    /// Toolbox, regex lab, coding time, memory.
+    power: power::Power,
     /// The PostgreSQL server being asked questions.
     postgres: Option<Postgres>,
     /// What Git is doing with another computer (a pull, a push, a fetch), and its name.
@@ -2053,6 +2071,7 @@ impl GodApp {
             env_pick: None,
             docker: None,
             insight: insight::Insight::default(),
+            power: power::Power::load(get("activity")),
             postgres: None,
             git_job: None,
             left_out: Default::default(),
@@ -7608,6 +7627,9 @@ impl GodApp {
             Cmd::Ports => self.open_ports(ctx),
             Cmd::Xray => self.open_xray(ctx),
             Cmd::MockServer => self.open_mock(),
+            Cmd::Toolbox => self.open_toolbox(),
+            Cmd::RegexLab => self.open_regex(),
+            Cmd::CodingTime => self.open_time(),
             Cmd::Docker => {
                 // The services the folder says it is made of, when it has a compose file.
                 let written = self.folder().and_then(|root| {
@@ -8522,6 +8544,12 @@ impl GodApp {
                 if widgets::small_icon_button(ui, icon::MINUS, "Zoom out").clicked() {
                     clicked.push(Cmd::ZoomOut);
                 }
+                if let Some(bytes) = self.power.memory {
+                    ui.add_space(10.0);
+                    let memory = format!("{} {} MB", icon::MEMORY, bytes / (1024 * 1024));
+                    ui.label(dim(memory))
+                        .on_hover_text("Memory GodCode uses right now");
+                }
                 if let Some(tab) = tab {
                     ui.spacing_mut().item_spacing.x = 18.0;
                     ui.add_space(12.0);
@@ -8655,6 +8683,8 @@ impl GodApp {
                     (icon::CUBE, "Docker", Cmd::Docker),
                     (icon::CHART_PIE_SLICE, "Project X-ray", Cmd::Xray),
                     (icon::PLUGS, "Ports in use", Cmd::Ports),
+                    (icon::TOOLBOX, "Developer toolbox", Cmd::Toolbox),
+                    (icon::TIMER, "Coding time", Cmd::CodingTime),
                     (icon::DATABASE, "Connect to PostgreSQL", Cmd::Postgres),
                     (icon::CLOCK_COUNTER_CLOCKWISE, "Git log", Cmd::GitLog),
                 ];
@@ -10306,6 +10336,7 @@ impl eframe::App for GodApp {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut clicked = std::mem::take(&mut self.pending);
+        self.track_activity(&ctx);
         self.poll();
         self.shortcuts(&ctx, &mut clicked);
         self.plugin_keys(&ctx);
@@ -10482,6 +10513,9 @@ impl eframe::App for GodApp {
         self.ports_window(&ctx);
         self.xray_window(&ctx);
         self.mock_window(&ctx);
+        self.toolbox_window(&ctx);
+        self.regex_window(&ctx);
+        self.time_window(&ctx);
         self.postgres_window(&ctx);
         self.plugins_dialog(&ctx);
         self.plugin_consent(&ctx);
@@ -10497,6 +10531,7 @@ impl eframe::App for GodApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let flag = |on: bool| if on { "1" } else { "0" }.to_owned();
         storage.set_string("dark_mode", flag(self.dark));
+        storage.set_string("activity", self.power.activity.to_text());
         storage.set_string("sidebar", flag(self.sidebar));
         storage.set_string("wrap", flag(self.wrap));
         storage.set_string("preview", flag(self.preview));

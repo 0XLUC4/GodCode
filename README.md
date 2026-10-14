@@ -42,6 +42,10 @@ New versions come through the Updates button: it downloads one and restarts on i
 - Ports in use: every port that listens on the computer, the program that holds it, open it in the browser or end it in two clicks. No more "port 3000 is already in use"
 - Project X-ray: lines per language, the biggest files, the notes left in the code (TODO, FIXME, HACK), the dependencies of `Cargo.toml` and `package.json` with the ones that have a new major version
 - Mock API: write the answers under the requests of a `.http` file and serve them on `localhost`, with `{id}` in paths, CORS, a log of the requests, answers that follow the file as it is edited
+- Developer toolbox: decode a JWT (with its expiry), Base64 and URL both ways, JSON pretty or minified, Unix time to a date and back, UUIDs, MD5 / SHA-1 / SHA-256. Opened on a selection, it picks the tool that reads it
+- Regex lab: the matches marked in the text as the pattern is typed, every group by name or number, the result of a replacement
+- Coding time: the time spent per day, project and language, counted while you type, click or scroll; kept on this computer only
+- The memory GodCode uses, in the status bar
 
 **Looks**
 - Six themes plus your own, a font of your choice, layouts you can save, Zen mode

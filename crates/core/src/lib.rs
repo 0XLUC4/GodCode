@@ -2,6 +2,7 @@
 //!
 //! Text in memory always uses `\n` line ends; positions handed to the editor are char indices.
 
+pub mod activity;
 pub mod check;
 pub mod complete;
 pub mod coverage;
@@ -19,11 +20,13 @@ pub mod mock;
 pub mod modal;
 pub mod outline;
 pub mod ports;
+pub mod regex_lab;
 pub mod search;
 pub mod secrets;
 pub mod sql;
 pub mod sqlite;
 pub mod syntax;
+pub mod toolbox;
 pub mod xray;
 
 /// Line end a file uses on disk.

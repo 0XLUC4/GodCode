@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "godcode"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1483,15 +1483,18 @@ dependencies = [
 
 [[package]]
 name = "godcode-core"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
+ "md-5",
  "regex",
  "serde_json",
+ "sha1",
+ "sha2",
 ]
 
 [[package]]
 name = "godcode-lsp"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "serde_json",
 ]
@@ -2064,6 +2067,16 @@ dependencies = [
  "log",
  "tendril",
  "web_atoms",
+]
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]
@@ -3253,6 +3266,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
 dependencies = [
  "stable_deref_trait",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]
