@@ -50,6 +50,58 @@ New versions come through the Updates button: it downloads one and restarts on i
 **Looks**
 - Six themes plus your own, a font of your choice, layouts you can save, Zen mode
 
+## GodCode, VS Code and Zed
+
+✓ built in · ✗ not there · *extension*: only once an extension is added · *partly*: some of it
+
+**Only in GodCode, out of the box**
+
+| | GodCode | VS Code | Zed |
+|---|:---:|:---:|:---:|
+| Secret guard: a commit waits when it holds API keys, tokens or private keys | ✓ | ✗ | ✗ |
+| Ports in use: every listening port, its program, open or end it | ✓ | partly (forwarding) | ✗ |
+| Mock API served from the answers written in a `.http` file | ✓ | ✗ | ✗ |
+| Project X-ray: lines per language, biggest files, notes, outdated dependencies | ✓ | ✗ | ✗ |
+| Developer toolbox: JWT, Base64, URL, JSON, Unix time, UUID, hashes | ✓ | extension | ✗ |
+| Regex lab with groups and replacement | ✓ | extension | ✗ |
+| Coding time per project and language, kept on your computer | ✓ | extension | ✗ |
+| HTTP client for `.http` files, with environments and WebSocket | ✓ | extension | ✗ |
+| SQLite and PostgreSQL windows | ✓ | extension | ✗ |
+| Docker: containers, images, compose | ✓ | extension | ✗ |
+
+**The everyday editor**
+
+| | GodCode | VS Code | Zed |
+|---|:---:|:---:|:---:|
+| Language servers (LSP) | ✓ | ✓ | ✓ |
+| Debugger (DAP) | ✓ | ✓ | ✓ |
+| Git: commit by file, branches, blame | ✓ | ✓ | ✓ |
+| Git graph and three-column merge view | ✓ | ✓ | partly |
+| Terminal | ✓ | ✓ | ✓ |
+| Vim keys | ✓ | extension | ✓ |
+| Assistant with a local model (Ollama) or your own key | ✓ | partly | ✓ |
+| Live web preview inside the window | ✓ | extension | ✗ |
+
+**Where the others are ahead**
+
+| | GodCode | VS Code | Zed |
+|---|:---:|:---:|:---:|
+| Number of extensions | a few (WebAssembly, sandboxed) | tens of thousands | hundreds |
+| Real-time collaboration | ✗ | extension | ✓ |
+| Remote development (SSH, containers) | ✗ | extension | ✓ |
+| Years of use and fixes | young | many | a few |
+
+**How it is made**
+
+| | GodCode | VS Code | Zed |
+|---|:---:|:---:|:---:|
+| Written in | Rust (egui) | TypeScript (Electron) | Rust (GPUI) |
+| What you download | one 20 MB `.exe`, nothing to install | an installer | an installer |
+| Account | never | for sync and Copilot | for collaboration and AI |
+
+GodCode's memory, measured on Windows 11 with a folder open and nothing else done: about 76 MB (Task Manager). Measure the others on your own machine.
+The table says what each one does without anything added, as far as we know in October 2026. Each editor moves fast: [open an issue](https://github.com/0XLUC4/GodCode/issues) if a line is wrong.
+
 ## State of the project
 
 GodCode is young. Everything listed above is built and covered by tests, but a good part of it has only been
