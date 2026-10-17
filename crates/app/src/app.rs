@@ -10334,6 +10334,7 @@ impl GodApp {
 
 impl eframe::App for GodApp {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        crate::window::track(ui.ctx());
         let ctx = ui.ctx().clone();
         let mut clicked = std::mem::take(&mut self.pending);
         self.track_activity(&ctx);
@@ -10529,6 +10530,7 @@ impl eframe::App for GodApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        crate::window::save();
         let flag = |on: bool| if on { "1" } else { "0" }.to_owned();
         storage.set_string("dark_mode", flag(self.dark));
         storage.set_string("activity", self.power.activity.to_text());
