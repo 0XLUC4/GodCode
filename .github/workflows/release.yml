@@ -1,0 +1,97 @@
+# Builds the Linux and macOS versions and attaches them to the release.
+name: Release builds
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the builds to
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  APP: GodCode
+  BIN: godcode
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+      - run: cargo build --release --locked -p "$BIN"
+      - name: Package
+        run: |
+          dir="$APP-linux-x64"
+          mkdir "$dir"
+          cp "target/release/$BIN" "$dir/"
+          cp assets/logo.png "$dir/$BIN.png"
+          cat > "$dir/$BIN.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=$APP
+          Exec=$BIN %F
+          Icon=$BIN
+          Terminal=false
+          Categories=Development;TextEditor;
+          EOF
+          tar -czf "$dir.tar.gz" "$dir"
+      - run: gh release upload "$TAG" "$APP-linux-x64.tar.gz" --clobber
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo build --release --locked -p "$BIN" --target aarch64-apple-darwin
+          cargo build --release --locked -p "$BIN" --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          version="${TAG#v}"
+          app="$APP.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          lipo -create -output "$app/Contents/MacOS/$BIN" \
+            "target/aarch64-apple-darwin/release/$BIN" "target/x86_64-apple-darwin/release/$BIN"
+          mkdir icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z $size $size assets/logo.png --out "icon.iconset/icon_${size}x${size}.png"
+            sips -z $((size * 2)) $((size * 2)) assets/logo.png --out "icon.iconset/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns icon.iconset -o "$app/Contents/Resources/$BIN.icns"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>$APP</string>
+            <key>CFBundleDisplayName</key><string>$APP</string>
+            <key>CFBundleIdentifier</key><string>com.0xluc4.$BIN</string>
+            <key>CFBundleExecutable</key><string>$BIN</string>
+            <key>CFBundleIconFile</key><string>$BIN</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --keepParent "$app" "$APP-macos-universal.zip"
+      - run: gh release upload "$TAG" "$APP-macos-universal.zip" --clobber
